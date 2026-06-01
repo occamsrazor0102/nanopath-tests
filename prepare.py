@@ -1,5 +1,5 @@
-# Single data-prep entry point. Reads the YAML config the user passes in and
-# checks every path train.py will read:
+# Single data-prep entry point. Reads configs/main.yaml by default (or a
+# user-passed YAML config) and checks every path train.py will read:
 #   - data.dataset_dir/shard-NNNNN.parquet   (the 4M-tile dataset, sharded)
 #   - probe.dataset_roots[name] for each configured probe dataset
 #   - Meta's DINOv2 pretrained weights for cfg["model"]["type"] (torch.hub cache)
@@ -10,8 +10,9 @@
 # you want to regenerate the tile dataset from raw SVS files; see README.
 #
 # Run:
-#   python prepare.py <config.yaml> download=False  # verify only
-#   python prepare.py <config.yaml> download=True   # fetch what's missing
+#   python prepare.py download=False                    # verify configs/main.yaml
+#   python prepare.py download=True                     # fetch what's missing
+#   python prepare.py configs/smoke.yaml download=True  # override the default config
 #
 # `process_row`, `count_rows`, `select_rows`, `prepare_tiles`, and
 # `pack_from_jpeg_dir` are kept in this file so a contributor revising tile
@@ -664,34 +665,55 @@ def _resolve(s):
     return Path(os.path.expanduser(os.path.expandvars(str(s))))
 
 
-# Off-cluster default: a configured absolute path that is absent and whose mount
-# root (e.g. /data or /block) is missing or not writable means a fresh clone
-# cannot use the MedARC path. Retarget by basename into repo-local data/ so setup
-# works without YAML edits. Existing paths are returned unchanged.
-def _localize(s):
+# Missing checked-in /data and /block dataset defaults are shared-cluster paths,
+# not portable user choices. Retarget empty/missing ones into repo-local data/
+# so `prepare.py ... download=True` makes a fresh clone runnable by itself.
+def _local_data_root(s):
     p = _resolve(s)
-    mount = Path(*p.parts[:2]) if p.is_absolute() and len(p.parts) > 1 else p
-    if p.is_absolute() and not p.exists() and (not mount.exists() or not os.access(mount, os.W_OK)):
+    if p.is_absolute() and len(p.parts) > 1 and p.parts[1] in {"data", "block"} and (not p.is_dir() or not any(p.iterdir())):
         return str(REPO_ROOT / "data" / p.name)
     return str(s)
 
 
-# Off-cluster default: a fresh clone with no /data or /block mount can't use the
-# checked-in cluster paths, so rewrite them in place to point into repo-local
-# data/ (by basename). Surgical replacement on the raw text keeps every
-# comment/format intact and only touches values that actually redirect, so the
-# YAML itself becomes the source of truth that train.py/probe.py read unchanged.
-# Idempotent, and a no-op on the cluster where the paths/mounts already exist.
+# Output/log roots follow repo-local data roots when prepare had to localize a
+# config, otherwise they stay on writable shared /data for MedARC runs.
+def _local_output_root(s, force=False):
+    p = _resolve(s)
+    mount = Path(*p.parts[:2]) if p.is_absolute() and len(p.parts) > 1 else p
+    if force or (p.is_absolute() and not p.exists() and (not mount.exists() or not os.access(mount, os.W_OK))):
+        parts = list(p.parts)
+        tail = parts[parts.index("nanopath") + 1:] if "nanopath" in parts else [p.name]
+        return str(REPO_ROOT / "data" / Path(*tail))
+    return str(s)
+
+
+# Rewrite missing portable defaults in place before downloading. Surgical text
+# replacement preserves comments and formatting, so the YAML remains the source
+# of truth that train.py/probe.py read unchanged after preparation.
 def localize_config_file(config_path):
     raw = config_path.read_text()
     cfg = yaml.safe_load(raw)
-    roots = [cfg["data"]["dataset_dir"], *cfg["probe"]["dataset_roots"].values(), cfg["project"]["output_dir"], cfg["project"]["wandb_dir"]]
-    changes = {v: nv for v in roots if (nv := _localize(v)) != v}
+    data_roots = [cfg["data"]["dataset_dir"], *cfg["probe"]["dataset_roots"].values()]
+    output_roots = [cfg["project"]["output_dir"], cfg["project"]["wandb_dir"]]
+    changes = {v: nv for v in data_roots if (nv := _local_data_root(v)) != v}
+    changes.update({v: nv for v in output_roots if (nv := _local_output_root(v, force=bool(changes))) != v})
     for old, new in changes.items():
         raw = raw.replace(f": {old}", f": {new}")
     if changes:
         config_path.write_text(raw)
-        print(f"[data] no /data or /block mount found; rewrote {len(changes)} root(s) in {config_path} to defaults under {REPO_ROOT / 'data'}.", flush=True)
+        print(f"[data] rewrote {len(changes)} missing/unusable root(s) in {config_path} to defaults under {REPO_ROOT / 'data'}.", flush=True)
+
+
+def localize_config_files(config_path):
+    # Smoke is the usual first command on a fresh clone, but users naturally
+    # train main next. Keep both checked-in recipes pointed at the same local
+    # downloaded data once either config triggers localization.
+    seen = set()
+    for path in [config_path, REPO_ROOT / "configs" / "main.yaml", REPO_ROOT / "configs" / "smoke.yaml"]:
+        path = path.resolve()
+        if path.exists() and path not in seen:
+            seen.add(path)
+            localize_config_file(path)
 
 
 # Flat dict of {label: expanded Path} for every data path declared in cfg.
@@ -745,20 +767,28 @@ def is_populated(name, p):
 
 
 def main():
-    usage = "usage: python prepare.py <config.yaml> download=True|download=False"
-    # Config path is required, must be a YAML.
-    if len(sys.argv) < 2 or not sys.argv[1].endswith((".yaml", ".yml")):
+    usage = "usage: python prepare.py [config.yaml] download=True|download=False"
+    args = sys.argv[1:]
+    # The download flag is required and must be exactly download=True or download=False.
+    if not args or args[-1] not in ("download=True", "download=False"):
         raise SystemExit(usage)
-    config_path = Path(sys.argv[1])
-    # download flag is required and must be exactly download=True or download=False.
-    if len(sys.argv) != 3 or sys.argv[2] not in ("download=True", "download=False"):
+    download = args[-1] == "download=True"
+    # Config path is optional; without one, prepare the canonical main recipe.
+    if len(args) == 1:
+        config_path = REPO_ROOT / "configs" / "main.yaml"
+    elif len(args) == 2 and args[0].endswith((".yaml", ".yml")):
+        config_path = Path(args[0])
+    else:
         raise SystemExit(usage)
-    download = sys.argv[2] == "download=True"
+    resolved_config_path = config_path.resolve()
+    config_label = str(resolved_config_path.relative_to(REPO_ROOT)) if resolved_config_path.is_relative_to(REPO_ROOT) else str(config_path)
+    prepare_cmd = "python prepare.py download=True" if len(args) == 1 else f"python prepare.py {config_label} download=True"
 
-    # Off-cluster, correct this config's cluster paths to repo-local defaults on
-    # disk before preparing, so the YAML matches where data actually lands.
+    # Off-cluster, correct the requested config plus the checked-in smoke/main
+    # recipes before preparing, so subsequent train.py commands read the same
+    # local paths that download=True populates.
     if download:
-        localize_config_file(config_path)
+        localize_config_files(config_path)
     cfg = yaml.safe_load(os.path.expandvars(config_path.read_text()))
     paths = get_paths(cfg)
     dataset_dir = paths["data.dataset_dir"]
@@ -770,8 +800,8 @@ def main():
     elif not download:
         raise SystemExit(
             f"expected {NUM_SHARDS} parquet shards under {dataset_dir}, found {len(shards)}.\n"
-            f"Either fix data.dataset_dir in {config_path} to point at an existing prepared "
-            f"dataset, or rerun: python prepare.py {config_path} download=True"
+            f"Either fix data.dataset_dir in {config_label} to point at an existing prepared "
+            f"dataset, or rerun: {prepare_cmd}"
         )
     else:
         dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -801,8 +831,8 @@ def main():
         for name, root in missing:
             lines.append(f"  probe/{name}: {root} is empty, missing, or stale for the current benchmark")
         lines.append(
-            f"Either fix probe.dataset_roots in {config_path} to point at existing populated "
-            f"paths, or rerun: python prepare.py {config_path} download=True"
+            f"Either fix probe.dataset_roots in {config_label} to point at existing populated "
+            f"paths, or rerun: {prepare_cmd}"
         )
         raise SystemExit("\n".join(lines))
 
@@ -821,7 +851,7 @@ def main():
     elif not download:
         raise SystemExit(
             f"Meta {cfg['model']['type']} pretrained weights missing at {weights_path}.\n"
-            f"Rerun: python prepare.py {config_path} download=True"
+            f"Rerun: {prepare_cmd}"
         )
     else:
         weights_dir.mkdir(parents=True, exist_ok=True)
@@ -837,8 +867,8 @@ def main():
     print(
         f"\nAll data ready: {n_shards} parquet shards at {dataset_dir}, {n_probes} probe datasets "
         f"({', '.join(cfg['probe']['dataset_roots'])}), and {cfg['model']['type']} weights at "
-        f"{weights_path}. Launch training with `python train.py {config_path}` or "
-        f"`sbatch submit/train_1gpu.sbatch {config_path}`.",
+        f"{weights_path}. Launch training with `python train.py {config_label}` or "
+        f"`sbatch submit/train_1gpu.sbatch {config_label}`.",
         flush=True,
     )
 

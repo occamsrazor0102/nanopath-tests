@@ -18,7 +18,7 @@ uv sync && source .venv/bin/activate
 wandb login  # optional; set WANDB_MODE=offline to keep W&B local
 
 # download pretraining & probe datasets & DINOv2 pretrained ckpt
-python prepare.py configs/smoke.yaml download=True
+python prepare.py download=True
 
 # smoke test: short training plus the fixed full probe suite
 sbatch submit/train_1gpu.sbatch configs/smoke.yaml
@@ -30,6 +30,7 @@ sbatch submit/train_1gpu.sbatch configs/main.yaml output_dir=$RUN_DIR
 # or directly on a GPU machine: python train.py configs/main.yaml output_dir=$RUN_DIR
 
 # publish a completed full run to the live labless plot
+# the submitter will ask you to sign in with GitHub in a browser
 ./labless/submit_to_labless.py output_dir=$RUN_DIR run_name=kde-crops notes="what changed"
 ```
 
@@ -71,18 +72,36 @@ Baseline rows are frozen reference checkpoints evaluated with the same probe sui
 
 ### How to submit to the leaderboard
 
-`configs/main.yaml` is the current `nanopath` main-branch training recipe. Submit completed full runs to labless:
+Labless is the public run ledger and live plot for `nanopath`. You do not need a Labless password or a pull request to make a leaderboard claim; the submitter connects your submission to your GitHub identity through GitHub's no-scope device sign-in flow.
+
+`configs/main.yaml` is the current `nanopath` main-branch training recipe. A normal submission is:
 
 ```bash
 RUN_DIR=/data/$USER/nanopath/main/my-run
 ./labless/submit_to_labless.py output_dir=$RUN_DIR run_name=kde-crops notes="what changed and why"
 ```
 
-The `run_name` is the short label shown next to your dot on the Labless plot; keep it under 20 characters and make it describe what changed. A copied config such as `configs/new_config.yaml` is fine if the completed `summary.json` still reports `max_train_samples: 1000000`, `tile_presentations <= 1000000`, and `max_train_flops: 1e18`. Short smoke-sized runs and failed runs are not public Labless submissions.
+The pipeline is:
+
+1. Train a completed full run with `configs/main.yaml` or a copied `configs/*.yaml` that keeps the locked probe suite intact.
+2. Let `train.py` finish the final probe. The run directory must contain `summary.json`, `metrics.jsonl`, and the source snapshot written at launch under `labless_source/`.
+3. Run `./labless/submit_to_labless.py ...` from the repo root. It writes `labless_submission.json`, checks the run caps and locked benchmark surface, then prints a GitHub device-login URL and one-time code.
+4. Open the URL on any machine, sign in to GitHub, and enter the code. Labless records that verified GitHub login as the contributor, posts the run to `api.labless.dev`, and shows it as `pending` until maintainer validation.
+
+Public full-run submissions must satisfy:
+
+- `summary.max_train_samples == 1000000`
+- `summary.tile_presentations <= 1000000`
+- `summary.max_train_flops == 1e18`
+- final `mean_probe_score` / `final_probe_score` is present
+- no saved-source changes to `probe.py` or anything under `benchmarking/`
+- no locked probe config changes except local `probe.dataset_roots`
+
+The `run_name` is the short label shown next to your dot on the Labless plot; keep it under 20 characters and make it describe what changed. Short smoke-sized runs, failed runs, and runs missing the saved source snapshot stay local. Each verified GitHub login can submit at most 10 runs per 24 hours.
 
 To top the leaderboard you must beat the highest validated Labless run on `mean_probe_score` by at least 0.01. Submit the run to labless; that public submission is the leaderboard claim, with the saved source snapshot, changed files, notes, metrics, hardware, and optional W&B link attached. Public submissions have no wall-clock limit, so train on whatever hardware you have access to. [@PaulScotti](https://github.com/PaulScotti) will inspect promising submissions, rerun the candidate on the maintainer's single 80 GB H100 with a different rng seed, and validate it on Labless if training completes within 2 hours and the rerun still improves by at least 0.01. If its code is pushed to nanopath `main`, Labless marks that run separately as `main`. **You don't need an H100 or a PR to submit**; labless handles the public record and maintainer validation.
 
-Code-cleanup PRs are still welcome when they simplify the codebase without changing benchmark peformance on the main recipe. Leaderboard claims should go through labless instead of a pull request.
+Code-cleanup PRs are still welcome when they simplify the codebase without changing benchmark performance on the main recipe. Leaderboard claims should go through labless instead of a pull request.
 
 ### What you must NOT change for a leaderboard submission
 
@@ -118,7 +137,7 @@ RUN_DIR=/data/$USER/nanopath/main/my-run
 ./labless/submit_to_labless.py output_dir=$RUN_DIR run_name=kde-crops notes="what changed and why"
 ```
 
-The script reads `summary.json` and `metrics.jsonl`, uses the run's saved source snapshot (`output_dir/labless_source`), writes `labless_submission.json`, verifies full runs from `max_train_samples: 1000000`, `tile_presentations <= 1000000`, and `max_train_flops: 1e18`, signs you in through GitHub's no-scope device flow, and posts to `api.labless.dev`. Labless records the verified GitHub login and accepts at most 10 submissions per login per 24 hours. W&B can be online or offline; online runs add a public W&B link, while source review always comes from the local snapshot. Smoke checks and failed runs stay local. The labless website, run log, and plot update automatically; new completed full runs stay `pending` until maintainer validation. See [labless/README.md](labless/README.md) for details.
+The script reads `summary.json` and `metrics.jsonl`, reviews `output_dir/labless_source` rather than your current working tree, and posts the local payload in `labless_submission.json` after GitHub device sign-in succeeds. W&B can be online or offline; online runs add a public W&B link, while source review always comes from the local snapshot. The labless website, run log, and plot update automatically. See [labless/README.md](labless/README.md) for the exact payload fields, dry-run mode, baseline submission notes, and validation policy.
 
 ## Repository layout
 
@@ -140,9 +159,9 @@ The script reads `summary.json` and `metrics.jsonl`, uses the run's saved source
 
 ## Data
 
-`prepare.py` prepares the necessary data for pretraining and downstream probing. Flag `download=True` to fetch/prepare the configured datasets into the folders specified by the YAML; flag `download=False` to verify that all required paths are already populated.
+`prepare.py` prepares the necessary data for pretraining and downstream probing. By default it reads `configs/main.yaml`; pass a YAML path before the flag to prepare a different config, e.g. `python prepare.py configs/smoke.yaml download=True`. Flag `download=True` to fetch/prepare the configured datasets into the folders specified by the YAML; flag `download=False` to verify that all required paths are already populated.
 
-On the MedARC cluster, the checked-in `/data` and `/block` paths are the intended defaults. On a fresh clone with no such mounts, `prepare.py … download=True` rewrites those roots in place in the config you pass (data, probes, `output_dir`, `wandb_dir`) to point into `nanopath/data/<name>`, preserving all comments — so it just works with no manual YAML edits, and `train.py`/`probe.py` then read the corrected config unchanged. Only roots that are missing and whose `/data` or `/block` mount is absent or not writable get rewritten; the rewrite is idempotent and a no-op on the cluster. To point elsewhere, edit `data.dataset_dir` and the `probe.dataset_roots.*` paths to writable storage before downloading.
+On the MedARC cluster, the checked-in `/data` and `/block` paths are the intended populated shared defaults. On a fresh clone, `prepare.py … download=True` rewrites any missing or empty checked-in data/probe roots to point into `nanopath/data/<name>`, preserving comments and formatting. It also moves `output_dir` and `wandb_dir` into `nanopath/data/` whenever a config's data roots are localized. The rewrite updates the selected config plus the checked-in `configs/main.yaml` and `configs/smoke.yaml`, so running prepare once still leaves both smoke and main directly runnable afterward. This happens even if the machine has a `/data` mount but lacks `/data/nanopath_parquet`. Populated shared roots are left unchanged. To force a different storage location, edit `data.dataset_dir`, `probe.dataset_roots.*`, `project.output_dir`, and `project.wandb_dir` to existing writable paths before downloading.
 
 **What `download=True` does**
 1. **TCGA tiles**: `huggingface_hub.snapshot_download` (filtered to `shard-*.parquet`) pulls the 200 parquet shards (~120 GB total, `{path: string, jpeg: binary}` rows with 64-row row groups) from [`medarc/nanopath`](https://huggingface.co/datasets/medarc/nanopath) into `data.dataset_dir`.
@@ -199,10 +218,10 @@ sbatch submit/train_1gpu.sbatch configs/main.yaml
 
 ## Outputs
 
-The `/data`- and `/block`-rooted defaults below are the MedARC cluster layout; on a fresh clone with neither mount, `prepare.py … download=True` rewrites these roots (data, probes, `output_dir`, `wandb_dir`) in the config to live under `nanopath/data/` instead.
+The `/data`- and `/block`-rooted defaults below are the MedARC cluster layout; `prepare.py … download=True` rewrites missing or empty data/probe defaults in the selected config plus `configs/{main,smoke}.yaml` to live under `nanopath/data/` instead, and it localizes run outputs/W&B logs there too for those rewritten configs.
 
-- run outputs: `project.output_dir` (default is `/data/$USER/nanopath/main/...`). Final probe results log to `metrics.jsonl`.
-- wandb: `/data/$USER/nanopath/wandb`.
+- run outputs: `project.output_dir` (cluster default `/data/$USER/nanopath/main/...`; auto-localized default `nanopath/data/main/...`). Final probe results log to `metrics.jsonl`.
+- wandb: `project.wandb_dir` (cluster default `/data/$USER/nanopath/wandb`; auto-localized default `nanopath/data/wandb`).
 - parquet tile shards: `data.dataset_dir` (defaults to `/data/nanopath_parquet`).
 - probe datasets: `probe.dataset_roots` (defaults to shared `/block/...` and `/data/...` paths on the MedARC cluster).
 - DINOv2 backbone weights: `~/.cache/torch/hub/checkpoints/` for the selected `model.type`.
