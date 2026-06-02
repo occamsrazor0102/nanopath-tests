@@ -50,7 +50,7 @@ Score is final `mean_probe_score` across our 11-dataset benchmarking suite, asse
 
 | # | Description | final score | linear | knn | 16-shot | segmentation | progression | mutation | survival | robustness | Contributors |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| 1 | DINOv2-small/14-reg trained on TCGA w KDE| 0.5713 | 0.7544 | 0.6805 | 0.5940 | 0.3185 | 0.6356 | 0.5989 | 0.5354 | 0.8538 | @PaulScotti |
+| 1 | DINOv2-small/14-reg trained on TCGA w KDE| 0.5670 | 0.7546 | 0.6862 | 0.5912 | 0.3028 | 0.6387 | 0.5991 | 0.5302 | 0.8510 | @PaulScotti |
 
 ### Baselines
 
