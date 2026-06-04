@@ -28,7 +28,7 @@ python prepare.py download=True
 # auto-submits to Labless if config passes submission requirements and you provide run name/notes & GitHub login
 RUN_DIR=$PWD/data/main/my-run
 ./submit/train_1gpu.sbatch configs/main.yaml output_dir=$RUN_DIR
-# or directly on a GPU machine without auto-submit: python train.py configs/main.yaml output_dir=$RUN_DIR
+# or directly on a GPU machine: python train.py configs/main.yaml output_dir=$RUN_DIR
 ```
 
 `pyproject.toml` pins `torch` / `torchvision` against the CUDA 12.9 wheel index. If your GPU/driver needs a different CUDA build, edit the `torch` and `torchvision` lines in `pyproject.toml` before `uv sync`.

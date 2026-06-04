@@ -46,7 +46,6 @@ HF_REPO_ID = "medarc/nanopath"
 HF_PROBE_PREFIX = "probes"
 PROBE_ACCESS_NOTICES = {
     "consep": "you MUST satisfy the official CoNSeP/Warwick access terms at https://warwick.ac.uk/fac/sci/dcs/research/tia/data/hovernet/ before using these data; this mirror download is only for portable setup.",
-    "leopard_bcr": "LEOPARD BCR is rehosted in medarc/nanopath with organizer permission; see https://leopard.grand-challenge.org/ for the upstream challenge.",
     "mhist": "you MUST complete MHIST's Dataset Research Use Agreement at https://bmirds.github.io/MHIST/ before using these data; this mirror download is only for portable setup.",
 }
 TILE_SIZE = 224
