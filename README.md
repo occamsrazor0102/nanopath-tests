@@ -100,7 +100,7 @@ Public full-run submissions must satisfy:
 - no saved-source changes to `probe.py` or anything under `benchmarking/`
 - no locked probe config changes except local `probe.dataset_roots`
 
-The `run_name` is the short label shown next to your dot on the Labless plot; keep it under 20 characters and make it describe what changed. Short smoke-sized runs, failed runs, and runs missing the saved source snapshot stay local. Each verified GitHub login can submit at most 10 runs per 24 hours.
+The `run_name` is the short label shown next to your dot on the Labless plot; keep it under 20 characters and make it describe what changed. Short smoke-sized runs, failed runs, and runs missing the saved source snapshot stay local. Each verified GitHub login can submit at most 20 runs per 24 hours.
 
 To top the leaderboard you must beat the highest validated Labless run on `mean_probe_score` by at least 0.006. Public submissions have no wall-clock limit, so train on whatever hardware you have access to. [@PaulScotti](https://github.com/PaulScotti) will inspect promising submissions, independently rerun candidates that pass this threshold on maintainer compute with a different rng seed, and validate them on Labless if training completes within 2 hours and the rerun still improves by at least 0.006. If the candidate code is pushed to nanopath `main`, Labless marks that run separately as `main`. **You don't need an H100 or a PR to submit**; labless handles the public record and maintainer validation.
 

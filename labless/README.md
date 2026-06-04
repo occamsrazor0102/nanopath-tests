@@ -30,7 +30,7 @@ RUN_DIR=$PWD/data/main/my-run
 
 The labless backend stores the submission as a run with saved source context and
 an optional W&B run link. It derives the public contributor from the verified
-GitHub login, rejects scoped OAuth tokens, and accepts at most 10 submissions per
+GitHub login, rejects scoped OAuth tokens, and accepts at most 20 submissions per
 login per 24 hours. The website fetches the API data and the SVG plot from
 `api.labless.dev`, so the run appears in the project log, run table, and plot
 without opening a pull request.
