@@ -237,10 +237,10 @@ def required(opts: dict[str, str], key: str) -> str:
 
 def public_config_path(value: Any) -> str:
     config_path = str(value)
-    match = re.search(r"(?:^|/)(configs/[A-Za-z0-9._-]+\.ya?ml)$", config_path)
+    match = re.search(r"(?:^|/)(configs/[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml)$", config_path)
     if match:
         return match.group(1)
-    if config_path.startswith("/") or "\\" in config_path or not re.match(r"^configs/[A-Za-z0-9._-]+\.ya?ml$", config_path):
+    if config_path.startswith("/") or "\\" in config_path or not re.match(r"^configs/[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml$", config_path):
         raise ValueError("summary.config_path must be a repo-relative configs/*.yaml path")
     return config_path
 
@@ -458,7 +458,7 @@ def collect_review_files(source: str, source_dir: Path, review_paths: list[str])
 
 
 def review_path_allowed(path: str) -> bool:
-    return path in REVIEW_DIFF_PATHS or bool(re.match(r"^configs/[A-Za-z0-9._-]+\.ya?ml$", path))
+    return path in REVIEW_DIFF_PATHS or bool(re.match(r"^configs/[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml$", path))
 
 
 def new_source_path_blocked(path: str) -> bool:
@@ -466,12 +466,16 @@ def new_source_path_blocked(path: str) -> bool:
 
 
 def changed_source_paths(commit: str, source_dir: Path) -> list[str]:
-    source_files = [
-        p.relative_to(source_dir).as_posix()
-        for p in source_dir.rglob("*")
-        if p.is_file() and p.name != "manifest.json" and not p.relative_to(source_dir).as_posix().startswith("labless/")
+    source_files = []
+    for p in source_dir.rglob("*"):
+        rel_path = p.relative_to(source_dir)
+        rel = rel_path.as_posix()
+        if p.is_file() and p.name != "manifest.json" and not rel.startswith("labless/") and not any(part.startswith(".") for part in rel_path.parts):
+            source_files.append(rel)
+    main_files = [
+        path for path in subprocess.check_output(["git", "ls-tree", "-r", "--name-only", commit, "--", *REVIEW_DIFF_PATHS, *LOCKED_PATHS], text=True).splitlines()
+        if not any(part.startswith(".") for part in Path(path).parts)
     ]
-    main_files = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", commit, "--", *REVIEW_DIFF_PATHS, *LOCKED_PATHS], text=True).splitlines()
     paths = sorted(set(source_files + main_files))
     return [path for path in paths if main_file(commit, path) != snapshot_file(source_dir, path)]
 
@@ -479,7 +483,7 @@ def changed_source_paths(commit: str, source_dir: Path) -> list[str]:
 def locked_probe_config_errors(source_dir: Path, review_paths: list[str]) -> list[str]:
     errors: list[str] = []
     for path in review_paths:
-        if not re.match(r"^configs/[A-Za-z0-9._-]+\.ya?ml$", path):
+        if not re.match(r"^configs/[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml$", path):
             continue
         data = snapshot_file(source_dir, path)
         if data is None:
@@ -583,8 +587,16 @@ def file_diff(path: str, main_data: bytes | None, source_data: bytes | None) -> 
 
 
 def locked_path_changes(commit: str, source_dir: Path) -> list[str]:
-    source_files = [p.relative_to(source_dir).as_posix() for p in source_dir.rglob("*") if p.is_file() and p.name != "manifest.json" and not p.relative_to(source_dir).as_posix().startswith("labless/")]
-    main_files = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", commit, "--", *LOCKED_PATHS], text=True).splitlines()
+    source_files = []
+    for p in source_dir.rglob("*"):
+        rel_path = p.relative_to(source_dir)
+        rel = rel_path.as_posix()
+        if p.is_file() and p.name != "manifest.json" and not rel.startswith("labless/") and not any(part.startswith(".") for part in rel_path.parts):
+            source_files.append(rel)
+    main_files = [
+        path for path in subprocess.check_output(["git", "ls-tree", "-r", "--name-only", commit, "--", *LOCKED_PATHS], text=True).splitlines()
+        if not any(part.startswith(".") for part in Path(path).parts)
+    ]
     locked_files = sorted(path for path in set(source_files + main_files) if any(path == lock.rstrip("/") or path.startswith(lock) for lock in LOCKED_PATHS))
     return [path for path in locked_files if main_file(commit, path) != snapshot_file(source_dir, path)]
 

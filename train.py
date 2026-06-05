@@ -315,7 +315,10 @@ def main():
     def artifact_ignored(path):
         if any(path.resolve().is_relative_to(root) for root in ignored_roots):
             return True
-        rel, name = path.relative_to(repo_dir).as_posix(), path.name
+        rel_path = path.relative_to(repo_dir)
+        if any(part.startswith(".") for part in rel_path.parts):
+            return True
+        rel, name = rel_path.as_posix(), path.name
         for pat in artifact_ignore:
             pat = pat.rstrip("/") if pat.endswith("/") else pat
             if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel, pat) or rel == pat or rel.startswith(pat + "/"):
