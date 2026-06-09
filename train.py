@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, load_dinov2_pretrained
+from model import DINOHead, DinoV2ViT, JEPAPredictor, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -163,11 +163,26 @@ def kde_loss(x, concentration):
 
 
 # Sample iBOT masking pattern: per-image bernoulli on whether to mask, then random patch ratio.
-def make_masks(batch, patches, device):
+def make_masks(batch, patches, device, mask_prob=0.5):
     masks = torch.zeros(batch, patches, dtype=torch.bool, device=device)
     for i in range(batch):
-        if random.random() < 0.5:
+        if random.random() < mask_prob:
             masks[i, torch.randperm(patches, device=device)[: int(patches * random.uniform(0.1, 0.45))]] = True
+    idx = masks.flatten().nonzero().flatten()
+    weights = (1 / masks.sum(-1).clamp(min=1)).unsqueeze(-1).expand_as(masks)[masks]
+    return masks, idx, weights
+
+
+# I-JEPA target mask: contiguous square blocks instead of iBOT's scattered random patches.
+def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10):
+    masks = torch.zeros(batch, grid, grid, dtype=torch.bool, device=device)
+    side = max(1, round(grid * block_scale**0.5))
+    for i in range(batch):
+        for _ in range(n_blocks):
+            top = random.randint(0, grid - side)
+            left = random.randint(0, grid - side)
+            masks[i, top : top + side, left : left + side] = True
+    masks = masks.flatten(1)
     idx = masks.flatten().nonzero().flatten()
     weights = (1 / masks.sum(-1).clamp(min=1)).unsqueeze(-1).expand_as(masks)[masks]
     return masks, idx, weights
@@ -177,13 +192,13 @@ def make_masks(batch, patches, device):
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
 # multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
 # final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
-def build_param_groups(student_backbone, student_dino_head, student_ibot_head, layerwise_decay, patch_embed_lr_mult):
+def build_param_groups(student_backbone, head_modules, layerwise_decay, patch_embed_lr_mult):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
     # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
     coalesced = {}
-    modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_ibot_head, "ibot_head"))
+    modules = ((student_backbone, "backbone"), *((m, "head") for m in head_modules))
     for module, kind in modules:
         for name, p in module.named_parameters():
             if not p.requires_grad:
@@ -233,15 +248,31 @@ def main():
     for p in teacher_backbone.parameters():
         p.requires_grad = False
     student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
-    student_ibot_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
-    teacher_ibot_head = deepcopy(student_ibot_head)
+    jepa = float(dino_cfg.get("jepa_weight", 0.0)) > 0
+    if jepa:
+        student_ibot_head = None
+        teacher_ibot_head = None
+        student_predictor = JEPAPredictor(
+            student_backbone.embed_dim,
+            depth=int(dino_cfg["jepa_pred_depth"]),
+            width=int(dino_cfg["jepa_pred_width"]),
+        ).to(device)
+        patch_modules = [student_predictor]
+    else:
+        student_ibot_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+        teacher_ibot_head = deepcopy(student_ibot_head)
+        student_predictor = None
+        patch_modules = [student_ibot_head]
     for m in (teacher_dino_head, teacher_ibot_head):
+        if m is None:
+            continue
         for p in m.parameters():
             p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
     # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
-    opt = torch.optim.AdamW(build_param_groups(student_backbone, student_dino_head, student_ibot_head, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"]), lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
+    opt = torch.optim.AdamW(build_param_groups(student_backbone, [student_dino_head, *patch_modules], dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"]), lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
+    warmup_fraction = float(dino_cfg.get("warmup_flop_fraction", dino_cfg.get("warmup_fraction", 0.03)))
     step = 0
     batch_size = int(train_cfg["batch_size"])
     max_train_samples = int(train_cfg["max_train_samples"])
@@ -271,9 +302,12 @@ def main():
         student_backbone.load_state_dict(checkpoint["model"])
         teacher_backbone.load_state_dict(checkpoint["model_ema"])
         student_dino_head.load_state_dict(checkpoint["dino_head"])
-        student_ibot_head.load_state_dict(checkpoint["ibot_head"])
         teacher_dino_head.load_state_dict(checkpoint["dino_head_ema"])
-        teacher_ibot_head.load_state_dict(checkpoint["ibot_head_ema"])
+        if jepa:
+            student_predictor.load_state_dict(checkpoint["predictor"])
+        else:
+            student_ibot_head.load_state_dict(checkpoint["ibot_head"])
+            teacher_ibot_head.load_state_dict(checkpoint["ibot_head_ema"])
         opt.load_state_dict(checkpoint["opt"])
         step = int(checkpoint["step"])
         examples_seen = int(checkpoint["examples_seen"])
@@ -300,7 +334,7 @@ def main():
         f"{console_prefix()} Run  start: {wandb_name}  "
         f"config: {cfg['config_path']}  batch_size: {batch_size}  max_train_samples: {max_train_samples}  "
         f"max_train_flops: {train_cfg['max_train_flops']}  "
-        f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
+        f"probe_count: {cfg['probe']['count']}  warmup_fraction: {warmup_fraction}  "
         f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
         f"kde_concentration: {dino_cfg['kde_concentration']}  drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
@@ -360,7 +394,8 @@ def main():
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     activation_checkpointing = bool(train_cfg["activation_checkpointing"])
-    global_patches = (train_cfg["global_size"] // student_backbone.patch_size) ** 2
+    global_grid = train_cfg["global_size"] // student_backbone.patch_size
+    global_patches = global_grid**2
     local_patches = (train_cfg["local_size"] // student_backbone.patch_size) ** 2
     last_time = time.time()
     last_examples = examples_seen
@@ -379,10 +414,23 @@ def main():
         payload = {"model": cpu_state(student_backbone), "model_ema": cpu_state(teacher_backbone), "step": next_step, "config": cfg}
         if not full:
             return payload
-        return {**payload, "dino_head": cpu_state(student_dino_head), "ibot_head": cpu_state(student_ibot_head),
-                "dino_head_ema": cpu_state(teacher_dino_head), "ibot_head_ema": cpu_state(teacher_ibot_head),
-                "opt": opt.state_dict(), "examples_seen": examples_seen,
-                "visible_patch_presentations": visible_patch_presentations, "train_flops": train_flops, "wandb": wandb_meta}
+        payload.update(
+            {
+                "dino_head": cpu_state(student_dino_head),
+                "dino_head_ema": cpu_state(teacher_dino_head),
+                "opt": opt.state_dict(),
+                "examples_seen": examples_seen,
+                "visible_patch_presentations": visible_patch_presentations,
+                "train_flops": train_flops,
+                "wandb": wandb_meta,
+            }
+        )
+        if jepa:
+            payload["predictor"] = cpu_state(student_predictor)
+        else:
+            payload["ibot_head"] = cpu_state(student_ibot_head)
+            payload["ibot_head_ema"] = cpu_state(teacher_ibot_head)
+        return payload
 
     def save_latest_checkpoint(checkpoint_step):
         nonlocal last_saved_step
@@ -414,15 +462,21 @@ def main():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
             t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
-            t_patch_prob = sinkhorn(teacher_ibot_head(t["x_norm_patchtokens"].flatten(0, 1)[mask_idx]), t_temp)
+            if not jepa:
+                t_patch_prob = sinkhorn(teacher_ibot_head(t["x_norm_patchtokens"].flatten(0, 1)[mask_idx]), t_temp)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
         sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
         L = train_cfg["local_views"]
         local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
-        s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
-        ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
+        if jepa:
+            target = F.layer_norm(t["x_norm_patchtokens"].flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]
+            pred = student_predictor(sg["x_norm_patchtokens"]).flatten(0, 1)[mask_idx]
+            ibot_loss = float(dino_cfg["jepa_weight"]) * F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
+        else:
+            s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
+            ibot_loss = float(dino_cfg.get("ibot_loss_weight", 1.0)) * -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
         return local_loss + global_loss, ibot_loss, kde
 
@@ -430,7 +484,7 @@ def main():
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
     # diagnostics. RNG is snapshotted/restored so val masks don't perturb the next training step.
     def evaluate(eval_step, eval_teacher_temp, eval_kde_scale):
-        for m in (student_backbone, student_dino_head, student_ibot_head):
+        for m in (student_backbone, student_dino_head, *patch_modules):
             m.eval()
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
@@ -444,7 +498,17 @@ def main():
             b = vg.shape[0]
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
-                masks, mask_idx, mask_w = make_masks(b * train_cfg["global_views"], global_patches, device)
+                masks, mask_idx, mask_w = (
+                    make_block_mask(
+                        b * train_cfg["global_views"],
+                        global_grid,
+                        device,
+                        n_blocks=int(dino_cfg.get("jepa_blocks", 4)),
+                        block_scale=float(dino_cfg["jepa_block_scale"]),
+                    )
+                    if jepa
+                    else make_masks(b * train_cfg["global_views"], global_patches, device, float(dino_cfg.get("mask_prob", 0.5)))
+                )
                 dino_l, ibot_l, kde_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(ibot_l), float(kde_v), float(dino_l + ibot_l + kde_v)], device=device)
             n_batches += 1
@@ -478,7 +542,7 @@ def main():
 
     log_probe_results()
     max_train_flops = int(train_cfg["max_train_flops"])
-    warmup_train_samples = math.ceil(max_train_samples * dino_cfg["warmup_fraction"])
+    warmup_train_samples = math.ceil(max_train_samples * warmup_fraction)
     # Probe targets are sample milestones: one tile counts once even with many global/local crops.
     probe_count = int(cfg["probe"]["count"]) if probe_enabled(cfg) else 0
     probe_targets = [math.ceil(max_train_samples * (i + 1) / probe_count) for i in range(probe_count)]
@@ -509,7 +573,8 @@ def main():
             data_seconds = batch_started_at - data_wait_started_at
             student_backbone.train()
             student_dino_head.train()
-            student_ibot_head.train()
+            for m in patch_modules:
+                m.train()
             completed_step = step + 1
             should_log = completed_step == 1 or completed_step % train_cfg["log_every"] == 0
             # Data identifiers stay on CPU and feed coverage metrics; image tensors move below.
@@ -523,7 +588,7 @@ def main():
             if warmup < 1.0:
                 lr = dino_cfg["lr"] * warmup
             else:
-                lr = cosine_schedule(dino_cfg["lr"], dino_cfg["lr_min"], (frac - dino_cfg["warmup_fraction"]) / max(1e-9, 1 - dino_cfg["warmup_fraction"]))
+                lr = cosine_schedule(dino_cfg["lr"], dino_cfg["lr_min"], (frac - warmup_fraction) / max(1e-9, 1 - warmup_fraction))
             wd = cosine_schedule(0.04, 0.2, frac)
             teacher_temp = 0.04 + min(1.0, frac / 0.2727) * (0.07 - 0.04)
             last_layer_lr = 0.0 if frac < dino_cfg["freeze_last_layer_fraction"] else lr
@@ -531,7 +596,17 @@ def main():
                 base_lr = last_layer_lr if group["last_layer"] else lr
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
-            masks, mask_idx, mask_w = make_masks(batch_size * train_cfg["global_views"], global_patches, device)
+            masks, mask_idx, mask_w = (
+                make_block_mask(
+                    batch_size * train_cfg["global_views"],
+                    global_grid,
+                    device,
+                    n_blocks=int(dino_cfg.get("jepa_blocks", 4)),
+                    block_scale=float(dino_cfg["jepa_block_scale"]),
+                )
+                if jepa
+                else make_masks(batch_size * train_cfg["global_views"], global_patches, device, float(dino_cfg.get("mask_prob", 0.5)))
+            )
             kde_scale = min(1.0, max(0.0, (frac - 0.1) / 0.4))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
@@ -550,7 +625,7 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(
-                    [*student_backbone.parameters(), *student_dino_head.parameters(), *student_ibot_head.parameters()],
+                    [*student_backbone.parameters(), *student_dino_head.parameters(), *(p for m in patch_modules for p in m.parameters())],
                     dino_cfg["clip_grad"],
                 )
                 opt.step()
@@ -562,7 +637,8 @@ def main():
                 m = cosine_schedule(0.994, 1.0, frac)
                 update_ema(student_backbone, teacher_backbone, m)
                 update_ema(student_dino_head, teacher_dino_head, m)
-                update_ema(student_ibot_head, teacher_ibot_head, m)
+                if not jepa:
+                    update_ema(student_ibot_head, teacher_ibot_head, m)
             step_seconds = time.monotonic() - batch_started_at
             examples_seen += batch_size
             visible_patch_presentations += visible_now
@@ -701,7 +777,7 @@ def main():
         # Average throughput over the train loop; wall time is diagnostic, not an eligibility cap.
         "flops_per_sec": train_flops / max(1.0, train_loop_wall_seconds),
         "visible_patches_per_sec": visible_patch_presentations / max(1.0, train_loop_wall_seconds),
-        "warmup_fraction": dino_cfg["warmup_fraction"],
+        "warmup_fraction": warmup_fraction,
         "warmup_train_samples": warmup_train_samples,
         "lr": dino_cfg["lr"],
         "adam_beta2": dino_cfg["adam_beta2"],
