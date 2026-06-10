@@ -6,6 +6,8 @@ project:
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
+  # dataset_dir holds the parquet shards (shard-NNNNN.parquet) that train.py reads.
+  # `prepare.py … download=True` populates it from the medarc/nanopath HF mirror.
   dataset_dir: /data/nanopath_parquet
   split_seed: 7777
   val_fraction: 0.05
@@ -16,7 +18,7 @@ data:
   color_jitter: 0.3
   color_jitter_saturation: 0.25
   hed_jitter: 0.06
-  tissue_thresh: 0.0
+  tissue_thresh: 0.0 # 0 disables tissue rejection; >0 requires this saturated-pixel fraction
 
 model:
   type: dinov2_vits14_reg
@@ -29,17 +31,18 @@ train:
   num_workers: 16
   prefetch_factor: 2
   persistent_workers: true
-  max_train_samples: 1000000
-  max_train_flops: 1000000000000000000
+  max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
+  max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
   log_every: 100
   save_every: 1000
+  # Validation pass every `eval_every` steps over `val_batches` held-out batches
   eval_every: 200
   val_batches: 16
   global_views: 2
   local_views: 8
   global_size: 224
   local_size: 112
-  resume: null
+  resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
 
 dino:
   lr: 1.0e-4
@@ -63,7 +66,7 @@ dino:
 probe:
   enabled: true
   model_weights: ema
-  count: 1
+  count: 1 # 4 means probing at 25%, 50%, 75%, and 100% of the sample cap. 1 means probing just at the end.
   datasets:
     - bracs
     - break_his

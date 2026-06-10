@@ -187,7 +187,7 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
     # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
     coalesced = {}
-    modules = ((student_backbone, "backbone"), (student_dino_head, "head"), (student_predictor, "head"))
+    modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_predictor, "jepa_predictor"))
     for module, kind in modules:
         for name, p in module.named_parameters():
             if not p.requires_grad:

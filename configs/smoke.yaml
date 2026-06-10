@@ -6,6 +6,8 @@ project:
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
+  # dataset_dir holds the parquet shards (shard-NNNNN.parquet) that train.py reads.
+  # `prepare.py … download=True` populates it from the medarc/nanopath HF mirror.
   dataset_dir: /data/nanopath_parquet
   split_seed: 42
   val_fraction: 0.05
@@ -16,7 +18,7 @@ data:
   color_jitter: 0.3
   color_jitter_saturation: 0.25
   hed_jitter: 0.06
-  tissue_thresh: 0.0
+  tissue_thresh: 0.0 # 0 disables tissue rejection; >0 requires this saturated-pixel fraction
 
 model:
   type: dinov2_vits14_reg
