@@ -244,7 +244,6 @@ def main():
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
     # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
     opt = torch.optim.AdamW(build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"]), lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
-    warmup_fraction = float(dino_cfg["warmup_fraction"])
     step = 0
     batch_size = int(train_cfg["batch_size"])
     max_train_samples = int(train_cfg["max_train_samples"])
@@ -302,7 +301,7 @@ def main():
         f"{console_prefix()} Run  start: {wandb_name}  "
         f"config: {cfg['config_path']}  batch_size: {batch_size}  max_train_samples: {max_train_samples}  "
         f"max_train_flops: {train_cfg['max_train_flops']}  "
-        f"probe_count: {cfg['probe']['count']}  warmup_fraction: {warmup_fraction}  "
+        f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
         f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
         f"kde_concentration: {dino_cfg['kde_concentration']}  drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
@@ -481,7 +480,7 @@ def main():
 
     log_probe_results()
     max_train_flops = int(train_cfg["max_train_flops"])
-    warmup_train_samples = math.ceil(max_train_samples * warmup_fraction)
+    warmup_train_samples = math.ceil(max_train_samples * dino_cfg["warmup_fraction"])
     # Probe targets are sample milestones: one tile counts once even with many global/local crops.
     probe_count = int(cfg["probe"]["count"]) if probe_enabled(cfg) else 0
     probe_targets = [math.ceil(max_train_samples * (i + 1) / probe_count) for i in range(probe_count)]
@@ -526,7 +525,7 @@ def main():
             if warmup < 1.0:
                 lr = dino_cfg["lr"] * warmup
             else:
-                lr = cosine_schedule(dino_cfg["lr"], dino_cfg["lr_min"], (frac - warmup_fraction) / max(1e-9, 1 - warmup_fraction))
+                lr = cosine_schedule(dino_cfg["lr"], dino_cfg["lr_min"], (frac - dino_cfg["warmup_fraction"]) / max(1e-9, 1 - dino_cfg["warmup_fraction"]))
             wd = cosine_schedule(0.04, 0.2, frac)
             teacher_temp = 0.04 + min(1.0, frac / 0.2727) * (0.07 - 0.04)
             last_layer_lr = 0.0 if frac < dino_cfg["freeze_last_layer_fraction"] else lr
@@ -703,7 +702,7 @@ def main():
         # Average throughput over the train loop; wall time is diagnostic, not an eligibility cap.
         "flops_per_sec": train_flops / max(1.0, train_loop_wall_seconds),
         "visible_patches_per_sec": visible_patch_presentations / max(1.0, train_loop_wall_seconds),
-        "warmup_fraction": warmup_fraction,
+        "warmup_fraction": dino_cfg["warmup_fraction"],
         "warmup_train_samples": warmup_train_samples,
         "lr": dino_cfg["lr"],
         "adam_beta2": dino_cfg["adam_beta2"],
