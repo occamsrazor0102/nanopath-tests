@@ -25,3 +25,21 @@ Hypotheses: W1-base confirms we reproduce 0.6471 (control for all FINO deltas). 
 on JEPA. W1-s isolates the histotype anchor (most robust single factor in the DINO sweep). W1-se-rr tests the
 run-keyed DANN ramp (nanopath is sample-capped at ~19% of FLOP budget; flop-keyed gamma stalls at ~0.74).
 Results + Wave 2 design pending (~1 hr).
+
+## Literature (scan 2026-06-11, ingested AdvDINO -> geist)
+- **Novelty:** FINO M+/M- on a JEPA objective in pathology is novel. Precedents: AdvDINO (2508.04955, DANN on
+  slide-ID atop DINOv2 — gate stacks, slide-ARI 0.663->0.037, survival +0.010); JEPA-T (2510.00974, metadata-
+  conditioned JEPA predictor, T2I not pathology); GenBio-PathFM (JEPA as stage-2 on frozen DINO). None combine all.
+- **JEPA framing:** "Pretext Matters" (2603.22649) — JEAs > JEPAs for spatially-localized signal (tile pathology);
+  JEPA earns its keep only as an AUXILIARY on a DINO spine. Our leader recipe IS that shape -> keep DINO-CLS spine.
+- **Weighting:** don't import lambda blindly (AdvDINO 50 vs FINO 0.03; magnitudes differ). GRADNORM-MATCH the meta
+  branch to the SSL gradient. We log grad_norm -> use it. Wave-2 lever: sweep gamma_max / lambda_meta for JEPA.
+- **Entanglement gotcha:** U(cancer|TSS)=1.0 -> solo TSS/scanner-M- reverses cancer signal; suppression must be
+  PAIRED with an M+ anchor (subtype/cancer). Pure-suppression alone ~+0.01 (borderline). M+ anchor carries the EV.
+- **Mechanism check:** for any M- run, measure slide/TSS-clustering ARI drop ("adversary working" signal) before
+  expecting probe gains. **Novel idea (Wave 2/3):** condition JEPAPredictor on cancer-type embedding (JEPA-T style).
+
+## Wave 2 candidate directions (finalize FROM Wave-1 results)
+- if jf_sub_expr512 > jepa_base by >+0.01: push M+ stacking (subtype+expr512+morphology / +fga) + gamma_max sweep.
+- if FINO ~flat on JEPA: gradnorm-match meta (raise gamma_max), OR try the JEPA-T metadata-conditioned predictor.
+- paired cancer-M+/TSS-M- (entanglement-safe suppression) as a separate track once an M+ anchor is confirmed.
