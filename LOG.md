@@ -82,3 +82,22 @@ seg cost. Optimum at low gamma. NOTE deltas now ~noise floor (DINO-era 3-seed st
 | W3-g05s2 | jf_se_g05_s2 | gamma 0.5, seed 1337 | RESEED of best — is 0.6482 real vs noise? |
 | W3-morph-g05 | jf_morph_g05 | +morphology, gamma 0.5 | best stack at gentle gamma (less seg damage) |
 | W3-fga-g05 | jf_se_fga_g05 | +fga (continuous), gamma 0.5 | DINO-era #3 stack at gentle gamma |
+
+## Wave 3 RESULTS (10:01) — best recipe beats leader (2-seed); gamma peak = 0.5
+| id | recipe | score | knn | seg | surv | note |
+|----|--------|------:|----:|----:|-----:|------|
+| W3-g05s2 | subtype+expr512 g0.5 seed1337 | **0.6510** | 0.719 | 0.303 | 0.601 | reseed > orig 0.6482; +0.0074 vs control |
+| W3-fga-g05 | +fga g0.5 | 0.6477 | 0.709 | 0.299 | 0.589 | neutral |
+| W3-g03 | g0.3 | 0.6465 | 0.717 | 0.302 | 0.581 | too gentle; peak is 0.5 |
+| W3-morph-g05 | +morph g0.5 | 0.6429 | 0.709 | 0.291 | 0.560 | morph HURTS (surv crash) |
+Best = subtype+expr512 @ gamma 0.5: seeds {0.6482, 0.6510} mean ~0.6496 (both > leader 0.6471, > control 0.6436).
+gamma peak confirmed at 0.5; at g0.5 seg loss ~vanishes -> seg no longer the limit, M+ magnitude is. Stacking
+(morph/fga) does not help -> subtype+expr512 is THE recipe. Noise ~0.0028 -> need more seeds for a firm lead claim.
+
+## Wave 4 (launched 10:01, 4-wide) — exploit config space + 3rd seed
+| id | job | recipe | hypothesis |
+|----|-----|--------|-----------|
+| W4-g065 | jf_se_g065 | subtype+expr512 gamma 0.65 | true peak between 0.5 and 1.0? |
+| W4-cancer | jf_cancer_expr512_g05 | cancer+expr512 g0.5 | organ-level anchor cleaner than 40-class subtype? |
+| W4-til | jf_subexpr_til_g05 | subtype+expr512+til g0.5 | TIL was DINO-era best generalist add (E19) |
+| W4-g05s3 | jf_se_g05_s3 | subtype+expr512 g0.5 seed2024 | 3rd seed -> credible mean for the lead claim |
