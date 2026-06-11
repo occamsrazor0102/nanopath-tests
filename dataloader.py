@@ -20,6 +20,7 @@
 
 import hashlib
 import io
+import json
 import random
 from pathlib import Path
 
@@ -124,6 +125,17 @@ class TCGATileDataset(Dataset):
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
+        # FINO metadata, built/copied once by prepare.py: per-factor barcode->id (discrete) / barcode->value
+        # (continuous, z-scored) maps. cfg.fino.discrete/continuous select factors and their sign (+ encourage /
+        # - suppress). Loaded once so DataLoader fork-workers share it copy-on-write; train.py masks absent ones.
+        self.fino = (cfg.get("fino") or {}).get("enabled")
+        if self.fino:
+            meta = json.loads((dataset_dir / "fino_meta.json").read_text())
+            self.fino_disc = [f for f, _ in cfg["fino"].get("discrete", [])]
+            self.fino_cont = [f for f, _ in cfg["fino"].get("continuous", [])]
+            self.meta_disc = {f: meta["discrete"][f] for f in self.fino_disc}
+            self.meta_cont = {f: meta["continuous"][f] for f in self.fino_cont}
+            self.cont_dim = {f: (len(next(iter(v.values()))) if v and isinstance(next(iter(v.values())), list) else 1) for f, v in self.meta_cont.items()}
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
@@ -192,10 +204,20 @@ class TCGATileDataset(Dataset):
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
         global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
+        # FINO per-factor labels for this tile's patient: discrete ids (-1 = missing), one tensor per continuous
+        # factor (scalar or vector; nan-filled if missing). train.py masks missing branches out per-factor.
+        fino_keys = {}
+        if self.fino:
+            fino_keys["meta_disc"] = torch.tensor([self.meta_disc[f].get(patient_id, -1) for f in self.fino_disc], dtype=torch.int64)
+            for f in self.fino_cont:
+                v = self.meta_cont[f].get(patient_id)
+                v = [float("nan")] * self.cont_dim[f] if v is None else (v if isinstance(v, list) else [v])
+                fino_keys[f"mc_{f}"] = torch.tensor(v, dtype=torch.float32)
         return {
             "global_views": global_views,
             "local_views": local_views,
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
+            **fino_keys,
         }

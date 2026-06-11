@@ -46,6 +46,15 @@ class LayerScale(nn.Module):
     def forward(self, x): return x * self.gamma
 
 
+# FINO gradient gate: identity forward, scales the gradient by `scale` on backward. sign>0 encourages the
+# encoder to predict a metadata factor (M+); sign<0 reverses the gradient to suppress it (M-, DANN-style).
+class GradScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale): ctx.scale = scale; return x
+    @staticmethod
+    def backward(ctx, g): return g * ctx.scale, None
+
+
 # Attention with single qkv Linear + F.scaled_dot_product_attention (Flash-2 backend on H100 bf16).
 class Attention(nn.Module):
     def __init__(self, dim, heads):
