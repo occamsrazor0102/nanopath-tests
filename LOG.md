@@ -63,3 +63,22 @@ LESS on JEPA (+0.0037) than on DINO+iBOT (+0.0074) — JEPA's patch objective al
 | W2-g15 | jf_se_g15 | gamma_max 1.0->1.5 | stronger (gradnorm-match) -> more M+ gain if seg loss sublinear |
 | W2-g20 | jf_se_g20 | gamma_max 1.0->2.0 | upper bound of the gamma curve |
 | W2-morph | jf_se_morph | + morphology M+ (gamma 1.0) | 2nd-best DINO anchor; does stacking add on JEPA |
+
+## Wave 2 RESULTS (08:50) — gentler gamma wins (monotonic)
+| id | gamma | score | knn | seg | surv | note |
+|----|------:|------:|----:|----:|-----:|------|
+| W2-g05 | 0.5 | **0.6482** | 0.714 | 0.304 | 0.591 | NEW BEST; +0.0046 vs base, +0.0011 vs leader 0.6471 |
+| W2-morph | 1.0 | 0.6477 | 0.723 | 0.298 | 0.579 | +morph: knn up, surv down -> wash |
+| (W1-se) | 1.0 | 0.6473 | 0.718 | 0.285 | 0.597 | prior best |
+| W2-g15 | 1.5 | 0.6469 | 0.720 | 0.293 | 0.590 | |
+| W2-g20 | 2.0 | 0.6462 | 0.718 | 0.288 | 0.583 | too strong; seg loss dominates |
+Trend: gamma 0.5>1.0>1.5>2.0 monotonic. Seg loss scales with gamma; gentle gamma keeps M+ knn/surv gains w/o the
+seg cost. Optimum at low gamma. NOTE deltas now ~noise floor (DINO-era 3-seed std 0.0005) -> reseed best.
+
+## Wave 3 (launched 08:50, 4-wide) — find gamma floor + confirm best + stack at good gamma
+| id | job | recipe | hypothesis |
+|----|-----|--------|-----------|
+| W3-g03 | jf_se_g03 | subtype+expr512, gamma 0.3 | even gentler — is optimum <0.5 or does it decay to control? |
+| W3-g05s2 | jf_se_g05_s2 | gamma 0.5, seed 1337 | RESEED of best — is 0.6482 real vs noise? |
+| W3-morph-g05 | jf_morph_g05 | +morphology, gamma 0.5 | best stack at gentle gamma (less seg damage) |
+| W3-fga-g05 | jf_se_fga_g05 | +fga (continuous), gamma 0.5 | DINO-era #3 stack at gentle gamma |
