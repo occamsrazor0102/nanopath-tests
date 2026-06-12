@@ -227,6 +227,9 @@ def main():
     fino_disc = [(f, float(s)) for f, s in fino_cfg.get("discrete", [])] if fino_cfg else []
     fino_cont = [(f, float(s)) for f, s in fino_cfg.get("continuous", [])] if fino_cfg else []
     fino_meta = json.loads((Path(cfg["data"]["dataset_dir"]) / "fino_meta.json").read_text()) if fino_cfg else {"n": {}, "cont_dim": {}}
+    # FINO two-phase: freeze the backbone (except patch_embed) for the first this-fraction of the run so the DINO/JEPA
+    # heads + metadata prototypes/predictors converge against a fixed target before they steer the encoder. 0 = off.
+    freeze_backbone_frac = float(dino_cfg.get("freeze_backbone_fraction", 0.0))
     # JEPA-T: optionally condition the JEPA predictor on a discrete factor (must be in fino.discrete so its per-tile
     # label rides in the batch). cond_col indexes that factor's column in batch["meta_disc"].
     jepa_cond = fino_cfg.get("jepa_cond") if fino_cfg else None
@@ -608,6 +611,9 @@ def main():
                     total_loss = dino_loss_value + jepa_loss + kde + meta_loss
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
+                if examples_seen / max_train_samples < freeze_backbone_frac:  # Phase 1: backbone frozen (patch_embed + heads + metadata still train)
+                    for n, p in student_backbone.named_parameters():
+                        if not n.startswith("patch_embed"): p.grad = None
                 grad_norm = nn.utils.clip_grad_norm_(
                     [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()],
                     dino_cfg["clip_grad"],
