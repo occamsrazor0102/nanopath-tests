@@ -112,8 +112,10 @@ class TCGATileDataset(Dataset):
         # the JPEG bytes column stays on disk until __getitem__.
         in_split_shard = []
         in_split_row = []
+        shard_sizes = []
         for shard_idx, shard_path in enumerate(self.shards):
             paths = pq.read_table(str(shard_path), columns=["path"], memory_map=True)["path"].to_pylist()
+            shard_sizes.append(len(paths))
             for row_idx, p in enumerate(paths):
                 # XOR with is_train: training keeps tiles where patient_in_val is False,
                 # validation keeps the complement.
@@ -133,7 +135,12 @@ class TCGATileDataset(Dataset):
             meta = json.loads((dataset_dir / "fino_meta.json").read_text())
             self.fino_disc = [f for f, _ in cfg["fino"].get("discrete", [])]
             self.fino_cont = [f for f, _ in cfg["fino"].get("continuous", [])]
-            self.meta_disc = {f: meta["discrete"][f] for f in self.fino_disc}
+            # tile_npy maps a discrete factor -> a per-TILE label .npy in shard-concat order (e.g. strong-FM cluster
+            # pseudo-labels): a dense FM-distillation M+ target, looked up by global tile index not patient barcode.
+            tile_npy = cfg["fino"].get("tile_npy", {})
+            self.meta_disc = {f: meta["discrete"][f] for f in self.fino_disc if f not in tile_npy}
+            gidx = np.concatenate([[0], np.cumsum(shard_sizes)])[:-1][self.shard_of] + self.row_of
+            self.tile_label = {f: np.load(dataset_dir / tile_npy[f])[gidx] for f in self.fino_disc if f in tile_npy}
             self.meta_cont = {f: meta["continuous"][f] for f in self.fino_cont}
             self.cont_dim = {f: (len(next(iter(v.values()))) if v and isinstance(next(iter(v.values())), list) else 1) for f, v in self.meta_cont.items()}
         mean, std = data["mean"], data["std"]
@@ -208,7 +215,7 @@ class TCGATileDataset(Dataset):
         # factor (scalar or vector; nan-filled if missing). train.py masks missing branches out per-factor.
         fino_keys = {}
         if self.fino:
-            fino_keys["meta_disc"] = torch.tensor([self.meta_disc[f].get(patient_id, -1) for f in self.fino_disc], dtype=torch.int64)
+            fino_keys["meta_disc"] = torch.tensor([int(self.tile_label[f][idx]) if f in self.tile_label else self.meta_disc[f].get(patient_id, -1) for f in self.fino_disc], dtype=torch.int64)
             for f in self.fino_cont:
                 v = self.meta_cont[f].get(patient_id)
                 v = [float("nan")] * self.cont_dim[f] if v is None else (v if isinstance(v, list) else [v])
