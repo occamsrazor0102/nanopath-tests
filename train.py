@@ -596,10 +596,10 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    # FINO DANN ramp: gamma starts ~0 (DINO/JEPA stabilize, banks warm) and rises to gamma_max.
-                    # `ramp: run` keys it to run-completion = max(sample, flop) so it reaches full strength by the
-                    # cap that actually stops the run (default `flop` underestimates in this sample-capped regime).
-                    ramp = max(examples_seen / max_train_samples, frac) if (fino_cfg or {}).get("ramp") == "run" else frac
+                    # FINO DANN ramp keyed to nanopath's SAMPLE budget (NOT FLOPs — sample-capped at ~19% of the FLOP
+                    # cap, so a flop-keyed ramp stalls gamma at ~0.75*gamma_max). Counted from the backbone-unfreeze
+                    # point: gamma=0 through the frozen Phase 1 (banks warm), then ramps to full gamma_max by the cap.
+                    ramp = max(0.0, (examples_seen / max_train_samples - freeze_backbone_frac) / max(1e-6, 1.0 - freeze_backbone_frac))
                     meta = ((fino_cfg["gamma_max"] * (2.0 / (1.0 + math.exp(-10.0 * ramp)) - 1.0),
                              batch["meta_disc"].to(device, non_blocking=True),
                              {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
