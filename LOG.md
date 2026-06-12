@@ -200,3 +200,11 @@ were on a throttled ramp (effective gamma = 0.75x nominal) -> re-establishing ba
 | 82419 jf_cr_se_g05 | subtype+expr512 | 0.5 | 0 | best 0.6481 |
 | 82420 jf_cr_fgaclu_warm | subtype+cluster+expr512+fga | 0.5 | 0.15 | combo + warmup |
 Tests: (A) does full-strength ramp change the baselines, (B) does the two-phase warmup help, (C) gamma re-opt.
+
+## STRATEGY (user directive 2026-06-12): JEPA-FINO is primary; regular FINO is the validation fallback
+If FINO+JEPA stays a wash through Wave CR (+ maybe one more), PIVOT to "regular FINO" = FINO on the DINO+iBOT base
+(the paper's actual SSL family = nanopath main recipe) WITH the corrected schedule (sample-keyed ramp from-unfreeze
++ two-phase backbone freeze). Two reasons: (1) validates our FINO implementation reproduces the paper's gains on the
+family it was designed for; (2) the DINO-era FINO numbers (+0.0074 best, throttled ramp) were ALSO under-cooked, so
+corrected-schedule regular-FINO is a FRESH test, not a rerun. Setup: new worktree off origin/main @ 6c05053 (fino),
+port the ramp-fix + freeze_backbone_fraction (~10 lines) from train.py here, run the best FINO recipes.
