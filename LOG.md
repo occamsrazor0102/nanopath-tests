@@ -174,3 +174,9 @@ running 4-wide, M-suppression + M+morphology (the untested theory-backed levers)
 | #2 | jf_sub_morph_comp | subtype+ slide_%_tumor_nuclei+, g0.5 | M+ tile-readable morphology (vs latent expr) |
 | #4 | jf_stack_sub_expr512_fga | subtype+ expr512+ fga+, g0.5 | DINO-era's one robust lever: orthogonal histotype+transcriptome+CNV stack |
 | #5 | jf_sub_comp_immune | subtype+ tumor_nuclei+ lymphocyte+, g0.5 | orthogonal morphology stack (composition + immune) |
+
+## CONSTRAINT (user, 2026-06-12): M- only suppresses nuisance UNcorrelated with disease
+`site` (anatomical) heavily correlates with disease type -> suppressing it gradient-reverses the biology we want
+(fights the M+ anchor). Same for `tss` (U(cancer|tss)=1.0) and `organ`. CLEAN batch factors for M- = scanner
+(device), year (time), race (~0.04 entanglement), maybe country. DROPPED matrix #15 (jf_supp_site_sub_expr_g10).
+Remaining M- configs (scanner/year/race/country) honor this. Don't propose site/tss/organ suppression.
