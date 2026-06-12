@@ -180,3 +180,23 @@ running 4-wide, M-suppression + M+morphology (the untested theory-backed levers)
 (fights the M+ anchor). Same for `tss` (U(cancer|tss)=1.0) and `organ`. CLEAN batch factors for M- = scanner
 (device), year (time), race (~0.04 entanglement), maybe country. DROPPED matrix #15 (jf_supp_site_sub_expr_g10).
 Remaining M- configs (scanner/year/race/country) honor this. Don't propose site/tss/organ suppression.
+
+## SCHEDULE FIX (2026-06-12) — FINO ramp was throttled all campaign
+ALL prior runs used the default flop-keyed DANN ramp. nanopath is sample-capped at ~19% of the FLOP budget, so
+gamma = gamma_max*(2σ(10*frac)-1) stalled at frac~0.19 -> **gamma only reached 0.75*gamma_max, never full strength.**
+Fixed: ramp now keyed to SAMPLE progress, counted FROM the backbone-unfreeze point: gamma=0 through frozen Phase 1,
+then ramps to full gamma_max by the sample cap. So prior "gamma 0.5 optimal / cluster wants higher gamma" findings
+were on a throttled ramp (effective gamma = 0.75x nominal) -> re-establishing baselines under the corrected schedule.
+
+## Wave CR (corrected ramp + two-phase warmup) — 8-wide, launched 03:49
+| job | recipe | gamma | freeze | vs (old-ramp) |
+|-----|--------|------:|-------:|--------------|
+| 82413 jf_cr_cluster_g05 | cluster | 0.5 | 0 | cluster-g05 0.6452 |
+| 82414 jf_cr_cluster_g05_warm | cluster | 0.5 | 0.15 | + warmup |
+| 82415 jf_cr_cluster_g03_warm | cluster | 0.3 | 0.15 | lower gamma (eff. higher now) |
+| 82416 jf_cr_cluster_g08_warm | cluster | 0.8 | 0.15 | cluster-g08 0.6484 |
+| 82417 jf_cr_mol_g05 | subtype+expr512+fga | 0.5 | 0 | fga 0.6494 |
+| 82418 jf_cr_mol_g05_warm | subtype+expr512+fga | 0.5 | 0.15 | + warmup |
+| 82419 jf_cr_se_g05 | subtype+expr512 | 0.5 | 0 | best 0.6481 |
+| 82420 jf_cr_fgaclu_warm | subtype+cluster+expr512+fga | 0.5 | 0.15 | combo + warmup |
+Tests: (A) does full-strength ramp change the baselines, (B) does the two-phase warmup help, (C) gamma re-opt.
