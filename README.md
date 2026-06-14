@@ -134,9 +134,10 @@ Intensive preprocessing before model training starts, such as tile extraction, d
 **Probe evaluation must be untouched**
 - All of `probe.py` and `benchmarking/`
 - All probe config variables in `configs/main.yaml`.
+- `model.py` is still part of the submitted model: `probe_features()` may return your chosen frozen feature representation (for example, the last four layers' CLS tokens concatenated for tile-classification probes), as long as `probe.py` itself is unchanged.
 
-**Pretrained models are OK only if not pathology-specific**
-You can use any pretrained model however you want, including for initialization, teachers, data curation, or preprocessing, as long as it was not originally trained on pathology-related data. DINOv2 is allowed; H-optimus-0, OpenMidnight, and other pathology-trained checkpoints are not.
+**Pretraining must not use pathology-specific pretrained models**
+Non-pathology pretrained models such as DINOv2 may be used for initialization, teachers, data curation, or preprocessing. Pathology-trained checkpoints such as H-optimus-0 or OpenMidnight may not initialize weights or guide training, but they may be used before and separately from training for TCGA-tile curation or preprocessing.
 
 ### Labless for live tracking
 
