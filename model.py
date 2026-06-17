@@ -173,14 +173,35 @@ class DinoV2ViT(nn.Module):
             "x_norm_patchtokens": x[:, 1 + self.registers :],
         }
 
-    # Probe contract: encode_image returns [registers || patches] for the seg head;
-    # probe_features returns the cls token for classification probes.
+    # Probe readouts fuse intermediate normalized tokens: denser patch detail for seg,
+    # and strided-depth CLS features that are less tied to the final DINO head.
     def encode_image(self, x, checkpoint=False):
-        out = self(x, checkpoint=checkpoint)
-        return torch.cat([out["x_norm_regtokens"], out["x_norm_patchtokens"]], dim=1)
+        B, _, H, W = x.shape
+        h, w, G = H // self.patch_size, W // self.patch_size, 32
+        guide = x.mean(1, keepdim=True)
+        guide = (guide - guide.amin((2, 3), keepdim=True)) / (guide.amax((2, 3), keepdim=True) - guide.amin((2, 3), keepdim=True) + 1e-6)
+        xt, feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            xt = torch.utils.checkpoint.checkpoint(blk, xt, use_reentrant=False) if checkpoint and self.training else blk(xt)
+            if i >= len(self.blocks) - 4:
+                feats.append(self.norm(xt)[:, 1:])
+        fused = torch.cat(feats, -1)
+        regs, patches = fused[:, :self.registers], fused[:, self.registers:]
+        up = F.interpolate(patches.transpose(1, 2).reshape(B, patches.shape[-1], h, w).float(), size=(G, G), mode="bilinear", align_corners=False)
+        guide_lr = F.interpolate(guide, size=(h, w), mode="area")
+        guide_hr = F.interpolate(guide, size=(G, G), mode="area")
+        w_range = torch.exp(-((guide_hr - F.interpolate(guide_lr, size=(G, G), mode="nearest")).abs() ** 2) / 0.02)
+        blur = F.avg_pool2d(F.pad(up, (1, 1, 1, 1), mode="replicate"), 3, 1)
+        dense = (up + (1 - w_range) * (up - blur)).flatten(2).transpose(1, 2).to(fused.dtype)
+        return torch.cat([regs, dense], dim=1)
 
     def probe_features(self, x):
-        return self(x)["x_norm_clstoken"]
+        xt, feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            xt = blk(xt)
+            if i in (4, 6, 8, 11):
+                feats.append(self.norm(xt)[:, 0])
+        return torch.cat(feats, dim=-1)
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.
