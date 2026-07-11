@@ -205,3 +205,19 @@ class DINOHead(nn.Module):
         x = self.mlp(x)
         x = F.normalize(x, dim=-1, p=2)
         return self.last_layer(x)
+
+
+# MolCap projection head (train.py auxiliary): maps the student CLS token to the frozen
+# text-embedding of the tile's patient "molecular caption" (subtype/stage/mutations/expression
+# rendered as a sentence, embedded once offline by a non-pathology text encoder). It is a
+# *projection*, not identity, so the CLS need only carry molecular semantics in a linear subspace
+# — leaving the rest of the CLS free for tile discrimination (linear/knn). Output is L2-normalized
+# so the training loss is a cosine alignment against the (also L2-normalized) caption vector.
+# Discarded at probe time: probe.py reads the raw CLS, never this head.
+class MolCapHead(nn.Module):
+    def __init__(self, in_dim, text_dim, hidden_dim=2048):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, text_dim))
+
+    def forward(self, x):
+        return F.normalize(self.mlp(x), dim=-1, p=2)

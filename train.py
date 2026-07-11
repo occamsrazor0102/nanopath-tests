@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, load_dinov2_pretrained
+from model import DINOHead, DinoV2ViT, MolCapHead, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -177,13 +177,15 @@ def make_masks(batch, patches, device):
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
 # multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
 # final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
-def build_param_groups(student_backbone, student_dino_head, student_ibot_head, layerwise_decay, patch_embed_lr_mult):
+def build_param_groups(student_backbone, student_dino_head, student_ibot_head, layerwise_decay, patch_embed_lr_mult, student_molcap_head=None):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
     # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
     coalesced = {}
-    modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_ibot_head, "ibot_head"))
+    modules = [(student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_ibot_head, "ibot_head")]
+    if student_molcap_head is not None:
+        modules.append((student_molcap_head, "molcap_head"))
     for module, kind in modules:
         for name, p in module.named_parameters():
             if not p.requires_grad:
@@ -239,9 +241,13 @@ def main():
     for m in (teacher_dino_head, teacher_ibot_head):
         for p in m.parameters():
             p.requires_grad = False
+    # MolCap auxiliary head: student-only (no EMA teacher; discarded at probe time). Off unless configured.
+    molcap_cfg = cfg.get("molcap", {})
+    molcap_on = bool(molcap_cfg.get("enabled", False))
+    student_molcap_head = MolCapHead(student_backbone.embed_dim, int(molcap_cfg["text_dim"])).to(device) if molcap_on else None
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
     # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
-    opt = torch.optim.AdamW(build_param_groups(student_backbone, student_dino_head, student_ibot_head, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"]), lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
+    opt = torch.optim.AdamW(build_param_groups(student_backbone, student_dino_head, student_ibot_head, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], student_molcap_head), lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
     step = 0
     batch_size = int(train_cfg["batch_size"])
     max_train_samples = int(train_cfg["max_train_samples"])
@@ -274,6 +280,8 @@ def main():
         student_ibot_head.load_state_dict(checkpoint["ibot_head"])
         teacher_dino_head.load_state_dict(checkpoint["dino_head_ema"])
         teacher_ibot_head.load_state_dict(checkpoint["ibot_head_ema"])
+        if molcap_on:
+            student_molcap_head.load_state_dict(checkpoint["molcap_head"])
         opt.load_state_dict(checkpoint["opt"])
         step = int(checkpoint["step"])
         examples_seen = int(checkpoint["examples_seen"])
@@ -381,6 +389,7 @@ def main():
             return payload
         return {**payload, "dino_head": cpu_state(student_dino_head), "ibot_head": cpu_state(student_ibot_head),
                 "dino_head_ema": cpu_state(teacher_dino_head), "ibot_head_ema": cpu_state(teacher_ibot_head),
+                **({"molcap_head": cpu_state(student_molcap_head)} if molcap_on else {}),
                 "opt": opt.state_dict(), "examples_seen": examples_seen,
                 "visible_patch_presentations": visible_patch_presentations, "train_flops": train_flops, "wandb": wandb_meta}
 
@@ -409,7 +418,7 @@ def main():
 
     # Compute (dino_loss, ibot_loss, kde) for one batch of (gf, lf) crops with the given masks +
     # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False):
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, cap=None, cap_w=None, m_scale=0.0, ckpt=False):
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
@@ -424,7 +433,16 @@ def main():
         s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
         ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
-        return local_loss + global_loss, ibot_loss, kde
+        # MolCap: cosine-align a projection of each global-crop student CLS to its patient's caption
+        # embedding. gf is crop-major ([view0 of all b, view1 of all b, ...]) so tile the per-tile caption
+        # and weight across the global views. Zero unless molcap is on and captions were supplied.
+        molcap = sg["x_norm_clstoken"].new_zeros(())
+        if molcap_on and cap is not None:
+            pred = student_molcap_head(sg["x_norm_clstoken"])
+            tgt = cap.repeat(train_cfg["global_views"], 1)
+            w = cap_w.repeat(train_cfg["global_views"])
+            molcap = molcap_cfg["weight"] * m_scale * (w * (1 - (pred * tgt).sum(-1))).sum() / w.sum().clamp_min(1.0)
+        return local_loss + global_loss, ibot_loss, kde, molcap
 
     # Held-out validation pass: same DINO + iBOT + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -445,7 +463,7 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_masks(b * train_cfg["global_views"], global_patches, device)
-                dino_l, ibot_l, kde_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                dino_l, ibot_l, kde_v, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(ibot_l), float(kde_v), float(dino_l + ibot_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -542,15 +560,20 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    dino_loss_value, ibot_loss, kde = compute_losses(
+                    # MolCap caption target for this batch, ramped in late (after tile features settle).
+                    cap = batch["caption"].to(device, non_blocking=True) if molcap_on else None
+                    cap_w = batch["has_caption"].to(device, non_blocking=True) if molcap_on else None
+                    m_scale = min(1.0, max(0.0, (frac - molcap_cfg["ramp_start"]) / molcap_cfg["ramp_len"])) if molcap_on else 0.0
+                    dino_loss_value, ibot_loss, kde, molcap = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
-                        ckpt=activation_checkpointing,
+                        cap=cap, cap_w=cap_w, m_scale=m_scale, ckpt=activation_checkpointing,
                     )
-                    total_loss = dino_loss_value + ibot_loss + kde
+                    total_loss = dino_loss_value + ibot_loss + kde + molcap
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(
-                    [*student_backbone.parameters(), *student_dino_head.parameters(), *student_ibot_head.parameters()],
+                    [*student_backbone.parameters(), *student_dino_head.parameters(), *student_ibot_head.parameters(),
+                     *(student_molcap_head.parameters() if molcap_on else [])],
                     dino_cfg["clip_grad"],
                 )
                 opt.step()
