@@ -151,6 +151,9 @@ class TCGATileDataset(Dataset):
             self.tile_label = {f: np.load(dataset_dir / tile_npy[f])[gidx] for f in self.fino_disc if f in tile_npy}
             self.meta_cont = {f: meta["continuous"][f] for f in self.fino_cont}
             self.cont_dim = {f: (len(next(iter(v.values()))) if v and isinstance(next(iter(v.values())), list) else 1) for f, v in self.meta_cont.items()}
+        molcap = cfg.get("molcap") or {}
+        self.molcap_bank = load_molcap_bank(molcap["targets"], int(molcap["target_dim"])) if is_train and molcap.get("enabled") else None
+        self.molcap_dim = int(molcap.get("target_dim", 0))
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
@@ -228,6 +231,13 @@ class TCGATileDataset(Dataset):
                 v = self.meta_cont[f].get(patient_id)
                 v = [float("nan")] * self.cont_dim[f] if v is None else (v if isinstance(v, list) else [v])
                 fino_keys[f"mc_{f}"] = torch.tensor(v, dtype=torch.float32)
+        molcap_keys = {}
+        if self.molcap_bank is not None:
+            target = self.molcap_bank.get(patient_id)
+            molcap_keys = {
+                "molcap_target": torch.from_numpy(target) if target is not None else torch.zeros(self.molcap_dim),
+                "molcap_present": torch.tensor(float(target is not None)),
+            }
         return {
             "global_views": global_views,
             "local_views": local_views,
@@ -235,4 +245,5 @@ class TCGATileDataset(Dataset):
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
             **fino_keys,
+            **molcap_keys,
         }

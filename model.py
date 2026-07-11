@@ -247,6 +247,14 @@ class MolCapHead(nn.Module):
         return F.normalize(self.net(x), dim=-1)
 
 
+# Head initialization must not perturb the frontier's later FINO prototype draw at the same seed.
+def seed_neutral_molcap_head(in_dim, target_dim, device):
+    state = torch.random.get_rng_state()
+    head = MolCapHead(in_dim, target_dim)
+    torch.random.set_rng_state(state)
+    return head.to(device)
+
+
 # Targets are per tile while features are crop-major global views: [view0 batch, view1 batch, ...].
 def molcap_loss(head, features, targets, present, views):
     pred = head(features)
@@ -256,6 +264,15 @@ def molcap_loss(head, features, targets, present, views):
 
 def linear_ramp(progress, start, length):
     return min(1.0, max(0.0, (progress - start) / length))
+
+
+# Measure whether the auxiliary and existing objectives agree on a shared trunk parameter.
+def gradient_alignment(base_loss, auxiliary_loss, parameter):
+    base_grad = torch.autograd.grad(base_loss, parameter, retain_graph=True)[0]
+    auxiliary_grad = torch.autograd.grad(auxiliary_loss, parameter, retain_graph=True)[0]
+    cosine = F.cosine_similarity(base_grad.flatten(), auxiliary_grad.flatten(), dim=0)
+    ratio = auxiliary_grad.norm() / base_grad.norm().clamp_min(1e-12)
+    return cosine.detach(), ratio.detach()
 
 
 # I-JEPA predictor head: regresses EMA-teacher patch representations at masked target blocks from the student's

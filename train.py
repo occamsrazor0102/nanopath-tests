@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, load_dinov2_pretrained
+from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, gradient_alignment, linear_ramp, load_dinov2_pretrained, molcap_loss, seed_neutral_molcap_head
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -224,6 +224,7 @@ def main():
     # FINO metadata-guidance: select factors + signs (float; + encourage M+ / - suppress M-). fino_meta (built or
     # copied beside the dataset by prepare.py) holds per-factor barcode maps + cardinalities (n) / vector dims.
     fino_cfg = cfg["fino"] if (cfg.get("fino") or {}).get("enabled") else None
+    molcap_cfg = cfg["molcap"] if (cfg.get("molcap") or {}).get("enabled") else None
     fino_disc = [(f, float(s)) for f, s in fino_cfg.get("discrete", [])] if fino_cfg else []
     fino_cont = [(f, float(s)) for f, s in fino_cfg.get("continuous", [])] if fino_cfg else []
     fino_meta = json.loads((Path(cfg["data"]["dataset_dir"]) / "fino_meta.json").read_text()) if fino_cfg else {"n": {}, "cont_dim": {}}
@@ -252,6 +253,7 @@ def main():
     student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
+    molcap_head = seed_neutral_molcap_head(student_backbone.embed_dim, int(molcap_cfg["target_dim"]), device) if molcap_cfg else None
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
@@ -261,6 +263,8 @@ def main():
     param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"])
     if predictors:
         param_groups.append({"params": [p for m in predictors.values() for p in m.parameters()], "lr_mult": 1.0, "wd_mult": 1.0, "last_layer": False})
+    if molcap_head:
+        param_groups.append({"params": list(molcap_head.parameters()), "lr_mult": 1.0, "wd_mult": 1.0, "last_layer": False})
     opt = torch.optim.AdamW(param_groups, lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
     # FINO prototype banks: one unit vector per discrete-factor value, EMA-updated from teacher CLS in compute_losses.
     protos = {f: F.normalize(torch.randn(fino_meta["n"][f], student_backbone.embed_dim, device=device), dim=-1) for f, _ in fino_disc} if fino_cfg else {}
@@ -298,6 +302,8 @@ def main():
         student_dino_head.load_state_dict(checkpoint["dino_head"])
         teacher_dino_head.load_state_dict(checkpoint["dino_head_ema"])
         student_predictor.load_state_dict(checkpoint["predictor"])
+        if molcap_head:
+            molcap_head.load_state_dict(checkpoint["molcap_head"])
         opt.load_state_dict(checkpoint["opt"])
         if fino_cfg:
             protos = {k: v.to(device) for k, v in checkpoint["protos"].items()}
@@ -412,7 +418,8 @@ def main():
                 "predictor": cpu_state(student_predictor), "opt": opt.state_dict(),
                 "examples_seen": examples_seen, "visible_patch_presentations": visible_patch_presentations,
                 "train_flops": train_flops, "wandb": wandb_meta,
-                **({"protos": {k: v.cpu() for k, v in protos.items()}, "predictors": {f: cpu_state(m) for f, m in predictors.items()}} if fino_cfg else {})}
+                **({"protos": {k: v.cpu() for k, v in protos.items()}, "predictors": {f: cpu_state(m) for f, m in predictors.items()}} if fino_cfg else {}),
+                **({"molcap_head": cpu_state(molcap_head)} if molcap_head else {})}
 
     def save_latest_checkpoint(checkpoint_step):
         nonlocal last_saved_step
@@ -439,7 +446,8 @@ def main():
 
     # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
     # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None):
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None,
+                       molcap_target=None, molcap_present=None, molcap_scale=0.0, diagnose=False):
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
@@ -495,7 +503,16 @@ def main():
                     meta_loss = sum((nbar / grad_eq_ema[f]).detach() * L for f, L in terms)
                 else:
                     for _, L in terms: meta_loss = meta_loss + L
-        return local_loss + global_loss, jepa_loss, kde, meta_loss
+        molcap = sg["x_norm_clstoken"].new_zeros(())
+        grad_cosine = grad_norm_ratio = molcap
+        if molcap_target is not None:
+            molcap = float(molcap_cfg["weight"]) * molcap_scale * molcap_loss(
+                molcap_head, sg["x_norm_patchtokens"].mean(1), molcap_target, molcap_present, train_cfg["global_views"]
+            )
+            if diagnose and molcap_scale > 0 and molcap_present.any():
+                base = local_loss + global_loss + jepa_loss + kde + meta_loss
+                grad_cosine, grad_norm_ratio = gradient_alignment(base, molcap, student_backbone.blocks[-1].attn.qkv.weight)
+        return local_loss + global_loss, jepa_loss, kde, meta_loss, molcap, grad_cosine, grad_norm_ratio
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -516,7 +533,7 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                dino_l, jepa_l, kde_v, _, _, _, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -581,6 +598,7 @@ def main():
             student_backbone.train()
             student_dino_head.train()
             student_predictor.train()
+            if molcap_head: molcap_head.train()
             completed_step = step + 1
             should_log = completed_step == 1 or completed_step % train_cfg["log_every"] == 0
             # Data identifiers stay on CPU and feed coverage metrics; image tensors move below.
@@ -627,20 +645,25 @@ def main():
                              batch["meta_disc"].to(device, non_blocking=True),
                              {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
                     cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"]).to(device, non_blocking=True) if jepa_cond else None
-                    dino_loss_value, jepa_loss, kde, meta_loss = compute_losses(
+                    molcap_target = batch["molcap_target"].to(device, non_blocking=True) if molcap_cfg else None
+                    molcap_present = batch["molcap_present"].to(device, non_blocking=True) if molcap_cfg else None
+                    molcap_scale = linear_ramp(sfrac, float(molcap_cfg["ramp_start"]), float(molcap_cfg["ramp_len"])) if molcap_cfg else 0.0
+                    dino_loss_value, jepa_loss, kde, meta_loss, molcap, molcap_grad_cosine, molcap_grad_norm_ratio = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
-                        ckpt=activation_checkpointing, meta=meta, cond=cond,
+                        ckpt=activation_checkpointing, meta=meta, cond=cond, molcap_target=molcap_target,
+                        molcap_present=molcap_present, molcap_scale=molcap_scale,
+                        diagnose=should_log and bool(molcap_cfg.get("diagnose", False)),
                     )
                     total_loss = dino_loss_value + jepa_loss + kde + meta_loss
+                    if molcap_cfg: total_loss = total_loss + molcap
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 if examples_seen / max_train_samples < freeze_backbone_frac:  # Phase 1: backbone frozen (patch_embed + heads + metadata still train)
                     for n, p in student_backbone.named_parameters():
                         if not n.startswith("patch_embed"): p.grad = None
-                grad_norm = nn.utils.clip_grad_norm_(
-                    [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()],
-                    dino_cfg["clip_grad"],
-                )
+                clipped = [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()]
+                if molcap_head: clipped += list(molcap_head.parameters())
+                grad_norm = nn.utils.clip_grad_norm_(clipped, dino_cfg["clip_grad"])
                 opt.step()
             if measured_flops_per_step is None:
                 measured_flops_per_step = int(flop_ctx.get_total_flops())
@@ -659,6 +682,8 @@ def main():
                     "dino": float(dino_loss_value.detach()),
                     "jepa": float(jepa_loss.detach()),
                     "kde": float(kde.detach()),
+                    "meta": float(meta_loss.detach()),
+                    "molcap": float(molcap.detach()),
                     "total": float(total_loss.detach()),
                 }
                 unique_counts = flush_unique_counts()
@@ -702,6 +727,10 @@ def main():
                     "teacher_temp": teacher_temp,
                     "teacher_momentum": m,
                     "kde_scale": kde_scale,
+                    "molcap_scale": molcap_scale,
+                    "molcap_coverage": float(molcap_present.mean()) if molcap_present is not None else 0.0,
+                    "molcap_grad_cosine": float(molcap_grad_cosine),
+                    "molcap_grad_norm_ratio": float(molcap_grad_norm_ratio),
                     "batch_size": batch_size,
                     "examples_seen": examples_seen,
                     "visible_patch_presentations": visible_patch_presentations,
@@ -716,6 +745,7 @@ def main():
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
                     f"dino: {reduced['dino']:.4f}  jepa: {reduced['jepa']:.4f}  kde: {reduced['kde']:.4f}  "
+                    f"meta: {reduced['meta']:.4f}  molcap: {reduced['molcap']:.4f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
                     f"max mem: {int(gpu_peak_mem_gb * 1024)}",

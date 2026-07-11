@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from build_molcap_targets import save_target_bank
 from dataloader import load_molcap_bank
-from model import MolCapHead, linear_ramp, molcap_loss
+from model import MolCapHead, linear_ramp, molcap_loss, seed_neutral_molcap_head
 
 
 def test_target_bank_lookup_and_missing_patient(tmp_path):
@@ -70,3 +70,12 @@ def test_linear_ramp_endpoints():
     assert linear_ramp(0.625, 0.50, 0.25) == 0.5
     assert linear_ramp(0.75, 0.50, 0.25) == 1.0
     assert linear_ramp(0.90, 0.50, 0.25) == 1.0
+
+
+def test_optional_head_does_not_advance_baseline_rng():
+    torch.manual_seed(7777)
+    expected = torch.rand(4)
+    torch.manual_seed(7777)
+    seed_neutral_molcap_head(8, 6, "cpu")
+    actual = torch.rand(4)
+    torch.testing.assert_close(actual, expected)
