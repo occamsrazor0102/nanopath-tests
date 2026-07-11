@@ -154,6 +154,16 @@ class TCGATileDataset(Dataset):
                 v2.Normalize(mean=mean, std=std),
             ]
         )
+        # MolCap (optional aux target): map each tile's patient barcode to a precomputed, L2-normalized
+        # caption embedding (patient metadata rendered as a sentence, embedded offline). Loaded only for
+        # the training split; missing patients get a zero vector + 0 weight so they add no molcap gradient.
+        # Off unless configured, so the base recipe stays byte-identical.
+        mol = cfg.get("molcap", {})
+        self.caption_bank = None
+        if is_train and mol.get("enabled"):
+            bank = np.load(mol["caption_embeds"])  # .npz: patient_barcode -> float32[text_dim]
+            self.caption_bank = {k: bank[k].astype(np.float32) for k in bank.files}
+            self.text_dim = int(next(iter(self.caption_bank.values())).shape[0])
 
     # Dataset length is the number of tiles in this train/val split.
     def __len__(self):
@@ -192,10 +202,15 @@ class TCGATileDataset(Dataset):
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
         global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
-        return {
+        item = {
             "global_views": global_views,
             "local_views": local_views,
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
         }
+        if self.caption_bank is not None:
+            vec = self.caption_bank.get(patient_id)
+            item["caption"] = torch.from_numpy(vec) if vec is not None else torch.zeros(self.text_dim)
+            item["has_caption"] = torch.tensor(1.0 if vec is not None else 0.0)
+        return item
