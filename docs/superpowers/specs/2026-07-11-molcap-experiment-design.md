@@ -27,7 +27,7 @@ Captions use columns that actually exist: cancer type, cBioPortal subtype, prima
 
 Modes provide matched controls:
 
-- `text`: encode captions with frozen `sentence-transformers/all-MiniLM-L6-v2`;
+- `text`: encode captions with frozen `sentence-transformers/all-MiniLM-L6-v2`, remove the template-common mean direction, and apply mild `0.1`-power covariance shrinkage with a `5%` eigenvalue floor before final normalization;
 - `structured`: encode the same fields as one-hot/numeric features and apply a seeded fixed projection to 384 dimensions;
 - `shuffled`: apply a seeded patient permutation to the text targets.
 

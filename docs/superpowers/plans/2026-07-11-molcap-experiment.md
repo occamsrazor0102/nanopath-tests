@@ -69,7 +69,7 @@ Expected: collection failure for `build_molcap_targets`.
 
 ```python
 patients = raw.groupby("submitter_id", sort=True, as_index=False).first()
-targets = encoder.encode(captions, normalize_embeddings=True).astype("float32")
+targets = isotropize(encoder.encode(captions, normalize_embeddings=True)).astype("float32")
 np.savez(output, patient_ids=ids, targets=targets, captions=captions, mode=np.array(mode))
 ```
 

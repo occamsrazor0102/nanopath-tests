@@ -67,11 +67,18 @@ def structured_targets(frame, dim=384, seed=7777):
     return _normalize(features @ projection)
 
 
+def isotropize(targets):
+    centered = np.asarray(targets, dtype=np.float64) - np.asarray(targets, dtype=np.float64).mean(0, keepdims=True)
+    values, vectors = np.linalg.eigh(centered.T @ centered / max(1, len(centered) - 1))
+    scale = np.maximum(values, values.max() * 0.05) ** -0.1
+    return _normalize((centered @ vectors * scale) @ vectors.T)
+
+
 def encode_text(captions, encoder=None):
     if encoder is None:
         from sentence_transformers import SentenceTransformer
         encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    return _normalize(encoder.encode(captions, normalize_embeddings=True))
+    return isotropize(encoder.encode(captions, normalize_embeddings=True))
 
 
 def save_target_bank(path, patient_ids, targets, captions, mode):

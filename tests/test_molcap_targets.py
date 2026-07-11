@@ -6,6 +6,7 @@ import pandas as pd
 from build_molcap_targets import (
     aggregate_patients,
     encode_text,
+    isotropize,
     render_captions,
     save_target_bank,
     structured_targets,
@@ -129,3 +130,19 @@ def test_npz_is_non_pickled_and_byte_deterministic(tmp_path):
         assert set(bank.files) == {"patient_ids", "targets", "captions", "mode"}
         assert bank["targets"].dtype == np.float32
         assert bank["mode"].item() == "structured"
+
+
+def test_isotropy_correction_spreads_anisotropic_text_geometry():
+    rng = np.random.default_rng(3)
+    raw = rng.normal(size=(512, 16)).astype(np.float32) * np.geomspace(8.0, 0.2, 16)
+    raw = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    corrected = isotropize(raw)
+
+    def rank(x):
+        values = np.linalg.eigvalsh(np.cov(x, rowvar=False)).clip(0)
+        weights = values / values.sum()
+        return np.exp(-(weights[weights > 0] * np.log(weights[weights > 0])).sum())
+
+    assert rank(corrected) > rank(raw)
+    np.testing.assert_allclose(np.linalg.norm(corrected, axis=1), 1.0, atol=1e-6)
