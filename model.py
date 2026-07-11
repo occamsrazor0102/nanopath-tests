@@ -237,6 +237,27 @@ class DINOHead(nn.Module):
         return self.last_layer(x)
 
 
+# Train-only projection from shared patch features to a frozen patient target; probes never load this head.
+class MolCapHead(nn.Module):
+    def __init__(self, in_dim, target_dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(in_dim, 512), nn.GELU(), nn.Linear(512, target_dim))
+
+    def forward(self, x):
+        return F.normalize(self.net(x), dim=-1)
+
+
+# Targets are per tile while features are crop-major global views: [view0 batch, view1 batch, ...].
+def molcap_loss(head, features, targets, present, views):
+    pred = head(features)
+    target, weight = targets.repeat(views, 1), present.repeat(views)
+    return (weight * (1 - (pred * target).sum(-1))).sum() / weight.sum().clamp_min(1)
+
+
+def linear_ramp(progress, start, length):
+    return min(1.0, max(0.0, (progress - start) / length))
+
+
 # I-JEPA predictor head: regresses EMA-teacher patch representations at masked target blocks from the student's
 # block-masked patch tokens. FINO/JEPA-T option: n_cond>0 adds a learned per-class embedding (idx 0 = missing/-1)
 # of a discrete metadata factor to every patch token, so the latent-regression target is metadata-aware

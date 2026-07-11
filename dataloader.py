@@ -53,6 +53,14 @@ LOG_1E6 = float(np.log(1e-6))
 TILE_SIZE = 224
 
 
+# Load the compact patient-id/target arrays once; forked workers share this dictionary copy-on-write.
+def load_molcap_bank(path, target_dim):
+    with np.load(path, allow_pickle=False) as artifact:
+        patient_ids, targets = artifact["patient_ids"], artifact["targets"]
+    assert targets.ndim == 2 and targets.shape == (len(patient_ids), target_dim), f"MolCap target_dim={target_dim} does not match {targets.shape}"
+    return {str(patient_id): target.astype(np.float32) for patient_id, target in zip(patient_ids, targets)}
+
+
 # Patients (not tiles) are the split unit so train/val never share a case.
 def patient_in_val(patient_id, seed, val_fraction):
     key = f"{seed}:{patient_id}".encode()
