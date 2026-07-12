@@ -8,10 +8,13 @@
 # geometry normalization. Every provenance value (artifact hash, model revisions, widths, isotropy
 # constants, gate thresholds) is frozen below; the tool fails loudly if any input drifts.
 #
-# Stages (main): validate canonical NPZ -> re-encode captions with pinned MiniLM + PubMedBERT ->
-# per-encoder isotropy -> geometry -> hard gates (incl. MiniLM reproduction) -> deterministic NPZ + JSON.
-# Pure-math helpers (isotropy/geometry/gates/deterministic_savez) import with no heavy deps so the
-# test suite can validate them against hand-computable fixtures without downloading the encoders.
+# Failure hygiene: the biomedical NPZ is written to a staging path, every gate is evaluated into an
+# audit table, and the artifact is PUBLISHED only on a full pass. On failure the staging file is
+# removed AND any stale target at the fixed path is cleared, and a status=failed report is still
+# written — so a failed run can never leave a target beside a failed report.
+#
+# Pure-math helpers (isotropy/geometry/gates/publish/json) import with no heavy deps so the test
+# suite validates them against hand-computable fixtures without downloading the encoders.
 #
 #   python reembed_molcap_targets.py selftest=1        # pure-math self-checks, no models/data
 #   python reembed_molcap_targets.py canonical=molcap_targets_minilm.npz \
@@ -20,6 +23,7 @@
 import hashlib
 import io
 import json
+import os
 import sys
 import zipfile
 
@@ -128,30 +132,64 @@ def _sha256(path):
     return hashlib.sha256(open(path, "rb").read()).hexdigest()
 
 
-# All hard target gates on the written artifact `corrected`. Raises AssertionError (fail loudly)
-# on the first violation.
-def apply_gates(ids, captions, canon_ids, canon_captions, corrected, geom, tile_ids, biomed_path):
-    assert len(ids) == CANON_ROWS == len(set(ids.tolist())), f"expected {CANON_ROWS} unique ids, got {len(ids)}"
-    assert np.array_equal(ids, canon_ids), "patient ids differ from canonical (order or content)"
-    assert np.array_equal(captions, canon_captions), "caption strings differ from canonical (re-rendered, not reused)"
-    assert corrected.shape[1] == BIOMED_WIDTH, f"target width {corrected.shape[1]} != {BIOMED_WIDTH}"
-    assert np.isfinite(corrected).all(), "non-finite target values"
-    assert geom["max_unit_norm_error"] <= MAX_ROWNORM_ERR, f"row-norm error {geom['max_unit_norm_error']:.2e} > {MAX_ROWNORM_ERR}"
-    missing = set(map(str, tile_ids)) - set(map(str, ids.tolist()))
-    assert len(missing) == 0, f"{len(missing)} of {len(tile_ids)} tile patients lack a caption (coverage < 100%)"
-    assert abs(geom["mean_offdiag_cosine"]) <= MAX_OFFDIAG_COSINE, f"|off-diag cosine| {geom['mean_offdiag_cosine']:.4g} > {MAX_OFFDIAG_COSINE}"
-    assert geom["effective_rank"] >= MIN_EFFECTIVE_RANK, f"effective rank {geom['effective_rank']:.2f} < {MIN_EFFECTIVE_RANK}"
-    assert geom["participation_ratio"] >= MIN_PARTICIPATION, f"participation ratio {geom['participation_ratio']:.2f} < {MIN_PARTICIPATION}"
-    assert geom["var_cv"] <= MAX_VAR_CV, f"per-dim var CV {geom['var_cv']:.3f} > {MAX_VAR_CV}"
-    er_ratio = geom["norm_effective_rank"] / REF_NORM_EFFRANK
-    pr_ratio = geom["norm_participation_ratio"] / REF_NORM_PARTICIPATION
-    assert RATIO_LO <= er_ratio <= RATIO_HI, f"norm-effective-rank ratio {er_ratio:.3f} outside [{RATIO_LO},{RATIO_HI}]"
-    assert RATIO_LO <= pr_ratio <= RATIO_HI, f"norm-participation ratio {pr_ratio:.3f} outside [{RATIO_LO},{RATIO_HI}]"
-    # Determinism: a second write of identical arrays must hash identically.
-    tmp = biomed_path + ".dtmp"
-    deterministic_savez(tmp, {"patient_ids": ids, "captions": captions, "targets": corrected})
-    assert _sha256(tmp) == _sha256(biomed_path), "non-deterministic NPZ serialization"
-    return {"er_ratio": er_ratio, "pr_ratio": pr_ratio, "missing_patients": 0}
+# Evaluate every hard gate on the staged artifact `corrected`, returning an audit table plus the
+# verdict and first failing gate (frozen order). No exceptions: the caller writes a status report and
+# publishes the NPZ only on a full pass.
+def evaluate_gates(ids, captions, canon_ids, canon_captions, corrected, geom, tile_ids, staging_path):
+    missing = len(set(map(str, tile_ids.tolist())) - set(map(str, ids.tolist())))
+    dtmp = staging_path + ".dtmp"
+    deterministic_savez(dtmp, {"patient_ids": ids, "captions": captions, "targets": corrected})
+    deterministic = _sha256(dtmp) == _sha256(staging_path)
+    os.remove(dtmp)
+    er = geom["norm_effective_rank"] / REF_NORM_EFFRANK
+    pr = geom["norm_participation_ratio"] / REF_NORM_PARTICIPATION
+    checks = [
+        ("rows", len(ids), CANON_ROWS, len(ids) == CANON_ROWS),
+        ("unique_ids", len(set(ids.tolist())), CANON_ROWS, len(set(ids.tolist())) == CANON_ROWS),
+        ("ids_match_canonical", "elementwise", "equal", bool(np.array_equal(ids, canon_ids))),
+        ("captions_match_canonical", "elementwise", "equal", bool(np.array_equal(captions, canon_captions))),
+        ("width", int(corrected.shape[1]), BIOMED_WIDTH, corrected.shape[1] == BIOMED_WIDTH),
+        ("finite", bool(np.isfinite(corrected).all()), True, bool(np.isfinite(corrected).all())),
+        ("max_unit_norm_error", geom["max_unit_norm_error"], MAX_ROWNORM_ERR, geom["max_unit_norm_error"] <= MAX_ROWNORM_ERR),
+        ("deterministic_npz", deterministic, True, deterministic),
+        ("fino_coverage_missing", missing, 0, missing == 0),
+        ("mean_offdiag_cosine", abs(geom["mean_offdiag_cosine"]), MAX_OFFDIAG_COSINE, abs(geom["mean_offdiag_cosine"]) <= MAX_OFFDIAG_COSINE),
+        ("effective_rank", geom["effective_rank"], MIN_EFFECTIVE_RANK, geom["effective_rank"] >= MIN_EFFECTIVE_RANK),
+        ("participation_ratio", geom["participation_ratio"], MIN_PARTICIPATION, geom["participation_ratio"] >= MIN_PARTICIPATION),
+        ("var_cv", geom["var_cv"], MAX_VAR_CV, geom["var_cv"] <= MAX_VAR_CV),
+        ("norm_effrank_ratio", er, [RATIO_LO, RATIO_HI], RATIO_LO <= er <= RATIO_HI),
+        ("norm_participation_ratio", pr, [RATIO_LO, RATIO_HI], RATIO_LO <= pr <= RATIO_HI),
+    ]
+    audit = [{"gate": n, "observed": o, "requirement": r, "passed": bool(p)} for n, o, r, p in checks]
+    first_failed = next((c["gate"] for c in audit if not c["passed"]), None)
+    return audit, first_failed is None, first_failed
+
+
+# Publish the staged NPZ only on a full pass; on failure remove staging AND clear any stale target at
+# the fixed path, so a failed run can never leave a target beside a failed report.
+def publish_or_clear(passed, staging, final):
+    if passed:
+        os.replace(staging, final)
+        return True, False
+    if os.path.exists(staging):
+        os.remove(staging)
+    stale = os.path.exists(final)
+    if stale:
+        os.remove(final)
+    return False, stale
+
+
+# Replace non-finite floats with None (recording their paths) so a degenerate geometry audit still
+# serializes as strict JSON.
+def json_safe(obj, nonfinite, path=""):
+    if isinstance(obj, dict):
+        return {k: json_safe(v, nonfinite, f"{path}.{k}") for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_safe(v, nonfinite, f"{path}[{i}]") for i, v in enumerate(obj)]
+    if isinstance(obj, float) and not np.isfinite(obj):
+        nonfinite.append(path or "<root>")
+        return None
+    return obj
 
 
 # Encode captions with a pinned frozen sentence-transformer (lazy import: heavy dep, not needed by tests).
@@ -162,51 +200,55 @@ def encode(model, revision, captions):
 
 
 def selftest():
-    # Geometry/isotropy invariants on synthetic anisotropic data — the hand-computable coverage.
     assert abs(_effective_rank(np.ones(4)) - 4) < 1e-9 and abs(_participation_ratio(np.ones(4)) - 4) < 1e-9
     assert _effective_rank(np.array([1.0, 0, 0, 0])) == 1.0 and _participation_ratio(np.array([1.0, 0, 0, 0])) == 1.0
     rows = _l2(np.array([[1.0, 0], [0, 1], [1, 0]]))
     assert abs(_mean_offdiag_cosine(rows) - 1 / 3) < 1e-9
     rng = np.random.default_rng(0)
-    aniso = rng.normal(size=(500, 32)) * (np.arange(1, 33) ** 2)   # strongly anisotropic
+    aniso = rng.normal(size=(500, 32)) * (np.arange(1, 33) ** 2)
     corr = fit_isotropy(aniso)
-    assert abs(np.linalg.norm(corr, axis=1) - 1).max() < 1e-5, "isotropy output not unit norm"
-    assert geometry(corr)["effective_rank"] > geometry(aniso)["effective_rank"], "isotropy did not raise effective rank"
+    assert abs(np.linalg.norm(corr, axis=1) - 1).max() < 1e-5
+    assert geometry(corr)["effective_rank"] > geometry(aniso)["effective_rank"]
     d = {"patient_ids": np.array(["A", "B"]), "captions": np.array(["x", "y"]), "targets": _l2(rng.normal(size=(2, BIOMED_WIDTH))).astype(np.float32)}
     deterministic_savez("/tmp/_st1.npz", d); deterministic_savez("/tmp/_st2.npz", d)
-    assert _sha256("/tmp/_st1.npz") == _sha256("/tmp/_st2.npz"), "savez not deterministic"
+    assert _sha256("/tmp/_st1.npz") == _sha256("/tmp/_st2.npz")
     print("selftest OK: effective-rank/participation/off-diag-cosine, isotropy unit-norm+decorrelation, deterministic NPZ")
 
 
 def build(canonical, biomed_out, report_out, tile_ids_path=None):
     assert _sha256(canonical) == CANON_SHA256, "canonical NPZ hash mismatch — wrong or modified source artifact"
     z = np.load(canonical, allow_pickle=False)
-    ids, captions = z["patient_ids"], z["captions"]
-    order = np.argsort(ids.astype(str))   # canonical order: sorted by submitter_id
-    ids, captions = ids[order], captions[order]
+    order = np.argsort(z["patient_ids"].astype(str))   # canonical order: sorted by submitter_id
+    ids, captions = z["patient_ids"][order], z["captions"][order]
     tile_ids = np.load(tile_ids_path)["patient_ids"] if tile_ids_path else ids   # fork supplies the 9,389 tile patients
-    # MiniLM reproduction: re-encode + isotropy must match the canonical corrected targets.
-    minilm_corr = fit_isotropy(encode(MINILM_MODEL, MINILM_REV, captions))
-    assert np.allclose(minilm_corr, z["targets"][order], atol=MINILM_REPRO_ATOL), "MiniLM reproduction failed — caption order or isotropy drift"
+    # Provenance precondition (not a tunable gate): MiniLM re-encode + shared isotropy must reproduce
+    # the canonical corrected targets, or caption order / isotropy drifted.
+    assert np.allclose(fit_isotropy(encode(MINILM_MODEL, MINILM_REV, captions)), z["targets"][order], atol=MINILM_REPRO_ATOL), "MiniLM reproduction failed — caption order or isotropy drift"
     raw = encode(BIOMED_MODEL, BIOMED_REV, captions)
     corrected = fit_isotropy(raw)
     geom_raw, geom_corr = geometry(raw), geometry(corrected)
-    deterministic_savez(biomed_out, {"patient_ids": ids, "captions": captions, "targets": corrected})
-    ratios = apply_gates(ids, captions, ids, captions, corrected, geom_corr, tile_ids, biomed_out)
-    report = {
-        "canonical_sha256": CANON_SHA256, "biomed_sha256": _sha256(biomed_out),
+    staging = biomed_out + ".staging"
+    deterministic_savez(staging, {"patient_ids": ids, "captions": captions, "targets": corrected})
+    audit, passed, first_failed = evaluate_gates(ids, captions, ids, captions, corrected, geom_corr, tile_ids, staging)
+    published, stale_cleared = publish_or_clear(passed, staging, biomed_out)
+    nonfinite = []
+    report = json_safe({
+        "status": "passed" if passed else "failed", "published": published,
+        "first_failed_gate": first_failed, "stale_target_cleared": stale_cleared,
+        "artifact_sha256": _sha256(biomed_out) if published else None,
+        "canonical_sha256": CANON_SHA256,
         "encoders": {"minilm": {"model": MINILM_MODEL, "revision": MINILM_REV, "width": MINILM_WIDTH},
                      "biomed": {"model": BIOMED_MODEL, "revision": BIOMED_REV, "width": BIOMED_WIDTH}},
         "isotropy": {"floor_frac": ISO_FLOOR_FRAC, "power": ISO_POWER},
         "geometry": {"biomed_raw": geom_raw, "biomed_corrected": geom_corr,
                      "minilm_reference": {"norm_effective_rank": REF_NORM_EFFRANK, "norm_participation_ratio": REF_NORM_PARTICIPATION}},
-        "coverage": {"tile_patients": int(len(tile_ids)), "missing": ratios["missing_patients"]},
-        "comparability_ratios": {"norm_effective_rank": ratios["er_ratio"], "norm_participation": ratios["pr_ratio"]},
-        "thresholds": {"max_offdiag_cosine": MAX_OFFDIAG_COSINE, "min_effective_rank": MIN_EFFECTIVE_RANK,
-                       "min_participation": MIN_PARTICIPATION, "max_var_cv": MAX_VAR_CV, "ratio_bounds": [RATIO_LO, RATIO_HI]},
-    }
-    json.dump(report, open(report_out, "w"), indent=2, sort_keys=True)
-    print(f"biomed targets -> {biomed_out} (sha256 {report['biomed_sha256'][:12]}); all gates passed; report -> {report_out}")
+        "coverage": {"tile_patients": int(len(tile_ids))},
+        "gate_audit": audit,
+    }, nonfinite)
+    report["nonfinite_fields"] = nonfinite
+    json.dump(report, open(report_out, "w"), indent=2, sort_keys=True, allow_nan=False)
+    print(f"status={'passed' if passed else 'failed'} published={published} first_failed={first_failed}; report -> {report_out}")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

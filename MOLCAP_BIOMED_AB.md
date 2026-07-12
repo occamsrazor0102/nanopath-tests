@@ -27,3 +27,18 @@ Primary endpoint = mean(molecular AUC, survival c-index). Biomedical semantics a
 - **Runs in the fork (GPU + data):** `python reembed_molcap_targets.py canonical=… biomed_out=… report_out=…` (needs the canonical NPZ + both pinned encoders + the tile-patient list), then tests → CPU integration → H100 smoke with gradient diagnostics → the locked 1,000,000-sample seed-7777 probe → submit to Labless if policy passes.
 
 `reembed_molcap_targets.py` and `tests/` are development helpers — exclude them from the Labless training source snapshot (like `build_molcap_targets.py`).
+
+## Result (2026-07-12): aborted at the width-confounded ratio gate — encoder hypothesis UNTESTED
+
+The S-PubMedBERT build passed every absolute gate (identity, finiteness, unit norm, off-diag cosine 0.00068, effective rank 33.19 ≥ 32, participation 19.35 ≥ 16, var CV 0.46, FINO coverage 9,389/9,389) but failed the **normalized** ratio gates and correctly published nothing:
+
+| gate | biomedical | MiniLM ref | ratio | bound |
+|---|---:|---:|---:|:---:|
+| norm effective-rank | 0.043214 | 0.096102 | **0.4497** | [0.5, 2.0] ✗ |
+| norm participation | 0.025193 | 0.059232 | **0.4253** | [0.5, 2.0] ✗ |
+
+**Diagnosis — the failure is width-confounded, not degenerate semantics.** `norm_effrank = effective_rank / width`, and biomedical width is 768 vs MiniLM 384. So `ratio = (eff_bio/eff_mini) × (384/768) = 0.899 × 0.5 = 0.450`. In **absolute** terms the biomedical corrected geometry (eff rank 33.2, participation 19.3) is **85–90%** of MiniLM's — well inside [0.5, 2.0]. The gate fired essentially because the encoder is 2× wider, not because its semantic manifold is collapsed. **Therefore the biomedical-semantics hypothesis is untested, not falsified** — no training ran.
+
+The disciplined response is a **new, width-controlled pre-registration** (not a post-hoc change to this frozen gate): PCA-reduce the biomedical embedding 768→384 *before* isotropy, so (a) width parity makes the normalized-ratio gate meaningful, (b) the MolCap head shape (→384) is held constant with the MiniLM arm — making it a truer encoder-only A/B. Reducing 768→384 loses negligible signal (corrected effective rank is only ~33). Alternatively the *next* experiment is the already-approved EMA patient-centroid variant.
+
+**Failure-path hardening (this PR).** Mirrors the fork's post-run review: the artifact is written to a staging path and **published only on a full pass**; on failure staging is removed and any stale target at the fixed path is cleared (`publish_or_clear`), a `status=failed`/`published=false` report with the full gate audit is still written, and non-finite audit values serialize as strict-JSON `null` with recorded field paths (`json_safe`). Covered by `test_publish_on_pass_and_clear_on_fail`, `test_json_safe_*`, and `test_gates_reproduce_biomed_width_confounded_failure`.
