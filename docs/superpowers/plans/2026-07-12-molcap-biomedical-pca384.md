@@ -637,8 +637,44 @@ Require before continuing:
 - every unchanged geometry gate passes;
 - 9,389/9,389 FINO coverage.
 
-If any gate fails, stop. Retrieve the failed report, write the durable negative
-result, do not run Tasks 3.6 onward, and do not submit.
+If any gate fails, enter the following target-abort subtask. Do not run Tasks
+3.6 onward, any GPU/fallback/calibration action, Task 4 compute, or submission.
+
+- [ ] **Step 4a: Complete and commit the target-abort record**
+
+1. Retrieve the strict failed geometry report and independently verify the
+   fixed PCA target path is absent. Complete the target-independent subset of
+   Step 5 and save the exact audit in
+   `.superpowers/sdd/pca384-target-audit.json`; do not claim target-byte or
+   real-target checks when no target was published.
+2. Create
+   `docs/results/2026-07-12-molcap-biomed-pca384-s7777.md` with this required
+   schema:
+   - decision and first failed frozen gate;
+   - source commit, canonical-source SHA-256, config SHA-256, downloaded
+     failure-report SHA-256, persisted report path, and local evidence path;
+   - retained, total, and discarded PCA variance plus the `0.99` comparison;
+   - the complete reached gate table, including variance CV versus `0.75`;
+   - `published=false`, target-path-cleared evidence, and explicit absence of
+     target/rebuild hashes;
+   - explicit GPU, training, real-target integration, probe, calibration, and
+     submission statuses; and
+   - audit limitations and the pre-registered next action.
+3. Cross-check every numeric value against the downloaded failed report and
+   `.superpowers/sdd/pca384-target-audit.json`; do not infer unavailable values.
+4. Commit the durable record with:
+
+   ```powershell
+   git add docs/results/2026-07-12-molcap-biomed-pca384-s7777.md
+   git commit -m "docs: record MolCap PCA-384 target abort"
+   ```
+
+5. Require the post-commit abort checklist to pass: strict JSON parsing of the
+   downloaded report and audit, report hash recomputation, an absent fixed PCA
+   target, `artifact.published=false`, `artifact.target_path_cleared=true`, no
+   GPU/training/probe/submission artifacts, clean `git status --short`, and an
+   empty locked-path diff for `model.py`, `dataloader.py`, `train.py`,
+   `probe.py`, and `benchmarking/`.
 
 - [ ] **Step 5: Retrieve and independently audit target/report**
 

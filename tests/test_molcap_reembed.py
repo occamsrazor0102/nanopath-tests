@@ -70,6 +70,87 @@ def test_pca_project_unit_is_deterministic_unit_norm_and_variance_audited():
     assert first_audit["component_sha256"] == second_audit["component_sha256"]
 
 
+def test_pca_project_unit_matches_independent_analytic_oracle_and_audits_frozen_gates():
+    centered = np.array(
+        [
+            [-3.0, -2.0, -1.0],
+            [-3.0, -2.0, 1.0],
+            [-3.0, 2.0, -1.0],
+            [-3.0, 2.0, 1.0],
+            [3.0, -2.0, -1.0],
+            [3.0, -2.0, 1.0],
+            [3.0, 2.0, -1.0],
+            [3.0, 2.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    raw = centered + np.array([11.0, -7.0, 5.0])
+
+    projected, audit = reembed.pca_project_unit(raw, n_components=2)
+
+    expected_projected = centered[:, :2] / np.sqrt(13.0)
+    expected_eigenvalues = np.array([72.0 / 7.0, 32.0 / 7.0, 8.0 / 7.0])
+    np.testing.assert_allclose(projected, expected_projected, atol=1e-7, rtol=0)
+    np.testing.assert_allclose(audit["eigenvalues_descending"], expected_eigenvalues)
+    assert audit["retained_variance_fraction"] == pytest.approx(13.0 / 14.0)
+    assert audit["centering"] == "per-dimension mean subtraction"
+    assert audit["eigenvalue_ordering"] == "descending"
+    assert audit["projected_shape"] == [8, 2]
+    assert audit["projected_finite"] is True
+    assert audit["min_pre_normalization_row_norm"] == pytest.approx(np.sqrt(13.0))
+    assert audit["max_post_normalization_unit_norm_error"] <= 1e-5
+    assert audit["discarded_variance"] == pytest.approx(8.0 / 7.0)
+    assert audit["discarded_variance_fraction"] == pytest.approx(1.0 / 14.0)
+    assert audit["eligibility_thresholds"] == {
+        "projected_shape": [8, 2],
+        "projected_finite": True,
+        "min_pre_normalization_row_norm_exclusive": 0.0,
+        "max_post_normalization_unit_norm_error": 1e-5,
+    }
+
+
+def test_pca_project_unit_rejects_wrong_projected_shape(monkeypatch):
+    raw = np.random.default_rng(17).normal(size=(16, 6))
+    canonicalize = reembed.canonicalize_component_signs
+
+    def drop_component(components):
+        return canonicalize(components)[:-1]
+
+    monkeypatch.setattr(reembed, "canonicalize_component_signs", drop_component)
+    with pytest.raises(AssertionError, match="PCA projected shape gate failed"):
+        reembed.pca_project_unit(raw, n_components=3)
+
+
+def test_pca_project_unit_rejects_nonfinite_projection(monkeypatch):
+    raw = np.random.default_rng(19).normal(size=(16, 6))
+    canonicalize = reembed.canonicalize_component_signs
+
+    def inject_nonfinite_component(components):
+        fixed = canonicalize(components)
+        fixed[0, 0] = np.nan
+        return fixed
+
+    monkeypatch.setattr(reembed, "canonicalize_component_signs", inject_nonfinite_component)
+    with pytest.raises(AssertionError, match="PCA projected finite gate failed"):
+        reembed.pca_project_unit(raw, n_components=3)
+
+
+def test_pca_project_unit_rejects_post_normalization_unit_norm_error(monkeypatch):
+    raw = np.random.default_rng(23).normal(size=(16, 6))
+    real_norm = np.linalg.norm
+    calls = 0
+
+    def inject_norm_error(values, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = real_norm(values, *args, **kwargs)
+        return result + 1e-3 if calls == 2 else result
+
+    monkeypatch.setattr(reembed.np.linalg, "norm", inject_norm_error)
+    with pytest.raises(AssertionError, match="PCA post-normalization unit-norm gate failed"):
+        reembed.pca_project_unit(raw, n_components=3)
+
+
 def test_pca_zero_projection_row_is_rejected():
     raw = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]]), (8, 1))
     with pytest.raises(AssertionError, match="zero-row"):
@@ -392,6 +473,259 @@ def test_pca_success_artifacts_are_byte_deterministic(tmp_path, monkeypatch):
     build_pca_fixture(case, tmp_path, monkeypatch, second, second_report)
     assert first.read_bytes() == second.read_bytes()
     assert first_report.read_bytes() == second_report.read_bytes()
+
+
+def pca_staging_paths(output, report):
+    return (
+        output.with_name(output.name + ".tmp"),
+        output.with_name(output.name + ".check"),
+        output.with_name(output.name + ".bak"),
+        report.with_name(report.name + ".tmp"),
+        report.with_name(report.name + ".bak"),
+    )
+
+
+def seed_stale_pca_artifacts(output, report, *, staging=False):
+    output.write_bytes(b"stale PCA target")
+    report.write_text('{"status":"passed","artifact":{"published":true}}\n')
+    if staging:
+        for path in pca_staging_paths(output, report):
+            path.write_bytes(b"stale PCA staging artifact")
+
+
+def assert_pca_failure_boundary(output, report, *, exception_type, message_fragment):
+    assert not output.exists()
+    assert not any(path.exists() for path in pca_staging_paths(output, report))
+
+    def reject_nonstandard_constant(value):
+        raise AssertionError(f"non-standard JSON constant: {value}")
+
+    payload = json.loads(report.read_text(), parse_constant=reject_nonstandard_constant)
+    assert payload["status"] == "failed"
+    assert payload["artifact"]["published"] is False
+    assert payload["artifact"]["preexisting_target_detected"] is True
+    assert payload["artifact"]["target_path_cleared"] is True
+    assert message_fragment in payload["gate_error"]["message"]
+    assert payload["failure_boundary"] == {
+        "variant": reembed.PCA384,
+        "exception_type": exception_type,
+        "exception_message": payload["failure_boundary"]["exception_message"],
+        "target_path_cleared": True,
+        "staging_paths_cleared": True,
+    }
+    assert message_fragment in payload["failure_boundary"]["exception_message"]
+
+
+def test_pca_replay_failure_replaces_stale_report_and_clears_all_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
+    monkeypatch.setattr(reembed, "PCA_MIN_VARIANCE", 0.0)
+    output, report = tmp_path / "replay.npz", tmp_path / "replay.json"
+    seed_stale_pca_artifacts(output, report, staging=True)
+    mismatched_minilm = np.roll(case.minilm_raw, 1, axis=0)
+    minilm = fake_binding(case, tmp_path, mismatched_minilm, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(case, tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
+
+    with pytest.raises(AssertionError, match="MiniLM regeneration"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+            variant=reembed.PCA384,
+        )
+
+    assert_pca_failure_boundary(
+        output,
+        report,
+        exception_type="AssertionError",
+        message_fragment="MiniLM regeneration gate failed",
+    )
+
+
+def test_pca_staging_gate_failure_replaces_stale_report_and_clears_all_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    output, report = tmp_path / "staging.npz", tmp_path / "staging.json"
+    seed_stale_pca_artifacts(output, report, staging=True)
+
+    with pytest.raises(AssertionError, match="staging artifact gate failed"):
+        build_pca_fixture(case, tmp_path, monkeypatch, output, report)
+
+    assert_pca_failure_boundary(
+        output,
+        report,
+        exception_type="AssertionError",
+        message_fragment="staging artifact gate failed",
+    )
+
+
+def test_pca_serialization_failure_replaces_stale_report_and_clears_all_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    output, report = tmp_path / "serialization.npz", tmp_path / "serialization.json"
+    seed_stale_pca_artifacts(output, report)
+
+    def fail_serialization(*args, **kwargs):
+        raise OSError("injected PCA serialization failure")
+
+    monkeypatch.setattr(reembed, "save_target_bank", fail_serialization)
+    with pytest.raises(OSError, match="injected PCA serialization failure"):
+        build_pca_fixture(case, tmp_path, monkeypatch, output, report)
+
+    assert_pca_failure_boundary(
+        output,
+        report,
+        exception_type="OSError",
+        message_fragment="injected PCA serialization failure",
+    )
+
+
+def test_pca_deterministic_npz_failure_replaces_stale_report_and_clears_all_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    output, report = tmp_path / "determinism.npz", tmp_path / "determinism.json"
+    seed_stale_pca_artifacts(output, report)
+    deterministic_save = reembed.save_target_bank
+
+    def mismatched_save(path, *args):
+        deterministic_save(path, *args)
+        if Path(path).name.endswith(".check"):
+            Path(path).write_bytes(Path(path).read_bytes() + b"mismatch")
+
+    monkeypatch.setattr(reembed, "save_target_bank", mismatched_save)
+    with pytest.raises(AssertionError, match="deterministic NPZ gate failed"):
+        build_pca_fixture(case, tmp_path, monkeypatch, output, report)
+
+    assert_pca_failure_boundary(
+        output,
+        report,
+        exception_type="AssertionError",
+        message_fragment="deterministic NPZ gate failed",
+    )
+
+
+def test_pca_source_failure_replaces_stale_report_and_clears_all_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
+    output, report = tmp_path / "source-failure.npz", tmp_path / "source-failure.json"
+    seed_stale_pca_artifacts(output, report, staging=True)
+
+    with pytest.raises(AssertionError, match="source SHA-256 gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            None,
+            None,
+            "0" * 64,
+            variant=reembed.PCA384,
+        )
+
+    assert_pca_failure_boundary(
+        output,
+        report,
+        exception_type="AssertionError",
+        message_fragment="source SHA-256 gate failed",
+    )
+
+
+def test_pca_source_failure_does_not_reuse_a_stale_failed_report(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
+    output, report = tmp_path / "stale-failed-source.npz", tmp_path / "stale-failed-source.json"
+    seed_stale_pca_artifacts(output, report, staging=True)
+    report.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "artifact": {"published": False},
+                "gate_error": {"gate": "stale gate", "message": "stale failure evidence"},
+            }
+        )
+        + "\n"
+    )
+
+    with pytest.raises(AssertionError, match="source SHA-256 gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            None,
+            None,
+            "0" * 64,
+            variant=reembed.PCA384,
+        )
+
+    assert_pca_failure_boundary(
+        output,
+        report,
+        exception_type="AssertionError",
+        message_fragment="source SHA-256 gate failed",
+    )
+    payload = json.loads(report.read_text())
+    assert payload["gate_error"]["gate"] != "stale gate"
+
+
+def test_pca_provenance_failure_replaces_stale_report_and_clears_all_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
+    output, report = tmp_path / "provenance.npz", tmp_path / "provenance.json"
+    seed_stale_pca_artifacts(output, report, staging=True)
+    minilm = reembed.EncoderBinding(
+        MINILM_MODEL,
+        "wrong-revision",
+        fake_snapshot_path(tmp_path, MINILM_MODEL, "wrong-revision"),
+    )
+    biomedical = fake_binding(case, tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
+
+    with pytest.raises(AssertionError, match="MiniLM revision provenance gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+            variant=reembed.PCA384,
+        )
+
+    assert_pca_failure_boundary(
+        output,
+        report,
+        exception_type="AssertionError",
+        message_fragment="MiniLM revision provenance gate failed",
+    )
+
+
+def test_pca_publication_failure_replaces_stale_report_and_clears_all_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    output, report = tmp_path / "publication.npz", tmp_path / "publication.json"
+    seed_stale_pca_artifacts(output, report)
+    original_replace = Path.replace
+    injected = False
+
+    def fail_first_report_promotion(self, target):
+        nonlocal injected
+        if not injected and self == report.with_name(report.name + ".tmp") and Path(target) == report:
+            injected = True
+            raise OSError("injected PCA report publication failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_first_report_promotion)
+    with pytest.raises(OSError, match="injected PCA report publication failure"):
+        build_pca_fixture(case, tmp_path, monkeypatch, output, report)
+
+    assert injected is True
+    assert_pca_failure_boundary(
+        output,
+        report,
+        exception_type="OSError",
+        message_fragment="injected PCA report publication failure",
+    )
 
 
 def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministically(tmp_path, monkeypatch):

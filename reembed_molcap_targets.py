@@ -152,25 +152,58 @@ def pca_project_unit(raw, n_components=PCA_DIM):
     eigenvalues = np.clip(eigenvalues[order], 0.0, None)
     components = canonicalize_component_signs(eigenvectors[:, order[:n_components]].T)
     scores = centered @ components.T
+    expected_shape = (len(values), n_components)
+    assert scores.shape == expected_shape, (
+        f"PCA projected shape gate failed: {scores.shape} != {expected_shape}"
+    )
+    assert np.isfinite(scores).all(), "PCA projected finite gate failed"
     norms = np.linalg.norm(scores, axis=1, keepdims=True)
-    assert (norms > 0).all(), "PCA projection zero-row gate failed"
+    min_pre_normalization_row_norm = float(norms.min())
+    assert min_pre_normalization_row_norm > 0, "PCA projection zero-row gate failed"
     projected = (scores / norms).astype(np.float32)
+    assert projected.shape == expected_shape, (
+        f"PCA projected shape gate failed: {projected.shape} != {expected_shape}"
+    )
+    projected_finite = bool(np.isfinite(projected).all())
+    assert projected_finite, "PCA projected finite gate failed"
+    max_post_normalization_unit_norm_error = float(
+        np.abs(np.linalg.norm(projected, axis=1) - 1.0).max()
+    )
+    assert max_post_normalization_unit_norm_error <= 1e-5, (
+        "PCA post-normalization unit-norm gate failed: "
+        f"{max_post_normalization_unit_norm_error} > 1e-05"
+    )
     total = float(eigenvalues.sum())
     retained = float(eigenvalues[:n_components].sum())
+    discarded = float(eigenvalues[n_components:].sum())
     audit = {
         "fit_rows": len(values),
         "input_width": values.shape[1],
         "output_width": n_components,
+        "centering": "per-dimension mean subtraction",
         "solver": "numpy.linalg.eigh",
+        "eigenvalue_ordering": "descending",
         "covariance_denominator": "n-1",
         "sign_rule": "lowest-index largest-absolute loading positive",
+        "projected_shape": list(projected.shape),
+        "projected_finite": projected_finite,
+        "min_pre_normalization_row_norm": min_pre_normalization_row_norm,
+        "max_post_normalization_unit_norm_error": max_post_normalization_unit_norm_error,
+        "eligibility_thresholds": {
+            "projected_shape": list(expected_shape),
+            "projected_finite": True,
+            "min_pre_normalization_row_norm_exclusive": 0.0,
+            "max_post_normalization_unit_norm_error": 1e-5,
+        },
         "eigenvalues_descending": eigenvalues.tolist(),
         "eigenvalues_sha256": array_sha256(eigenvalues),
         "mean_sha256": array_sha256(mean),
         "component_sha256": array_sha256(components),
         "retained_variance": retained,
+        "discarded_variance": discarded,
         "total_variance": total,
         "retained_variance_fraction": retained / total,
+        "discarded_variance_fraction": discarded / total,
         "discarded_energy_fraction": 1.0 - retained / total,
         "eigenvalue_384": float(eigenvalues[n_components - 1]),
         "eigenvalue_385": float(eigenvalues[n_components]),
@@ -354,7 +387,143 @@ def encode(encoder, captions, expected_dim):
     return raw
 
 
-def build_reembedded_bank(
+def pca_staging_paths(output, report):
+    output, report = Path(output).resolve(), Path(report).resolve()
+    return (
+        output.with_name(output.name + ".tmp"),
+        output.with_name(output.name + ".check"),
+        output.with_name(output.name + ".bak"),
+        report.with_name(report.name + ".tmp"),
+        report.with_name(report.name + ".bak"),
+    )
+
+
+def persist_pca_build_failure(
+    error,
+    source,
+    output,
+    report,
+    fino_path,
+    artifact_width,
+    artifact_mode,
+    preexisting_target_detected,
+    preexisting_report_sha256,
+):
+    source = Path(source).resolve()
+    output = Path(output).resolve()
+    report = Path(report).resolve()
+    fino_path = Path(fino_path).resolve()
+    protected_paths = {source, fino_path}
+    if output in protected_paths or report in protected_paths or output == report:
+        error.add_note("PCA failure boundary skipped unsafe colliding artifact paths")
+        return None
+
+    existing_failure = None
+    if report.is_file():
+        try:
+            def reject_nonstandard_constant(value):
+                raise ValueError(f"non-standard JSON constant: {value}")
+
+            report_bytes = report.read_bytes()
+            candidate = json.loads(
+                report_bytes.decode("utf-8"),
+                parse_constant=reject_nonstandard_constant,
+            )
+            current_report_sha256 = hashlib.sha256(report_bytes).hexdigest()
+            if (
+                current_report_sha256 != preexisting_report_sha256
+                and isinstance(candidate, dict)
+                and candidate.get("status") == "failed"
+            ):
+                existing_failure = candidate
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            pass
+
+    staging_paths = pca_staging_paths(output, report)
+    cleanup_errors = {}
+    for path in (output, *staging_paths):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            cleanup_errors[str(path)] = str(cleanup_error)
+    target_path_cleared = not output.exists()
+    staging_paths_cleared = not any(path.exists() for path in staging_paths)
+
+    exception_message = str(error)
+    gate = error.gate if isinstance(error, ValidationGateError) else "PCA build/publication"
+    validation = (
+        error.validation
+        if isinstance(error, ValidationGateError)
+        else {
+            "gate_values": {
+                "exception_type": type(error).__name__,
+                "exception_message": exception_message,
+            },
+            "thresholds": {"pca_build_and_publication_completed": True},
+        }
+    )
+    source_sha = None
+    try:
+        if source.is_file():
+            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    except OSError:
+        pass
+
+    payload = existing_failure or {
+        "source": {"sha256": source_sha, "rows": None, "mode": None},
+        "artifact": {
+            "rows": None,
+            "width": artifact_width,
+            "mode": artifact_mode,
+        },
+        "models": {},
+        "validation": validation,
+        "gate_error": {"gate": gate, "message": exception_message},
+        "pca": None,
+    }
+    artifact = payload.setdefault("artifact", {})
+    artifact.update(
+        {
+            "published": False,
+            "preexisting_target_detected": bool(
+                preexisting_target_detected or artifact.get("preexisting_target_detected", False)
+            ),
+            "target_path_cleared": target_path_cleared,
+            "width": artifact_width,
+            "mode": artifact_mode,
+        }
+    )
+    payload["status"] = "failed"
+    payload.setdefault("validation", validation)
+    payload.setdefault("gate_error", {"gate": gate, "message": exception_message})
+    payload.setdefault("pca", None)
+    payload["failure_boundary"] = {
+        "variant": PCA384,
+        "exception_type": type(error).__name__,
+        "exception_message": exception_message,
+        "target_path_cleared": target_path_cleared,
+        "staging_paths_cleared": staging_paths_cleared,
+    }
+    if cleanup_errors:
+        payload["failure_boundary"]["cleanup_errors"] = cleanup_errors
+    payload, non_finite_values = json_safe_payload(payload)
+    if non_finite_values:
+        payload.setdefault("non_finite_values", {}).update(non_finite_values)
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+    failure_report_tmp = report.with_name(report.name + ".tmp")
+    try:
+        failure_report_tmp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        failure_report_tmp.replace(report)
+    finally:
+        failure_report_tmp.unlink(missing_ok=True)
+    return payload
+
+
+def _build_reembedded_bank(
     source,
     output,
     report,
@@ -733,6 +902,69 @@ def build_reembedded_bank(
         for path in (output_tmp, output_check, report_tmp):
             if path.exists():
                 path.unlink()
+
+
+def build_reembedded_bank(
+    source,
+    output,
+    report,
+    fino_path,
+    minilm_binding,
+    biomedical_binding,
+    expected_source_sha,
+    device="cpu",
+    variant=RAW768,
+):
+    if variant != PCA384:
+        return _build_reembedded_bank(
+            source,
+            output,
+            report,
+            fino_path,
+            minilm_binding,
+            biomedical_binding,
+            expected_source_sha,
+            device=device,
+            variant=variant,
+        )
+
+    preexisting_target_detected = Path(output).resolve().exists()
+    preexisting_report_sha256 = None
+    report_path = Path(report).resolve()
+    try:
+        if report_path.is_file():
+            preexisting_report_sha256 = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    except OSError:
+        pass
+    try:
+        return _build_reembedded_bank(
+            source,
+            output,
+            report,
+            fino_path,
+            minilm_binding,
+            biomedical_binding,
+            expected_source_sha,
+            device=device,
+            variant=variant,
+        )
+    except Exception as error:
+        try:
+            persist_pca_build_failure(
+                error,
+                source,
+                output,
+                report,
+                fino_path,
+                VARIANT_SPECS[PCA384]["target_width"],
+                VARIANT_SPECS[PCA384]["artifact_mode"],
+                preexisting_target_detected,
+                preexisting_report_sha256,
+            )
+        except Exception as failure_boundary_error:
+            error.add_note(f"PCA failure boundary failed: {failure_boundary_error}")
+            raise error from failure_boundary_error
+        raise
 
 
 def main(argv=None):
