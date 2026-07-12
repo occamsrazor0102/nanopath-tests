@@ -26,7 +26,6 @@ FINO_PATIENT_COUNT = 9_389
 
 @dataclass(frozen=True)
 class EncoderBinding:
-    encoder: object
     model: str
     revision: str
     snapshot_path: Path
@@ -102,6 +101,12 @@ def validate_encoder_binding(binding, expected_model, expected_revision, label):
     assert snapshot.parent.name == "snapshots", f"{label} snapshot layout provenance gate failed"
     assert snapshot.parent.parent.name == expected_cache_name, f"{label} snapshot model provenance gate failed"
     return snapshot
+
+
+def load_snapshot_encoder(snapshot_path, device):
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(str(Path(snapshot_path).resolve()), device=device, local_files_only=True)
 
 
 def matrix_audit(values):
@@ -278,6 +283,7 @@ def build_reembedded_bank(
     minilm_binding,
     biomedical_binding,
     expected_source_sha,
+    device="cpu",
 ):
     source, output, report, fino_path = resolve_build_paths(source, output, report, fino_path)
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -299,8 +305,10 @@ def build_reembedded_bank(
         biomedical_binding, BIOMED_MODEL, BIOMED_REVISION, "biomedical"
     )
 
-    minilm_raw = encode(minilm_binding.encoder, captions, canonical_targets.shape[1])
-    biomedical_raw = encode(biomedical_binding.encoder, captions, BIOMED_DIM)
+    minilm_encoder = load_snapshot_encoder(minilm_snapshot, device)
+    biomedical_encoder = load_snapshot_encoder(biomedical_snapshot, device)
+    minilm_raw = encode(minilm_encoder, captions, canonical_targets.shape[1])
+    biomedical_raw = encode(biomedical_encoder, captions, BIOMED_DIM)
     minilm_raw_audit = matrix_audit(minilm_raw)
     biomedical_raw_audit = matrix_audit(biomedical_raw)
     provenance = {
@@ -501,7 +509,6 @@ def main(argv=None):
     args = dict(pairs)
     assert len(args) == len(pairs) and set(args) == {"source", "output", "report", "fino", "device"}, "required keys: source output report fino device"
     from huggingface_hub import snapshot_download
-    from sentence_transformers import SentenceTransformer
 
     minilm_snapshot = Path(
         snapshot_download(repo_id=MINILM_MODEL, revision=MINILM_REVISION, local_files_only=True)
@@ -510,13 +517,11 @@ def main(argv=None):
         snapshot_download(repo_id=BIOMED_MODEL, revision=BIOMED_REVISION, local_files_only=True)
     ).resolve()
     minilm = EncoderBinding(
-        SentenceTransformer(str(minilm_snapshot), device=args["device"], local_files_only=True),
         MINILM_MODEL,
         MINILM_REVISION,
         minilm_snapshot,
     )
     biomedical = EncoderBinding(
-        SentenceTransformer(str(biomedical_snapshot), device=args["device"], local_files_only=True),
         BIOMED_MODEL,
         BIOMED_REVISION,
         biomedical_snapshot,
@@ -529,6 +534,7 @@ def main(argv=None):
         minilm,
         biomedical,
         CANONICAL_SHA256,
+        device=args["device"],
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return result
