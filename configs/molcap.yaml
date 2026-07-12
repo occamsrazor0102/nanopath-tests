@@ -66,9 +66,11 @@ dino:
 # encoder, L2-normalize, and save patient_barcode -> vector into an .npz.
 molcap:
   enabled: true
-  caption_embeds: /data/$USER/nanopath/molcap_captions.npz
-  text_dim: 384          # frozen text-encoder width (e.g. all-MiniLM-L6-v2 = 384, BGE-small = 384)
-  weight: 0.1            # aux loss weight; sweep {0.05, 0.1, 0.2}
+  caption_embeds: /data/$USER/nanopath/molcap_captions.npz  # build_captions.py output (.npz)
+  text_dim: 384          # MUST match the encoder width: MiniLM/BGE-small = 384; biomedical
+                         # sentence encoders (S-PubMedBert-MS-MARCO, S-BioBert-*) = 768
+  weight: 0.03           # the 2026-07-11 s7777 run preserved tile metrics at 0.03; raising it just
+                         # amplifies the molecular/survival distortion, so do not increase it
   ramp_start: 0.15       # start ramping at 15% of the FLOP budget, after tile features settle
   ramp_len: 0.25         # linear ramp to full weight over the next 25%
 

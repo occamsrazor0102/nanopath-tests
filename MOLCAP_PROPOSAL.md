@@ -86,3 +86,15 @@ Run on top of your current frontier recipe (fork), not vanilla main:
 - **Weight / ramp is the antagonism dial.** Too high re-introduces the collapse; `weight 0.1`, `ramp_start 0.15` is a conservative start — sweep `weight ∈ {0.05, 0.1, 0.2}`.
 - **Batch composition:** with i.i.d. tile sampling most patients appear once per batch, so this MVP supervises per-tile (toward the patient caption). A follow-up — an **EMA per-patient CLS-centroid bank** aligned to the caption — would supervise the exact mean-pooled quantity the slide probes read, at ~20 more lines; worth trying if C2 is promising.
 - **Honest framing:** this is a research bet, not a guaranteed +0.006. But it is the one direction the field left untouched, aimed squarely at the failure mode the data reveals.
+
+## 8. Result: `molcap-text-s7777` (2026-07-11) — mechanism confirmed, target rejected
+
+First real run (per-patient MiniLM caption, weight 0.03, patch-routed late ramp) scored **0.66522**, −0.00069 vs same-seed `bsc-s7777-k10` (0.66591). Do not submit — a paired loss to a higher unvalidated run with no real margin. But the split is the informative part:
+
+| | linear | kNN | slide/prog | seg | molecular | survival | overall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Δ vs bsc-s7777-k10 | −0.0001 | **+0.0011** | **+0.0031** | −0.0021 | −0.0023 | −0.0040 | −0.0007 |
+
+**The decoupling worked** — linear held flat, kNN and slide AUC *rose*. No prior ledger run lifted slide signal without collapsing tile metrics; the antagonism is breakable. **The target failed**: molecular and survival (the categories it should help) dropped, and that plus seg erased the slide gain. Likely causes: (a) per-tile alignment flattens intra-slide heterogeneity mutation/survival need; (b) MiniLM is pathology-blind, so "KRAS-mutant" vs "wild-type" sit nearly collinear and get compressed; (c) shared-trunk gradients perturb patch tokens → seg −0.0021. Survival is also the noisiest probe, so part of −0.0040 is variance.
+
+**Next arm (biomedical encoder — tests cause b).** Routing is encoder-agnostic, so this is offline-only: rebuild captions with a biomedical **sentence** encoder (`pritamdeka/S-PubMedBert-MS-MARCO`, 768-d — *not* raw PubMedBERT, which embeds sentences poorly) via `build_captions.py`, set `molcap.text_dim: 768` and `caption_embeds` to the new `.npz`, and **keep caption text / weight 0.03 / ramp / seed 7777 identical** so the encoder is the only changed variable. Judge paired against this run: does molecular/survival recover while linear/kNN hold? Allowed — a text encoder trained on biomedical *literature* is public non-image info, not a pathology image model (worth a one-line maintainer confirm since it's domain-adjacent). If it doesn't recover, cause (a) dominates → build the EMA per-patient-centroid variant (§7) next.
