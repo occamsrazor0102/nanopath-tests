@@ -31,6 +31,13 @@ class EncoderBinding:
     revision: str
 
 
+class ValidationGateError(AssertionError):
+    def __init__(self, gate, validation, message=None):
+        self.gate = gate
+        self.validation = validation
+        super().__init__(message or f"{gate} gate failed")
+
+
 def geometry_metrics(targets):
     x = np.asarray(targets, dtype=np.float64)
     norms = np.linalg.norm(x, axis=1)
@@ -65,30 +72,34 @@ def fino_patient_ids(path):
 def validate_candidate(reference, candidate, patient_ids, fino_ids, expected_fino_count=FINO_PATIENT_COUNT):
     patient_set = set(np.asarray(patient_ids, dtype=str).tolist())
     numeric = np.asarray(list(candidate.values()), dtype=np.float64)
-    assert candidate["rows"] == len(patient_ids), "row count gate failed"
-    assert len(patient_set) == len(patient_ids), "unique patient IDs gate failed"
-    assert candidate["width"] == BIOMED_DIM, "width gate failed"
-    assert np.isfinite(numeric).all(), "finite geometry gate failed"
-    assert candidate["max_unit_norm_error"] <= 1e-5, "unit norm gate failed"
-    assert abs(candidate["mean_off_diagonal_cosine"]) <= 0.01, "cosine gate failed"
-    assert candidate["effective_rank"] >= 32, "effective rank gate failed"
-    assert candidate["participation_ratio"] >= 16, "participation ratio gate failed"
-    assert candidate["variance_cv"] <= 0.75, "variance CV gate failed"
     effective_ratio = round(candidate["normalized_effective_rank"] / reference["normalized_effective_rank"], 12)
     participation_ratio = round(candidate["normalized_participation_ratio"] / reference["normalized_participation_ratio"], 12)
-    assert 0.5 <= effective_ratio <= 2.0, "effective rank ratio gate failed"
-    assert 0.5 <= participation_ratio <= 2.0, "participation ratio ratio gate failed"
-    assert len(fino_ids) == expected_fino_count, f"FINO count gate failed: {len(fino_ids)} != {expected_fino_count}"
     missing = sorted(set(fino_ids) - patient_set)
-    assert not missing, f"FINO coverage gate failed: {len(missing)} missing"
-    return {
-        "coverage_count": len(fino_ids) - len(missing),
+    coverage_count = len(fino_ids) - len(missing)
+    coverage_fraction = 1.0 if not fino_ids else coverage_count / len(fino_ids)
+    validation = {
+        "coverage_count": coverage_count,
         "coverage_total": len(fino_ids),
-        "coverage_fraction": 1.0 if not fino_ids else (len(fino_ids) - len(missing)) / len(fino_ids),
+        "coverage_fraction": coverage_fraction,
         "missing_patient_count": len(missing),
         "missing_patient_ids": missing,
         "normalized_effective_rank_ratio": effective_ratio,
         "normalized_participation_ratio_ratio": participation_ratio,
+        "gate_values": {
+            "rows": candidate["rows"],
+            "unique_patient_ids": len(patient_set),
+            "width": candidate["width"],
+            "finite_geometry": bool(np.isfinite(numeric).all()),
+            "max_unit_norm_error": candidate["max_unit_norm_error"],
+            "absolute_mean_off_diagonal_cosine": abs(candidate["mean_off_diagonal_cosine"]),
+            "effective_rank": candidate["effective_rank"],
+            "participation_ratio": candidate["participation_ratio"],
+            "variance_cv": candidate["variance_cv"],
+            "normalized_effective_rank_ratio": effective_ratio,
+            "normalized_participation_ratio_ratio": participation_ratio,
+            "fino_patient_count": len(fino_ids),
+            "coverage_fraction": coverage_fraction,
+        },
         "thresholds": {
             "rows": len(patient_ids),
             "width": BIOMED_DIM,
@@ -102,6 +113,29 @@ def validate_candidate(reference, candidate, patient_ids, fino_ids, expected_fin
             "required_coverage_fraction": 1.0,
         },
     }
+
+    def require(condition, gate, message=None):
+        if not condition:
+            raise ValidationGateError(gate, validation, message)
+
+    require(candidate["rows"] == len(patient_ids), "row count")
+    require(len(patient_set) == len(patient_ids), "unique patient IDs")
+    require(candidate["width"] == BIOMED_DIM, "width")
+    require(validation["gate_values"]["finite_geometry"], "finite geometry")
+    require(candidate["max_unit_norm_error"] <= 1e-5, "unit norm")
+    require(abs(candidate["mean_off_diagonal_cosine"]) <= 0.01, "cosine")
+    require(candidate["effective_rank"] >= 32, "effective rank")
+    require(candidate["participation_ratio"] >= 16, "participation ratio")
+    require(candidate["variance_cv"] <= 0.75, "variance CV")
+    require(0.5 <= effective_ratio <= 2.0, "effective rank ratio")
+    require(0.5 <= participation_ratio <= 2.0, "participation ratio ratio")
+    require(
+        len(fino_ids) == expected_fino_count,
+        "FINO count",
+        f"FINO count gate failed: {len(fino_ids)} != {expected_fino_count}",
+    )
+    require(not missing, "FINO coverage", f"FINO coverage gate failed: {len(missing)} missing")
+    return validation
 
 
 def encode(encoder, captions, expected_dim):
@@ -160,11 +194,46 @@ def build_reembedded_bank(
         rtol=0,
         err_msg="MiniLM regeneration gate failed",
     )
+    minilm_raw_geometry = geometry_metrics(minilm_raw)
     reference = geometry_metrics(canonical_targets)
+    biomedical_raw_geometry = geometry_metrics(biomedical_raw)
     candidate = geometry_metrics(biomedical_targets)
-    validation = validate_candidate(
-        reference, candidate, patient_ids, fino_patient_ids(fino_path), expected_fino_count=expected_fino_count
-    )
+    model_payload = {
+        "minilm": {
+            "model": minilm_binding.model,
+            "revision": minilm_binding.revision,
+            "raw_geometry": minilm_raw_geometry,
+            "corrected_geometry": reference,
+        },
+        "biomedical": {
+            "model": biomedical_binding.model,
+            "revision": biomedical_binding.revision,
+            "raw_geometry": biomedical_raw_geometry,
+            "corrected_geometry": candidate,
+        },
+    }
+    try:
+        validation = validate_candidate(
+            reference, candidate, patient_ids, fino_patient_ids(fino_path), expected_fino_count=expected_fino_count
+        )
+    except ValidationGateError as error:
+        failure_payload = {
+            "status": "failed",
+            "source": {"sha256": source_sha, "rows": len(patient_ids), "mode": mode.item()},
+            "artifact": {"published": False, "rows": len(patient_ids), "width": BIOMED_DIM, "mode": "biomedical"},
+            "models": model_payload,
+            "validation": error.validation,
+            "gate_error": {"gate": error.gate, "message": str(error)},
+        }
+        report.parent.mkdir(parents=True, exist_ok=True)
+        failure_report_tmp = report.with_name(report.name + ".tmp")
+        assert not failure_report_tmp.exists(), "staging artifact gate failed"
+        try:
+            failure_report_tmp.write_text(json.dumps(failure_payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
+            failure_report_tmp.replace(report)
+        finally:
+            failure_report_tmp.unlink(missing_ok=True)
+        raise
 
     output.parent.mkdir(parents=True, exist_ok=True)
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -184,20 +253,7 @@ def build_reembedded_bank(
         payload = {
             "source": {"sha256": source_sha, "rows": len(patient_ids), "mode": mode.item()},
             "artifact": {"sha256": output_sha, "rows": len(patient_ids), "width": BIOMED_DIM, "mode": "biomedical"},
-            "models": {
-                "minilm": {
-                    "model": minilm_binding.model,
-                    "revision": minilm_binding.revision,
-                    "raw_geometry": geometry_metrics(minilm_raw),
-                    "corrected_geometry": geometry_metrics(minilm_targets),
-                },
-                "biomedical": {
-                    "model": biomedical_binding.model,
-                    "revision": biomedical_binding.revision,
-                    "raw_geometry": geometry_metrics(biomedical_raw),
-                    "corrected_geometry": candidate,
-                },
-            },
+            "models": model_payload,
             "validation": validation,
         }
         report_tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")

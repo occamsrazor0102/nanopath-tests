@@ -74,6 +74,43 @@ def test_validate_candidate_accepts_valid_geometry_and_coverage():
     assert report["normalized_participation_ratio_ratio"] == 0.5
 
 
+def test_validate_candidate_failure_carries_complete_audit_values():
+    reference = {"normalized_effective_rank": 0.10, "normalized_participation_ratio": 0.06}
+    candidate = valid_geometry() | {"normalized_effective_rank": 0.049}
+
+    with pytest.raises(reembed.ValidationGateError, match="effective rank ratio") as raised:
+        reembed.validate_candidate(
+            reference,
+            candidate,
+            np.array(["P1", "P2"]),
+            {"P1", "P2"},
+            expected_fino_count=2,
+        )
+
+    assert raised.value.gate == "effective rank ratio"
+    audit = raised.value.validation
+    assert audit["coverage_count"] == 2
+    assert audit["coverage_total"] == 2
+    assert audit["coverage_fraction"] == 1.0
+    assert audit["normalized_effective_rank_ratio"] == 0.49
+    assert audit["normalized_participation_ratio_ratio"] == 0.5
+    assert audit["gate_values"] == {
+        "rows": 2,
+        "unique_patient_ids": 2,
+        "width": 768,
+        "finite_geometry": True,
+        "max_unit_norm_error": 1e-7,
+        "absolute_mean_off_diagonal_cosine": 0.0,
+        "effective_rank": 40.0,
+        "participation_ratio": 20.0,
+        "variance_cv": 0.3,
+        "normalized_effective_rank_ratio": 0.49,
+        "normalized_participation_ratio_ratio": 0.5,
+        "fino_patient_count": 2,
+        "coverage_fraction": 1.0,
+    }
+
+
 def test_validate_candidate_rejects_truncated_all_present_fino_set():
     reference = {"normalized_effective_rank": 0.10, "normalized_participation_ratio": 0.06}
     with pytest.raises(AssertionError, match="FINO count gate"):
@@ -343,3 +380,70 @@ def test_cli_pins_revisions_and_stays_offline(tmp_path, monkeypatch):
     assert isinstance(build_args[0][5], reembed.EncoderBinding)
     assert (build_args[0][5].model, build_args[0][5].revision) == (BIOMED_MODEL, BIOMED_REVISION)
     assert build_args[0][-1] == reembed.CANONICAL_SHA256
+
+
+def test_validation_failure_persists_audit_report_without_publishing_target(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = reembed.EncoderBinding(
+        FakeEncoder(case.minilm_raw, MINILM_REVISION), MINILM_MODEL, MINILM_REVISION
+    )
+    biomedical = reembed.EncoderBinding(
+        FakeEncoder(case.biomedical_raw, BIOMED_REVISION), BIOMED_MODEL, BIOMED_REVISION
+    )
+    output, report = tmp_path / "failed.npz", tmp_path / "failed.json"
+    audit = {
+        "coverage_count": case.rows,
+        "coverage_total": case.rows,
+        "coverage_fraction": 1.0,
+        "missing_patient_count": 0,
+        "missing_patient_ids": [],
+        "normalized_effective_rank_ratio": 0.4,
+        "normalized_participation_ratio_ratio": 0.6,
+        "thresholds": {"normalized_rank_ratio_range": [0.5, 2.0]},
+        "gate_values": {"normalized_effective_rank_ratio": 0.4},
+    }
+
+    def reject_candidate(*args, **kwargs):
+        raise reembed.ValidationGateError("effective rank ratio", audit)
+
+    monkeypatch.setattr(reembed, "validate_candidate", reject_candidate)
+    with pytest.raises(reembed.ValidationGateError, match="effective rank ratio gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+            expected_fino_count=case.rows,
+        )
+
+    assert not output.exists()
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["gate_error"] == {
+        "gate": "effective rank ratio",
+        "message": "effective rank ratio gate failed",
+    }
+    assert payload["source"] == {"sha256": case.source_sha, "rows": case.rows, "mode": "text"}
+    assert payload["artifact"] == {
+        "published": False,
+        "rows": case.rows,
+        "width": case.dim,
+        "mode": "biomedical",
+    }
+    assert payload["validation"] == audit
+    assert set(payload["models"]["minilm"]) == {
+        "model",
+        "revision",
+        "raw_geometry",
+        "corrected_geometry",
+    }
+    assert set(payload["models"]["biomedical"]) == {
+        "model",
+        "revision",
+        "raw_geometry",
+        "corrected_geometry",
+    }
+    assert not [*tmp_path.glob("*.tmp"), *tmp_path.glob("*.check"), *tmp_path.glob("*.bak")]
