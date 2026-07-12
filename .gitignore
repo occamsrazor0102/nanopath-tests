@@ -57,6 +57,7 @@ preserved_run_logs/
 
 # Development-only MolCap preprocessing/tests are not part of the Labless training source surface.
 build_molcap_targets.py
+reembed_molcap_targets.py
 tests/
 .superpowers/
 .worktrees/

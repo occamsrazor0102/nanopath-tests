@@ -39,5 +39,6 @@ def test_training_source_wires_optional_molcap_without_probe_changes():
 def test_development_helpers_are_excluded_from_labless_snapshot():
     patterns = Path(".gitignore").read_text().splitlines()
     assert "build_molcap_targets.py" in patterns
+    assert "reembed_molcap_targets.py" in patterns
     assert "tests/" in patterns
     assert ".superpowers/" in patterns
