@@ -3,6 +3,12 @@ from pathlib import Path
 import yaml
 
 
+def changed_leaves(left, right, prefix=""):
+    if isinstance(left, dict) and isinstance(right, dict):
+        return set().union(*(changed_leaves(left.get(key), right.get(key), f"{prefix}.{key}".strip(".")) for key in left.keys() | right.keys()))
+    return {prefix} if left != right else set()
+
+
 def test_molcap_config_is_exact_frontier_plus_auxiliary():
     config = yaml.safe_load(Path("configs/molcap-text-s7777.yaml").read_text())
 
@@ -22,6 +28,18 @@ def test_molcap_config_is_exact_frontier_plus_auxiliary():
         "ramp_len": 0.25,
         "diagnose": False,
     }
+
+
+def test_biomedical_config_is_encoder_only_ab():
+    generic = yaml.safe_load(Path("configs/molcap-text-s7777.yaml").read_text())
+    biomedical = yaml.safe_load(Path("configs/molcap-biomed-s7777.yaml").read_text())
+
+    assert changed_leaves(generic, biomedical) == {
+        "project.name", "project.output_dir", "molcap.targets", "molcap.target_dim"
+    }
+    assert biomedical["project"]["name"] == "molcap-biomed-s7777"
+    assert biomedical["molcap"]["targets"] == "/data/$USER/nanopath/molcap_biomed_768.npz"
+    assert biomedical["molcap"]["target_dim"] == 768
 
 
 def test_training_source_wires_optional_molcap_without_probe_changes():
