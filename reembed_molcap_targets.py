@@ -17,6 +17,14 @@ MINILM_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 BIOMED_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
 BIOMED_REVISION = "96786c7024f95c5aac7f2b9a18086c7b97b23036"
 BIOMED_DIM = 768
+RAW768 = "raw768"
+PCA384 = "pca384"
+PCA_DIM = 384
+PCA_MIN_VARIANCE = 0.99
+VARIANT_SPECS = {
+    RAW768: {"target_width": 768, "artifact_mode": "biomedical"},
+    PCA384: {"target_width": 384, "artifact_mode": "biomedical-pca384"},
+}
 ISOTROPY_FLOOR = 0.05
 ISOTROPY_POWER = 0.1
 CANONICAL_SHA256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
@@ -120,7 +128,69 @@ def matrix_audit(values):
     }
 
 
-def persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload):
+def canonicalize_component_signs(components):
+    fixed = np.asarray(components, dtype=np.float64).copy()
+    pivots = np.argmax(np.abs(fixed), axis=1)
+    signs = np.where(fixed[np.arange(len(fixed)), pivots] < 0, -1.0, 1.0)
+    return fixed * signs[:, None]
+
+
+def array_sha256(array):
+    canonical = np.ascontiguousarray(np.asarray(array, dtype="<f8"))
+    return hashlib.sha256(canonical.tobytes()).hexdigest()
+
+
+def pca_project_unit(raw, n_components=PCA_DIM):
+    values = np.asarray(raw, dtype=np.float64)
+    assert values.ndim == 2 and 0 < n_components < values.shape[1]
+    assert np.isfinite(values).all(), "PCA input finite gate failed"
+    mean = values.mean(axis=0, keepdims=True)
+    centered = values - mean
+    covariance = centered.T @ centered / max(1, len(centered) - 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.lexsort((np.arange(len(eigenvalues)), -eigenvalues))
+    eigenvalues = np.clip(eigenvalues[order], 0.0, None)
+    components = canonicalize_component_signs(eigenvectors[:, order[:n_components]].T)
+    scores = centered @ components.T
+    norms = np.linalg.norm(scores, axis=1, keepdims=True)
+    assert (norms > 0).all(), "PCA projection zero-row gate failed"
+    projected = (scores / norms).astype(np.float32)
+    total = float(eigenvalues.sum())
+    retained = float(eigenvalues[:n_components].sum())
+    audit = {
+        "fit_rows": len(values),
+        "input_width": values.shape[1],
+        "output_width": n_components,
+        "solver": "numpy.linalg.eigh",
+        "covariance_denominator": "n-1",
+        "sign_rule": "lowest-index largest-absolute loading positive",
+        "eigenvalues_descending": eigenvalues.tolist(),
+        "eigenvalues_sha256": array_sha256(eigenvalues),
+        "mean_sha256": array_sha256(mean),
+        "component_sha256": array_sha256(components),
+        "retained_variance": retained,
+        "total_variance": total,
+        "retained_variance_fraction": retained / total,
+        "discarded_energy_fraction": 1.0 - retained / total,
+        "eigenvalue_384": float(eigenvalues[n_components - 1]),
+        "eigenvalue_385": float(eigenvalues[n_components]),
+        "eigengap_384_385": float(eigenvalues[n_components - 1] - eigenvalues[n_components]),
+    }
+    return projected, audit
+
+
+def persist_validation_failure(
+    error,
+    source_sha,
+    patient_ids,
+    mode,
+    output,
+    report,
+    model_payload,
+    artifact_width,
+    artifact_mode,
+    extra_payload=None,
+):
     preexisting_target_detected = output.exists()
     target_clear_error = None
     try:
@@ -135,13 +205,15 @@ def persist_validation_failure(error, source_sha, patient_ids, mode, output, rep
             "preexisting_target_detected": preexisting_target_detected,
             "target_path_cleared": not output.exists(),
             "rows": len(patient_ids),
-            "width": BIOMED_DIM,
-            "mode": "biomedical",
+            "width": artifact_width,
+            "mode": artifact_mode,
         },
         "models": model_payload,
         "validation": error.validation,
         "gate_error": {"gate": error.gate, "message": str(error)},
     }
+    if extra_payload is not None:
+        failure_payload.update(extra_payload)
     failure_payload, non_finite_values = json_safe_payload(failure_payload)
     if non_finite_values:
         failure_payload["non_finite_values"] = non_finite_values
@@ -193,7 +265,14 @@ def fino_patient_ids(path):
     return {patient for group in ("discrete", "continuous") for mapping in payload[group].values() for patient in mapping}
 
 
-def validate_candidate(reference, candidate, patient_ids, fino_ids, expected_fino_count=FINO_PATIENT_COUNT):
+def validate_candidate(
+    reference,
+    candidate,
+    patient_ids,
+    fino_ids,
+    expected_fino_count=FINO_PATIENT_COUNT,
+    expected_width=768,
+):
     patient_set = set(np.asarray(patient_ids, dtype=str).tolist())
     numeric = np.asarray(list(candidate.values()), dtype=np.float64)
     effective_ratio = round(candidate["normalized_effective_rank"] / reference["normalized_effective_rank"], 12)
@@ -226,7 +305,7 @@ def validate_candidate(reference, candidate, patient_ids, fino_ids, expected_fin
         },
         "thresholds": {
             "rows": len(patient_ids),
-            "width": BIOMED_DIM,
+            "width": expected_width,
             "max_unit_norm_error": 1e-5,
             "max_absolute_mean_off_diagonal_cosine": 0.01,
             "min_effective_rank": 32,
@@ -244,7 +323,7 @@ def validate_candidate(reference, candidate, patient_ids, fino_ids, expected_fin
 
     require(candidate["rows"] == len(patient_ids), "row count")
     require(len(patient_set) == len(patient_ids), "unique patient IDs")
-    require(candidate["width"] == BIOMED_DIM, "width")
+    require(candidate["width"] == expected_width, "width")
     require(validation["gate_values"]["finite_geometry"], "finite geometry")
     require(candidate["max_unit_norm_error"] <= 1e-5, "unit norm")
     require(abs(candidate["mean_off_diagonal_cosine"]) <= 0.01, "cosine")
@@ -284,7 +363,13 @@ def build_reembedded_bank(
     biomedical_binding,
     expected_source_sha,
     device="cpu",
+    variant=RAW768,
 ):
+    assert variant in VARIANT_SPECS, f"variant gate failed: {variant}"
+    variant_spec = VARIANT_SPECS[variant]
+    artifact_width = BIOMED_DIM if variant == RAW768 else variant_spec["target_width"]
+    artifact_mode = variant_spec["artifact_mode"]
+    pca_audit = None
     source, output, report, fino_path = resolve_build_paths(source, output, report, fino_path)
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
     if expected_source_sha is not None:
@@ -344,12 +429,112 @@ def build_reembedded_bank(
                 "corrected_geometry": None,
             },
         }
-        persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload)
+        if variant == PCA384:
+            model_payload["biomedical"]["post_pca_geometry"] = None
+        persist_validation_failure(
+            error,
+            source_sha,
+            patient_ids,
+            mode,
+            output,
+            report,
+            model_payload,
+            artifact_width,
+            artifact_mode,
+            extra_payload={"pca": pca_audit} if variant == PCA384 else None,
+        )
         raise error
+    biomedical_pre_isotropy = biomedical_raw
     try:
         with np.errstate(all="ignore"):
             minilm_targets = isotropize(minilm_raw)
-            biomedical_targets = isotropize(biomedical_raw)
+            if variant == PCA384:
+                try:
+                    biomedical_pre_isotropy, pca_audit = pca_project_unit(
+                        biomedical_raw, artifact_width
+                    )
+                except Exception as pca_error:
+                    error = ValidationGateError(
+                        "PCA projection",
+                        {
+                            "gate_values": {
+                                "exception_type": type(pca_error).__name__,
+                                "exception_message": str(pca_error),
+                            },
+                            "thresholds": {"pca_projection_completed": True},
+                        },
+                    )
+                    model_payload = {
+                        "minilm": provenance["minilm"]
+                        | {
+                            "raw_matrix_audit": minilm_raw_audit,
+                            "raw_geometry": None,
+                            "corrected_geometry": None,
+                        },
+                        "biomedical": provenance["biomedical"]
+                        | {
+                            "raw_matrix_audit": biomedical_raw_audit,
+                            "raw_geometry": None,
+                            "post_pca_geometry": None,
+                            "corrected_geometry": None,
+                        },
+                    }
+                    persist_validation_failure(
+                        error,
+                        source_sha,
+                        patient_ids,
+                        mode,
+                        output,
+                        report,
+                        model_payload,
+                        artifact_width,
+                        artifact_mode,
+                        extra_payload={"pca": pca_audit},
+                    )
+                    raise error from pca_error
+                if pca_audit["retained_variance_fraction"] < PCA_MIN_VARIANCE:
+                    error = ValidationGateError(
+                        "PCA variance retention",
+                        {
+                            "gate_values": {
+                                "retained_variance_fraction": pca_audit[
+                                    "retained_variance_fraction"
+                                ],
+                            },
+                            "thresholds": {
+                                "min_retained_variance_fraction": PCA_MIN_VARIANCE,
+                            },
+                        },
+                    )
+                    model_payload = {
+                        "minilm": provenance["minilm"]
+                        | {
+                            "raw_geometry": geometry_metrics(minilm_raw),
+                            "corrected_geometry": geometry_metrics(minilm_targets),
+                        },
+                        "biomedical": provenance["biomedical"]
+                        | {
+                            "raw_geometry": geometry_metrics(biomedical_raw),
+                            "post_pca_geometry": geometry_metrics(biomedical_pre_isotropy),
+                            "corrected_geometry": None,
+                        },
+                    }
+                    persist_validation_failure(
+                        error,
+                        source_sha,
+                        patient_ids,
+                        mode,
+                        output,
+                        report,
+                        model_payload,
+                        artifact_width,
+                        artifact_mode,
+                        extra_payload={"pca": pca_audit},
+                    )
+                    raise error
+            biomedical_targets = isotropize(biomedical_pre_isotropy)
+    except ValidationGateError:
+        raise
     except Exception as isotropy_error:
         error = ValidationGateError(
             "isotropy",
@@ -371,7 +556,22 @@ def build_reembedded_bank(
                 "corrected_geometry": None,
             },
         }
-        persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload)
+        if variant == PCA384:
+            model_payload["biomedical"]["post_pca_geometry"] = (
+                geometry_metrics(biomedical_pre_isotropy) if pca_audit is not None else None
+            )
+        persist_validation_failure(
+            error,
+            source_sha,
+            patient_ids,
+            mode,
+            output,
+            report,
+            model_payload,
+            artifact_width,
+            artifact_mode,
+            extra_payload={"pca": pca_audit} if variant == PCA384 else None,
+        )
         raise error from isotropy_error
     minilm_corrected_audit = matrix_audit(minilm_targets)
     biomedical_corrected_audit = matrix_audit(biomedical_targets)
@@ -402,7 +602,22 @@ def build_reembedded_bank(
                 "corrected_geometry": None,
             },
         }
-        persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload)
+        if variant == PCA384:
+            model_payload["biomedical"]["post_pca_geometry"] = geometry_metrics(
+                biomedical_pre_isotropy
+            )
+        persist_validation_failure(
+            error,
+            source_sha,
+            patient_ids,
+            mode,
+            output,
+            report,
+            model_payload,
+            artifact_width,
+            artifact_mode,
+            extra_payload={"pca": pca_audit} if variant == PCA384 else None,
+        )
         raise error
     np.testing.assert_allclose(
         minilm_targets,
@@ -427,6 +642,10 @@ def build_reembedded_bank(
             "corrected_geometry": candidate,
         },
     }
+    if variant == PCA384:
+        model_payload["biomedical"]["post_pca_geometry"] = geometry_metrics(
+            biomedical_pre_isotropy
+        )
     try:
         validation = validate_candidate(
             reference,
@@ -434,9 +653,21 @@ def build_reembedded_bank(
             patient_ids,
             fino_patient_ids(fino_path),
             expected_fino_count=FINO_PATIENT_COUNT,
+            expected_width=artifact_width,
         )
     except ValidationGateError as error:
-        persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload)
+        persist_validation_failure(
+            error,
+            source_sha,
+            patient_ids,
+            mode,
+            output,
+            report,
+            model_payload,
+            artifact_width,
+            artifact_mode,
+            extra_payload={"pca": pca_audit} if variant == PCA384 else None,
+        )
         raise
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -449,8 +680,8 @@ def build_reembedded_bank(
     transaction_paths = (output_tmp, output_check, report_tmp, output_backup, report_backup)
     assert not any(path.exists() for path in transaction_paths), "staging artifact gate failed"
     try:
-        save_target_bank(output_tmp, patient_ids, biomedical_targets, captions, "biomedical")
-        save_target_bank(output_check, patient_ids, biomedical_targets, captions, "biomedical")
+        save_target_bank(output_tmp, patient_ids, biomedical_targets, captions, artifact_mode)
+        save_target_bank(output_check, patient_ids, biomedical_targets, captions, artifact_mode)
         output_sha = hashlib.sha256(output_tmp.read_bytes()).hexdigest()
         check_sha = hashlib.sha256(output_check.read_bytes()).hexdigest()
         assert output_sha == check_sha, "deterministic NPZ gate failed"
@@ -461,12 +692,14 @@ def build_reembedded_bank(
                 "published": True,
                 "sha256": output_sha,
                 "rows": len(patient_ids),
-                "width": BIOMED_DIM,
-                "mode": "biomedical",
+                "width": artifact_width,
+                "mode": artifact_mode,
             },
             "models": model_payload,
             "validation": validation,
         }
+        if variant == PCA384:
+            payload["pca"] = pca_audit
         report_tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
 
         output_backed_up = report_backed_up = output_promoted = report_promoted = False
@@ -507,7 +740,12 @@ def main(argv=None):
     pairs = [argument.split("=", 1) for argument in argv]
     assert all(len(pair) == 2 for pair in pairs), "arguments must be key=value"
     args = dict(pairs)
-    assert len(args) == len(pairs) and set(args) == {"source", "output", "report", "fino", "device"}, "required keys: source output report fino device"
+    required = {"source", "output", "report", "fino", "device"}
+    assert (
+        len(args) == len(pairs) and required <= set(args) <= required | {"variant"}
+    ), "required keys: source output report fino device; optional key: variant"
+    variant = args.get("variant", RAW768)
+    assert variant in VARIANT_SPECS, f"variant gate failed: {variant}"
     from huggingface_hub import snapshot_download
 
     minilm_snapshot = Path(
@@ -526,6 +764,9 @@ def main(argv=None):
         BIOMED_REVISION,
         biomedical_snapshot,
     )
+    build_kwargs = {"device": args["device"]}
+    if "variant" in args:
+        build_kwargs["variant"] = variant
     result = build_reembedded_bank(
         args["source"],
         args["output"],
@@ -534,7 +775,7 @@ def main(argv=None):
         minilm,
         biomedical,
         CANONICAL_SHA256,
-        device=args["device"],
+        **build_kwargs,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return result

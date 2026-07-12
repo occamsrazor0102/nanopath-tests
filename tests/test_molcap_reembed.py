@@ -43,6 +43,39 @@ def test_constants_pin_models_and_shared_isotropy():
     assert ISOTROPY_POWER == 0.1
 
 
+def test_canonicalize_component_signs_uses_lowest_largest_loading():
+    components = np.array([
+        [-0.5, 0.5, 0.1],
+        [0.1, -0.8, 0.2],
+    ], dtype=np.float64)
+    fixed = reembed.canonicalize_component_signs(components)
+    np.testing.assert_array_equal(fixed[0], -components[0])
+    np.testing.assert_array_equal(fixed[1], -components[1])
+    pivots = np.argmax(np.abs(fixed), axis=1)
+    assert np.all(fixed[np.arange(len(fixed)), pivots] > 0)
+
+
+def test_pca_project_unit_is_deterministic_unit_norm_and_variance_audited():
+    raw = np.random.default_rng(7).normal(size=(64, 8))
+    raw /= np.linalg.norm(raw, axis=1, keepdims=True)
+    first, first_audit = reembed.pca_project_unit(raw, n_components=4)
+    second, second_audit = reembed.pca_project_unit(raw, n_components=4)
+    assert first.shape == (64, 4)
+    assert np.isfinite(first).all()
+    np.testing.assert_allclose(np.linalg.norm(first, axis=1), 1.0, atol=1e-6)
+    np.testing.assert_array_equal(first, second)
+    assert first_audit == second_audit
+    assert len(first_audit["eigenvalues_descending"]) == 8
+    assert 0.0 <= first_audit["retained_variance_fraction"] <= 1.0
+    assert first_audit["component_sha256"] == second_audit["component_sha256"]
+
+
+def test_pca_zero_projection_row_is_rejected():
+    raw = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]]), (8, 1))
+    with pytest.raises(AssertionError, match="zero-row"):
+        reembed.pca_project_unit(raw, n_components=2)
+
+
 def test_fino_patient_ids_unions_every_mapping(tmp_path):
     path = tmp_path / "fino.json"
     path.write_text(json.dumps({"discrete": {"a": {"P1": 1}}, "continuous": {"b": {"P2": 0.2}}}))
@@ -245,6 +278,122 @@ def make_reembed_case(tmp_path, monkeypatch):
     )
 
 
+def test_default_and_explicit_raw768_builds_are_byte_identical(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = fake_binding(case, tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(case, tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
+    default_output, default_report = tmp_path / "default.npz", tmp_path / "default.json"
+    explicit_output, explicit_report = tmp_path / "explicit.npz", tmp_path / "explicit.json"
+    default_payload = reembed.build_reembedded_bank(
+        case.source, default_output, default_report, case.fino,
+        minilm, biomedical, case.source_sha,
+    )
+    explicit_payload = reembed.build_reembedded_bank(
+        case.source, explicit_output, explicit_report, case.fino,
+        minilm, biomedical, case.source_sha, variant=reembed.RAW768,
+    )
+    assert default_output.read_bytes() == explicit_output.read_bytes()
+    assert default_report.read_bytes() == explicit_report.read_bytes()
+    assert default_payload == explicit_payload
+
+
+def build_pca_fixture(case, tmp_path, monkeypatch, output, report):
+    monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
+    monkeypatch.setattr(reembed, "PCA_MIN_VARIANCE", 0.0)
+    monkeypatch.setattr(
+        reembed,
+        "validate_candidate",
+        lambda *args, **kwargs: {"coverage_count": case.rows, "coverage_total": case.rows},
+    )
+    minilm = fake_binding(case, tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(case, tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
+    return reembed.build_reembedded_bank(
+        case.source, output, report, case.fino,
+        minilm, biomedical, case.source_sha, variant=reembed.PCA384,
+    )
+
+
+def test_pca384_build_projects_normalizes_then_isotropizes(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    output, report = tmp_path / "pca.npz", tmp_path / "pca.json"
+    payload = build_pca_fixture(case, tmp_path, monkeypatch, output, report)
+    with np.load(output, allow_pickle=False) as bank:
+        assert bank["targets"].shape == (case.rows, 4)
+        assert bank["mode"].item() == "biomedical-pca384"
+    assert payload["artifact"]["width"] == 4
+    assert payload["pca"]["output_width"] == 4
+    assert payload["models"]["biomedical"]["post_pca_geometry"]["width"] == 4
+
+
+def test_pca_variance_failure_clears_stale_384_target_and_reports(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    output, report = tmp_path / "stale-pca.npz", tmp_path / "stale-pca.json"
+    output.write_bytes(b"stale")
+    monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
+    monkeypatch.setattr(reembed, "PCA_MIN_VARIANCE", 1.01)
+    minilm = fake_binding(case, tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(case, tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
+    with pytest.raises(reembed.ValidationGateError, match="PCA variance retention"):
+        reembed.build_reembedded_bank(
+            case.source, output, report, case.fino,
+            minilm, biomedical, case.source_sha, variant=reembed.PCA384,
+        )
+    assert not output.exists()
+    failure = json.loads(report.read_text())
+    assert failure["status"] == "failed"
+    assert failure["artifact"]["width"] == 4
+    assert failure["gate_error"]["gate"] == "PCA variance retention"
+
+
+def test_pca_projection_failure_is_reported_as_pca_gate(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    output, report = tmp_path / "failed-pca.npz", tmp_path / "failed-pca.json"
+    monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
+    constant_raw = np.tile(case.biomedical_raw[0], (case.rows, 1))
+    minilm = fake_binding(case, tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(case, tmp_path, constant_raw, BIOMED_MODEL, BIOMED_REVISION)
+    with pytest.raises(reembed.ValidationGateError, match="PCA projection gate failed"):
+        reembed.build_reembedded_bank(
+            case.source, output, report, case.fino,
+            minilm, biomedical, case.source_sha, variant=reembed.PCA384,
+        )
+    failure = json.loads(report.read_text())
+    assert failure["gate_error"]["gate"] == "PCA projection"
+    assert failure["artifact"]["width"] == 4
+    assert failure["pca"] is None
+    assert not output.exists()
+
+
+def test_pca_variant_orders_projection_before_biomedical_isotropy(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    events = []
+    original_isotropize = reembed.isotropize
+    original_pca = reembed.pca_project_unit
+
+    def record_isotropize(values):
+        events.append(("isotropize", values.shape[1]))
+        return original_isotropize(values)
+
+    def record_pca(values, n_components):
+        events.append(("pca", values.shape[1]))
+        return original_pca(values, n_components)
+
+    monkeypatch.setattr(reembed, "isotropize", record_isotropize)
+    monkeypatch.setattr(reembed, "pca_project_unit", record_pca)
+    build_pca_fixture(case, tmp_path, monkeypatch, tmp_path / "order.npz", tmp_path / "order.json")
+    assert events == [("isotropize", case.dim), ("pca", case.dim), ("isotropize", 4)]
+
+
+def test_pca_success_artifacts_are_byte_deterministic(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    first, first_report = tmp_path / "first-pca.npz", tmp_path / "first-pca.json"
+    second, second_report = tmp_path / "second-pca.npz", tmp_path / "second-pca.json"
+    build_pca_fixture(case, tmp_path, monkeypatch, first, first_report)
+    build_pca_fixture(case, tmp_path, monkeypatch, second, second_report)
+    assert first.read_bytes() == second.read_bytes()
+    assert first_report.read_bytes() == second_report.read_bytes()
+
+
 def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministically(tmp_path, monkeypatch):
     case = make_reembed_case(tmp_path, monkeypatch)
     minilm = FakeEncoder(case.minilm_raw, MINILM_REVISION)
@@ -413,6 +562,37 @@ def test_build_reembedded_bank_requires_canonical_row_count(tmp_path):
         reembed.build_reembedded_bank(source, tmp_path / "out.npz", tmp_path / "report.json", tmp_path / "fino.json", None, None, None)
 
 
+def test_cli_accepts_only_pca384_variant(tmp_path, monkeypatch):
+    build_calls = []
+
+    def fake_snapshot_download(repo_id, revision, local_files_only):
+        assert local_files_only is True
+        return str(fake_snapshot_path(tmp_path, repo_id, revision))
+
+    def fake_build(*args, **kwargs):
+        build_calls.append((args, kwargs))
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+    monkeypatch.setattr(reembed, "build_reembedded_bank", fake_build)
+    base_argv = [
+        f"source={tmp_path / 'source.npz'}",
+        f"output={tmp_path / 'output.npz'}",
+        f"report={tmp_path / 'report.json'}",
+        f"fino={tmp_path / 'fino.json'}",
+        "device=cpu",
+    ]
+    argv = base_argv + ["variant=pca384"]
+    assert reembed.main(argv) == {"ok": True}
+    assert build_calls[0][1]["variant"] == reembed.PCA384
+    with pytest.raises(AssertionError, match="variant"):
+        reembed.main(base_argv + ["variant=unknown"])
+
+
 def test_cli_pins_revisions_and_stays_offline(tmp_path, monkeypatch):
     snapshots, build_calls = [], []
 
@@ -557,6 +737,11 @@ def test_finite_geometry_failure_persists_json_safe_nonfinite_audit(tmp_path, mo
     minilm = fake_binding(case, tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
     biomedical = fake_binding(case, tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
     output, report = tmp_path / "nonfinite.npz", tmp_path / "nonfinite.json"
+    persist_failure = reembed.persist_validation_failure
+
+    def persist_with_nonfinite_pca(*args, **kwargs):
+        kwargs["extra_payload"] = {"pca": {"retained_variance_fraction": np.nan}}
+        return persist_failure(*args, **kwargs)
 
     def reject_candidate(*args, **kwargs):
         raise reembed.ValidationGateError(
@@ -568,6 +753,7 @@ def test_finite_geometry_failure_persists_json_safe_nonfinite_audit(tmp_path, mo
         )
 
     monkeypatch.setattr(reembed, "validate_candidate", reject_candidate)
+    monkeypatch.setattr(reembed, "persist_validation_failure", persist_with_nonfinite_pca)
     with pytest.raises(reembed.ValidationGateError, match="finite geometry gate failed"):
         reembed.build_reembedded_bank(
             case.source,
@@ -583,9 +769,9 @@ def test_finite_geometry_failure_persists_json_safe_nonfinite_audit(tmp_path, mo
     assert payload["status"] == "failed"
     assert payload["gate_error"]["gate"] == "finite geometry"
     assert payload["validation"]["gate_values"]["variance_cv"] is None
-    assert payload["non_finite_values"] == {
-        "validation.gate_values.variance_cv": "nan",
-    }
+    assert payload["non_finite_values"]["validation.gate_values.variance_cv"] == "nan"
+    assert payload["pca"]["retained_variance_fraction"] is None
+    assert payload["non_finite_values"]["pca.retained_variance_fraction"] == "nan"
     assert not output.exists()
 
 
