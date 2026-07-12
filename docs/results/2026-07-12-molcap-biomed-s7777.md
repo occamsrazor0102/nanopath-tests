@@ -122,8 +122,8 @@ authorized.
 Independent review found two failure-path defects that did not affect this
 run because its target path was initially absent: a stale pre-existing target
 could survive beside a failed report, and a non-finite audit could fail strict
-JSON serialization. Commit `7e76213` fixes both and adds the adjacent
-reproducibility guards:
+JSON serialization. Commits `7e76213` and `19eaf23` fix both and add the
+adjacent reproducibility guards:
 
 - a failed validation clears the fixed target path and records whether stale
   output was detected and successfully invalidated;
@@ -132,11 +132,12 @@ reproducibility guards:
 - non-finite values serialize as JSON `null` with explicit path/classification
   metadata, while raw/isotropy failures produce an audit before re-raising;
 - source, FINO, output, report, and staging paths must be collision-free; and
-- production encoders load from exact local Hugging Face snapshot-commit paths,
-  which the builder validates independently of model/revision labels.
+- the builder itself loads both encoders from exact local Hugging Face
+  snapshot-commit paths after validation, so callers cannot pair approved
+  provenance labels with an unrelated encoder object.
 
 The hardening did not rebuild the failed target, change any gate or geometry
-value, or authorize training. Its fresh local gate was `59 passed`, with clean
+value, or authorize training. Its final local gate was `61 passed`, with clean
 compilation, whitespace, and locked-path checks.
 
 ## Next action
