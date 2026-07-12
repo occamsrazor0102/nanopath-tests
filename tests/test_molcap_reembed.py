@@ -154,6 +154,22 @@ class FakeEncoder:
         return self.raw.copy()
 
 
+def fake_snapshot_path(tmp_path, model, revision):
+    snapshot = tmp_path / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / revision
+    snapshot.mkdir(parents=True, exist_ok=True)
+    return snapshot
+
+
+def fake_binding(tmp_path, raw, model, revision, *, snapshot_revision=None):
+    snapshot_revision = revision if snapshot_revision is None else snapshot_revision
+    return reembed.EncoderBinding(
+        FakeEncoder(raw, revision),
+        model,
+        revision,
+        fake_snapshot_path(tmp_path, model, snapshot_revision),
+    )
+
+
 def make_reembed_case(tmp_path, monkeypatch):
     rows, dim = 128, 40
     patient_ids = np.array([f"P{i:03d}" for i in range(rows)])
@@ -169,6 +185,7 @@ def make_reembed_case(tmp_path, monkeypatch):
     fino.write_text(json.dumps({"discrete": {"all": dict.fromkeys(patient_ids.tolist(), 1)}, "continuous": {}}))
     monkeypatch.setattr(reembed, "CANONICAL_ROWS", rows)
     monkeypatch.setattr(reembed, "BIOMED_DIM", dim)
+    monkeypatch.setattr(reembed, "FINO_PATIENT_COUNT", rows)
     return types.SimpleNamespace(
         rows=rows,
         dim=dim,
@@ -186,8 +203,15 @@ def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministicall
     case = make_reembed_case(tmp_path, monkeypatch)
     minilm = FakeEncoder(case.minilm_raw, MINILM_REVISION)
     biomedical = FakeEncoder(case.biomedical_raw, BIOMED_REVISION)
-    minilm_binding = reembed.EncoderBinding(minilm, MINILM_MODEL, MINILM_REVISION)
-    biomedical_binding = reembed.EncoderBinding(biomedical, BIOMED_MODEL, BIOMED_REVISION)
+    minilm_binding = reembed.EncoderBinding(
+        minilm, MINILM_MODEL, MINILM_REVISION, fake_snapshot_path(tmp_path, MINILM_MODEL, MINILM_REVISION)
+    )
+    biomedical_binding = reembed.EncoderBinding(
+        biomedical,
+        BIOMED_MODEL,
+        BIOMED_REVISION,
+        fake_snapshot_path(tmp_path, BIOMED_MODEL, BIOMED_REVISION),
+    )
     first, second = tmp_path / "first.npz", tmp_path / "second.npz"
     report, second_report = tmp_path / "first.json", tmp_path / "second.json"
 
@@ -199,7 +223,6 @@ def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministicall
         minilm_binding,
         biomedical_binding,
         case.source_sha,
-        expected_fino_count=case.rows,
     )
     reembed.build_reembedded_bank(
         case.source,
@@ -209,7 +232,6 @@ def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministicall
         minilm_binding,
         biomedical_binding,
         case.source_sha,
-        expected_fino_count=case.rows,
     )
 
     with np.load(first, allow_pickle=False) as bank:
@@ -221,7 +243,10 @@ def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministicall
     assert first_captions.tolist() == case.captions.tolist()
     assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(second.read_bytes()).digest()
     assert report.read_bytes() == second_report.read_bytes()
-    assert json.loads(report.read_text())["models"]["biomedical"]["revision"] == BIOMED_REVISION
+    report_payload = json.loads(report.read_text())
+    assert report_payload["status"] == "passed"
+    assert report_payload["artifact"]["published"] is True
+    assert report_payload["models"]["biomedical"]["revision"] == BIOMED_REVISION
     assert returned == json.loads(report.read_text())
     expected_call = {
         "captions": case.captions.tolist(),
@@ -236,10 +261,13 @@ def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministicall
 
 def test_build_reembedded_bank_rejects_wrong_encoder_revision(tmp_path, monkeypatch):
     case = make_reembed_case(tmp_path, monkeypatch)
-    minilm = reembed.EncoderBinding(FakeEncoder(case.minilm_raw, "wrong"), MINILM_MODEL, "wrong")
-    biomedical = reembed.EncoderBinding(
-        FakeEncoder(case.biomedical_raw, BIOMED_REVISION), BIOMED_MODEL, BIOMED_REVISION
+    minilm = reembed.EncoderBinding(
+        FakeEncoder(case.minilm_raw, "wrong"),
+        MINILM_MODEL,
+        "wrong",
+        fake_snapshot_path(tmp_path, MINILM_MODEL, "wrong"),
     )
+    biomedical = fake_binding(tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
     with pytest.raises(AssertionError, match="revision provenance gate"):
         reembed.build_reembedded_bank(
             case.source,
@@ -249,7 +277,6 @@ def test_build_reembedded_bank_rejects_wrong_encoder_revision(tmp_path, monkeypa
             minilm,
             biomedical,
             case.source_sha,
-            expected_fino_count=case.rows,
         )
 
 
@@ -264,16 +291,13 @@ def test_build_reembedded_bank_rejects_bare_unannotated_encoder(tmp_path, monkey
             FakeEncoder(case.minilm_raw, MINILM_REVISION),
             FakeEncoder(case.biomedical_raw, BIOMED_REVISION),
             case.source_sha,
-            expected_fino_count=case.rows,
         )
 
 
 def test_report_replace_failure_rolls_back_preexisting_artifacts(tmp_path, monkeypatch):
     case = make_reembed_case(tmp_path, monkeypatch)
-    minilm = reembed.EncoderBinding(FakeEncoder(case.minilm_raw, MINILM_REVISION), MINILM_MODEL, MINILM_REVISION)
-    biomedical = reembed.EncoderBinding(
-        FakeEncoder(case.biomedical_raw, BIOMED_REVISION), BIOMED_MODEL, BIOMED_REVISION
-    )
+    minilm = fake_binding(tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
     output, report = tmp_path / "existing.npz", tmp_path / "existing.json"
     output.write_bytes(b"preexisting output")
     report.write_bytes(b"preexisting report")
@@ -294,7 +318,6 @@ def test_report_replace_failure_rolls_back_preexisting_artifacts(tmp_path, monke
             minilm,
             biomedical,
             case.source_sha,
-            expected_fino_count=case.rows,
         )
     assert output.read_bytes() == b"preexisting output"
     assert report.read_bytes() == b"preexisting report"
@@ -303,10 +326,8 @@ def test_report_replace_failure_rolls_back_preexisting_artifacts(tmp_path, monke
 
 def test_deterministic_hash_failure_cleans_staging_artifacts(tmp_path, monkeypatch):
     case = make_reembed_case(tmp_path, monkeypatch)
-    minilm = reembed.EncoderBinding(FakeEncoder(case.minilm_raw, MINILM_REVISION), MINILM_MODEL, MINILM_REVISION)
-    biomedical = reembed.EncoderBinding(
-        FakeEncoder(case.biomedical_raw, BIOMED_REVISION), BIOMED_MODEL, BIOMED_REVISION
-    )
+    minilm = fake_binding(tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
     output, report = tmp_path / "failed.npz", tmp_path / "failed.json"
     deterministic_save = reembed.save_target_bank
 
@@ -325,7 +346,6 @@ def test_deterministic_hash_failure_cleans_staging_artifacts(tmp_path, monkeypat
             minilm,
             biomedical,
             case.source_sha,
-            expected_fino_count=case.rows,
         )
     assert not output.exists()
     assert not report.exists()
@@ -354,13 +374,18 @@ def test_build_reembedded_bank_requires_canonical_row_count(tmp_path):
 
 
 def test_cli_pins_revisions_and_stays_offline(tmp_path, monkeypatch):
-    constructed, build_args = [], []
+    constructed, snapshots, build_args = [], [], []
 
     class FakeSentenceTransformer:
         def __init__(self, model, **kwargs):
             constructed.append((model, kwargs))
 
+    def fake_snapshot_download(**kwargs):
+        snapshots.append(kwargs)
+        return str(fake_snapshot_path(tmp_path, kwargs["repo_id"], kwargs["revision"]))
+
     monkeypatch.setitem(sys.modules, "sentence_transformers", types.SimpleNamespace(SentenceTransformer=FakeSentenceTransformer))
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=fake_snapshot_download))
     monkeypatch.setattr(reembed, "build_reembedded_bank", lambda *args: build_args.append(args) or {"ok": True})
     argv = [
         f"source={tmp_path / 'source.npz'}",
@@ -371,9 +396,15 @@ def test_cli_pins_revisions_and_stays_offline(tmp_path, monkeypatch):
     ]
 
     assert reembed.main(argv) == {"ok": True}
+    assert snapshots == [
+        {"repo_id": MINILM_MODEL, "revision": MINILM_REVISION, "local_files_only": True},
+        {"repo_id": BIOMED_MODEL, "revision": BIOMED_REVISION, "local_files_only": True},
+    ]
+    minilm_snapshot = str(fake_snapshot_path(tmp_path, MINILM_MODEL, MINILM_REVISION).resolve())
+    biomedical_snapshot = str(fake_snapshot_path(tmp_path, BIOMED_MODEL, BIOMED_REVISION).resolve())
     assert constructed == [
-        (MINILM_MODEL, {"revision": MINILM_REVISION, "device": "cpu", "local_files_only": True}),
-        (BIOMED_MODEL, {"revision": BIOMED_REVISION, "device": "cpu", "local_files_only": True}),
+        (minilm_snapshot, {"device": "cpu", "local_files_only": True}),
+        (biomedical_snapshot, {"device": "cpu", "local_files_only": True}),
     ]
     assert isinstance(build_args[0][4], reembed.EncoderBinding)
     assert (build_args[0][4].model, build_args[0][4].revision) == (MINILM_MODEL, MINILM_REVISION)
@@ -384,12 +415,8 @@ def test_cli_pins_revisions_and_stays_offline(tmp_path, monkeypatch):
 
 def test_validation_failure_persists_audit_report_without_publishing_target(tmp_path, monkeypatch):
     case = make_reembed_case(tmp_path, monkeypatch)
-    minilm = reembed.EncoderBinding(
-        FakeEncoder(case.minilm_raw, MINILM_REVISION), MINILM_MODEL, MINILM_REVISION
-    )
-    biomedical = reembed.EncoderBinding(
-        FakeEncoder(case.biomedical_raw, BIOMED_REVISION), BIOMED_MODEL, BIOMED_REVISION
-    )
+    minilm = fake_binding(tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
     output, report = tmp_path / "failed.npz", tmp_path / "failed.json"
     audit = {
         "coverage_count": case.rows,
@@ -416,7 +443,6 @@ def test_validation_failure_persists_audit_report_without_publishing_target(tmp_
             minilm,
             biomedical,
             case.source_sha,
-            expected_fino_count=case.rows,
         )
 
     assert not output.exists()
@@ -429,6 +455,8 @@ def test_validation_failure_persists_audit_report_without_publishing_target(tmp_
     assert payload["source"] == {"sha256": case.source_sha, "rows": case.rows, "mode": "text"}
     assert payload["artifact"] == {
         "published": False,
+        "preexisting_target_detected": False,
+        "target_path_cleared": True,
         "rows": case.rows,
         "width": case.dim,
         "mode": "biomedical",
@@ -437,13 +465,202 @@ def test_validation_failure_persists_audit_report_without_publishing_target(tmp_
     assert set(payload["models"]["minilm"]) == {
         "model",
         "revision",
+        "snapshot_commit",
         "raw_geometry",
         "corrected_geometry",
     }
     assert set(payload["models"]["biomedical"]) == {
         "model",
         "revision",
+        "snapshot_commit",
         "raw_geometry",
         "corrected_geometry",
     }
     assert not [*tmp_path.glob("*.tmp"), *tmp_path.glob("*.check"), *tmp_path.glob("*.bak")]
+
+
+def test_validation_failure_removes_preexisting_target_before_publishing_failed_report(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = fake_binding(tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
+    output, report = tmp_path / "stale.npz", tmp_path / "stale.json"
+    output.write_bytes(b"stale target that must not remain trainable")
+    report.write_text('{"artifact":{"sha256":"stale"}}\n')
+
+    def reject_candidate(*args, **kwargs):
+        raise reembed.ValidationGateError(
+            "effective rank ratio",
+            {
+                "gate_values": {"normalized_effective_rank_ratio": 0.4},
+                "thresholds": {"normalized_rank_ratio_range": [0.5, 2.0]},
+            },
+        )
+
+    monkeypatch.setattr(reembed, "validate_candidate", reject_candidate)
+    with pytest.raises(reembed.ValidationGateError, match="effective rank ratio gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+        )
+
+    assert not output.exists()
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["artifact"]["published"] is False
+    assert payload["artifact"]["preexisting_target_detected"] is True
+    assert payload["artifact"]["target_path_cleared"] is True
+
+
+def test_finite_geometry_failure_persists_json_safe_nonfinite_audit(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = fake_binding(tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(tmp_path, case.biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
+    output, report = tmp_path / "nonfinite.npz", tmp_path / "nonfinite.json"
+
+    def reject_candidate(*args, **kwargs):
+        raise reembed.ValidationGateError(
+            "finite geometry",
+            {
+                "gate_values": {"finite_geometry": False, "variance_cv": np.nan},
+                "thresholds": {"finite_geometry": True},
+            },
+        )
+
+    monkeypatch.setattr(reembed, "validate_candidate", reject_candidate)
+    with pytest.raises(reembed.ValidationGateError, match="finite geometry gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+        )
+
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["gate_error"]["gate"] == "finite geometry"
+    assert payload["validation"]["gate_values"]["variance_cv"] is None
+    assert payload["non_finite_values"] == {
+        "validation.gate_values.variance_cv": "nan",
+    }
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("aliased_output", ["source", "fino", "report"])
+def test_build_reembedded_bank_rejects_input_output_path_aliases(tmp_path, aliased_output):
+    source = tmp_path / "source.npz"
+    fino = tmp_path / "fino.json"
+    report = tmp_path / "report.json"
+    output = tmp_path / "output.npz"
+    source.write_bytes(b"canonical bytes must survive")
+    fino.write_text("{}")
+    original_source = source.read_bytes()
+    paths = {"source": source, "fino": fino, "report": report}
+    output = paths[aliased_output]
+
+    with pytest.raises(AssertionError, match="path collision gate"):
+        reembed.build_reembedded_bank(source, output, report, fino, None, None, None)
+
+    assert source.read_bytes() == original_source
+
+
+def test_build_reembedded_bank_rejects_report_alias_with_source(tmp_path):
+    source = tmp_path / "source.npz"
+    output = tmp_path / "output.npz"
+    fino = tmp_path / "fino.json"
+    source.write_bytes(b"canonical bytes must survive")
+    fino.write_text("{}")
+    original_source = source.read_bytes()
+
+    with pytest.raises(AssertionError, match="path collision gate"):
+        reembed.build_reembedded_bank(source, output, source, fino, None, None, None)
+
+    assert source.read_bytes() == original_source
+
+
+def test_build_reembedded_bank_rejects_binding_from_wrong_snapshot_revision(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = fake_binding(tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(
+        tmp_path,
+        case.biomedical_raw,
+        BIOMED_MODEL,
+        BIOMED_REVISION,
+        snapshot_revision="wrong-commit",
+    )
+
+    with pytest.raises(AssertionError, match="biomedical snapshot revision provenance gate"):
+        reembed.build_reembedded_bank(
+            case.source,
+            tmp_path / "wrong-snapshot.npz",
+            tmp_path / "wrong-snapshot.json",
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+        )
+
+
+def test_nonfinite_raw_embeddings_persist_failed_audit_before_isotropy(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    biomedical_raw = case.biomedical_raw.copy()
+    biomedical_raw[0, 0] = np.nan
+    minilm = fake_binding(tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(tmp_path, biomedical_raw, BIOMED_MODEL, BIOMED_REVISION)
+    output, report = tmp_path / "nonfinite-raw.npz", tmp_path / "nonfinite-raw.json"
+
+    with pytest.raises(reembed.ValidationGateError, match="raw embedding finite gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+        )
+
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["gate_error"]["gate"] == "raw embedding finite"
+    assert payload["models"]["biomedical"]["raw_matrix_audit"]["finite"] is False
+    assert payload["models"]["biomedical"]["raw_matrix_audit"]["non_finite_count"] == 1
+    assert payload["models"]["biomedical"]["corrected_geometry"] is None
+    assert not output.exists()
+
+
+def test_nonfinite_isotropy_output_persists_failed_audit(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = fake_binding(tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
+    biomedical = fake_binding(
+        tmp_path,
+        np.zeros_like(case.biomedical_raw),
+        BIOMED_MODEL,
+        BIOMED_REVISION,
+    )
+    output, report = tmp_path / "nonfinite-corrected.npz", tmp_path / "nonfinite-corrected.json"
+
+    with pytest.raises(reembed.ValidationGateError, match="isotropy gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+        )
+
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["gate_error"]["gate"] == "isotropy"
+    assert payload["validation"]["gate_values"]["exception_type"] == "AssertionError"
+    assert "non-finite" in payload["validation"]["gate_values"]["exception_message"]
+    assert not output.exists()

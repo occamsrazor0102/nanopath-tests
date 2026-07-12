@@ -29,6 +29,7 @@ class EncoderBinding:
     encoder: object
     model: str
     revision: str
+    snapshot_path: Path
 
 
 class ValidationGateError(AssertionError):
@@ -36,6 +37,124 @@ class ValidationGateError(AssertionError):
         self.gate = gate
         self.validation = validation
         super().__init__(message or f"{gate} gate failed")
+
+
+def json_safe_payload(payload):
+    non_finite_values = {}
+
+    def convert(value, path):
+        if isinstance(value, dict):
+            return {
+                key: convert(item, f"{path}.{key}" if path else str(key))
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [convert(item, f"{path}[{index}]") for index, item in enumerate(value)]
+        if isinstance(value, np.generic):
+            return convert(value.item(), path)
+        if isinstance(value, float) and not np.isfinite(value):
+            if np.isnan(value):
+                classification = "nan"
+            elif value > 0:
+                classification = "positive_infinity"
+            else:
+                classification = "negative_infinity"
+            non_finite_values[path] = classification
+            return None
+        return value
+
+    return convert(payload, ""), non_finite_values
+
+
+def resolve_build_paths(source, output, report, fino_path):
+    resolved = {
+        "source": Path(source).resolve(),
+        "output": Path(output).resolve(),
+        "report": Path(report).resolve(),
+        "fino": Path(fino_path).resolve(),
+    }
+    output_path, report_path = resolved["output"], resolved["report"]
+    resolved.update(
+        {
+            "output_tmp": output_path.with_name(output_path.name + ".tmp"),
+            "output_check": output_path.with_name(output_path.name + ".check"),
+            "output_backup": output_path.with_name(output_path.name + ".bak"),
+            "report_tmp": report_path.with_name(report_path.name + ".tmp"),
+            "report_backup": report_path.with_name(report_path.name + ".bak"),
+        }
+    )
+    by_path = {}
+    for label, path in resolved.items():
+        by_path.setdefault(path, []).append(label)
+    collisions = {str(path): labels for path, labels in by_path.items() if len(labels) > 1}
+    assert not collisions, f"path collision gate failed: {collisions}"
+    return resolved["source"], resolved["output"], resolved["report"], resolved["fino"]
+
+
+def validate_encoder_binding(binding, expected_model, expected_revision, label):
+    assert isinstance(binding, EncoderBinding), f"{label} binding provenance gate failed"
+    assert binding.model == expected_model, f"{label} model provenance gate failed"
+    assert binding.revision == expected_revision, f"{label} revision provenance gate failed"
+    snapshot = Path(binding.snapshot_path).resolve()
+    expected_cache_name = f"models--{expected_model.replace('/', '--')}"
+    assert snapshot.is_dir(), f"{label} snapshot path provenance gate failed"
+    assert snapshot.name == expected_revision, f"{label} snapshot revision provenance gate failed"
+    assert snapshot.parent.name == "snapshots", f"{label} snapshot layout provenance gate failed"
+    assert snapshot.parent.parent.name == expected_cache_name, f"{label} snapshot model provenance gate failed"
+    return snapshot
+
+
+def matrix_audit(values):
+    array = np.asarray(values)
+    finite = np.isfinite(array)
+    return {
+        "rows": int(array.shape[0]),
+        "width": int(array.shape[1]),
+        "finite": bool(finite.all()),
+        "non_finite_count": int(array.size - finite.sum()),
+    }
+
+
+def persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload):
+    preexisting_target_detected = output.exists()
+    target_clear_error = None
+    try:
+        output.unlink(missing_ok=True)
+    except OSError as clear_error:
+        target_clear_error = clear_error
+    failure_payload = {
+        "status": "failed",
+        "source": {"sha256": source_sha, "rows": len(patient_ids), "mode": mode.item()},
+        "artifact": {
+            "published": False,
+            "preexisting_target_detected": preexisting_target_detected,
+            "target_path_cleared": not output.exists(),
+            "rows": len(patient_ids),
+            "width": BIOMED_DIM,
+            "mode": "biomedical",
+        },
+        "models": model_payload,
+        "validation": error.validation,
+        "gate_error": {"gate": error.gate, "message": str(error)},
+    }
+    failure_payload, non_finite_values = json_safe_payload(failure_payload)
+    if non_finite_values:
+        failure_payload["non_finite_values"] = non_finite_values
+    report.parent.mkdir(parents=True, exist_ok=True)
+    failure_report_tmp = report.with_name(report.name + ".tmp")
+    assert not failure_report_tmp.exists(), "staging artifact gate failed"
+    try:
+        failure_report_tmp.write_text(
+            json.dumps(failure_payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        failure_report_tmp.replace(report)
+    finally:
+        failure_report_tmp.unlink(missing_ok=True)
+    if target_clear_error is not None:
+        error.add_note(f"failed to clear pre-existing target path: {target_clear_error}")
+        raise error from target_clear_error
+    return failure_payload
 
 
 def geometry_metrics(targets):
@@ -159,9 +278,8 @@ def build_reembedded_bank(
     minilm_binding,
     biomedical_binding,
     expected_source_sha,
-    expected_fino_count=FINO_PATIENT_COUNT,
 ):
-    source, output, report = Path(source), Path(output), Path(report)
+    source, output, report, fino_path = resolve_build_paths(source, output, report, fino_path)
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
     if expected_source_sha is not None:
         assert source_sha == expected_source_sha.lower(), f"source SHA-256 gate failed: {source_sha}"
@@ -176,17 +294,108 @@ def build_reembedded_bank(
     assert captions.shape == patient_ids.shape, "canonical caption count gate failed"
     assert len(set(patient_ids.tolist())) == len(patient_ids), "canonical unique patient gate failed"
     assert mode.shape == () and mode.item() == "text", "canonical mode gate failed"
-    assert isinstance(minilm_binding, EncoderBinding), "MiniLM binding provenance gate failed"
-    assert isinstance(biomedical_binding, EncoderBinding), "biomedical binding provenance gate failed"
-    assert minilm_binding.model == MINILM_MODEL, "MiniLM model provenance gate failed"
-    assert minilm_binding.revision == MINILM_REVISION, "MiniLM revision provenance gate failed"
-    assert biomedical_binding.model == BIOMED_MODEL, "biomedical model provenance gate failed"
-    assert biomedical_binding.revision == BIOMED_REVISION, "biomedical revision provenance gate failed"
+    minilm_snapshot = validate_encoder_binding(minilm_binding, MINILM_MODEL, MINILM_REVISION, "MiniLM")
+    biomedical_snapshot = validate_encoder_binding(
+        biomedical_binding, BIOMED_MODEL, BIOMED_REVISION, "biomedical"
+    )
 
     minilm_raw = encode(minilm_binding.encoder, captions, canonical_targets.shape[1])
     biomedical_raw = encode(biomedical_binding.encoder, captions, BIOMED_DIM)
-    minilm_targets = isotropize(minilm_raw)
-    biomedical_targets = isotropize(biomedical_raw)
+    minilm_raw_audit = matrix_audit(minilm_raw)
+    biomedical_raw_audit = matrix_audit(biomedical_raw)
+    provenance = {
+        "minilm": {
+            "model": minilm_binding.model,
+            "revision": minilm_binding.revision,
+            "snapshot_commit": minilm_snapshot.name,
+        },
+        "biomedical": {
+            "model": biomedical_binding.model,
+            "revision": biomedical_binding.revision,
+            "snapshot_commit": biomedical_snapshot.name,
+        },
+    }
+    if not (minilm_raw_audit["finite"] and biomedical_raw_audit["finite"]):
+        error = ValidationGateError(
+            "raw embedding finite",
+            {
+                "gate_values": {
+                    "minilm_raw_finite": minilm_raw_audit["finite"],
+                    "biomedical_raw_finite": biomedical_raw_audit["finite"],
+                },
+                "thresholds": {"raw_embeddings_finite": True},
+            },
+        )
+        model_payload = {
+            "minilm": provenance["minilm"]
+            | {"raw_matrix_audit": minilm_raw_audit, "raw_geometry": None, "corrected_geometry": None},
+            "biomedical": provenance["biomedical"]
+            | {
+                "raw_matrix_audit": biomedical_raw_audit,
+                "raw_geometry": None,
+                "corrected_geometry": None,
+            },
+        }
+        persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload)
+        raise error
+    try:
+        with np.errstate(all="ignore"):
+            minilm_targets = isotropize(minilm_raw)
+            biomedical_targets = isotropize(biomedical_raw)
+    except Exception as isotropy_error:
+        error = ValidationGateError(
+            "isotropy",
+            {
+                "gate_values": {
+                    "exception_type": type(isotropy_error).__name__,
+                    "exception_message": str(isotropy_error),
+                },
+                "thresholds": {"isotropy_completed": True},
+            },
+        )
+        model_payload = {
+            "minilm": provenance["minilm"]
+            | {"raw_matrix_audit": minilm_raw_audit, "raw_geometry": None, "corrected_geometry": None},
+            "biomedical": provenance["biomedical"]
+            | {
+                "raw_matrix_audit": biomedical_raw_audit,
+                "raw_geometry": None,
+                "corrected_geometry": None,
+            },
+        }
+        persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload)
+        raise error from isotropy_error
+    minilm_corrected_audit = matrix_audit(minilm_targets)
+    biomedical_corrected_audit = matrix_audit(biomedical_targets)
+    if not (minilm_corrected_audit["finite"] and biomedical_corrected_audit["finite"]):
+        error = ValidationGateError(
+            "corrected embedding finite",
+            {
+                "gate_values": {
+                    "minilm_corrected_finite": minilm_corrected_audit["finite"],
+                    "biomedical_corrected_finite": biomedical_corrected_audit["finite"],
+                },
+                "thresholds": {"corrected_embeddings_finite": True},
+            },
+        )
+        model_payload = {
+            "minilm": provenance["minilm"]
+            | {
+                "raw_matrix_audit": minilm_raw_audit,
+                "corrected_matrix_audit": minilm_corrected_audit,
+                "raw_geometry": geometry_metrics(minilm_raw),
+                "corrected_geometry": None,
+            },
+            "biomedical": provenance["biomedical"]
+            | {
+                "raw_matrix_audit": biomedical_raw_audit,
+                "corrected_matrix_audit": biomedical_corrected_audit,
+                "raw_geometry": geometry_metrics(biomedical_raw),
+                "corrected_geometry": None,
+            },
+        }
+        persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload)
+        raise error
     np.testing.assert_allclose(
         minilm_targets,
         canonical_targets,
@@ -200,39 +409,26 @@ def build_reembedded_bank(
     candidate = geometry_metrics(biomedical_targets)
     model_payload = {
         "minilm": {
-            "model": minilm_binding.model,
-            "revision": minilm_binding.revision,
+            **provenance["minilm"],
             "raw_geometry": minilm_raw_geometry,
             "corrected_geometry": reference,
         },
         "biomedical": {
-            "model": biomedical_binding.model,
-            "revision": biomedical_binding.revision,
+            **provenance["biomedical"],
             "raw_geometry": biomedical_raw_geometry,
             "corrected_geometry": candidate,
         },
     }
     try:
         validation = validate_candidate(
-            reference, candidate, patient_ids, fino_patient_ids(fino_path), expected_fino_count=expected_fino_count
+            reference,
+            candidate,
+            patient_ids,
+            fino_patient_ids(fino_path),
+            expected_fino_count=FINO_PATIENT_COUNT,
         )
     except ValidationGateError as error:
-        failure_payload = {
-            "status": "failed",
-            "source": {"sha256": source_sha, "rows": len(patient_ids), "mode": mode.item()},
-            "artifact": {"published": False, "rows": len(patient_ids), "width": BIOMED_DIM, "mode": "biomedical"},
-            "models": model_payload,
-            "validation": error.validation,
-            "gate_error": {"gate": error.gate, "message": str(error)},
-        }
-        report.parent.mkdir(parents=True, exist_ok=True)
-        failure_report_tmp = report.with_name(report.name + ".tmp")
-        assert not failure_report_tmp.exists(), "staging artifact gate failed"
-        try:
-            failure_report_tmp.write_text(json.dumps(failure_payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
-            failure_report_tmp.replace(report)
-        finally:
-            failure_report_tmp.unlink(missing_ok=True)
+        persist_validation_failure(error, source_sha, patient_ids, mode, output, report, model_payload)
         raise
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -251,8 +447,15 @@ def build_reembedded_bank(
         check_sha = hashlib.sha256(output_check.read_bytes()).hexdigest()
         assert output_sha == check_sha, "deterministic NPZ gate failed"
         payload = {
+            "status": "passed",
             "source": {"sha256": source_sha, "rows": len(patient_ids), "mode": mode.item()},
-            "artifact": {"sha256": output_sha, "rows": len(patient_ids), "width": BIOMED_DIM, "mode": "biomedical"},
+            "artifact": {
+                "published": True,
+                "sha256": output_sha,
+                "rows": len(patient_ids),
+                "width": BIOMED_DIM,
+                "mode": "biomedical",
+            },
             "models": model_payload,
             "validation": validation,
         }
@@ -297,17 +500,26 @@ def main(argv=None):
     assert all(len(pair) == 2 for pair in pairs), "arguments must be key=value"
     args = dict(pairs)
     assert len(args) == len(pairs) and set(args) == {"source", "output", "report", "fino", "device"}, "required keys: source output report fino device"
+    from huggingface_hub import snapshot_download
     from sentence_transformers import SentenceTransformer
 
+    minilm_snapshot = Path(
+        snapshot_download(repo_id=MINILM_MODEL, revision=MINILM_REVISION, local_files_only=True)
+    ).resolve()
+    biomedical_snapshot = Path(
+        snapshot_download(repo_id=BIOMED_MODEL, revision=BIOMED_REVISION, local_files_only=True)
+    ).resolve()
     minilm = EncoderBinding(
-        SentenceTransformer(MINILM_MODEL, revision=MINILM_REVISION, device=args["device"], local_files_only=True),
+        SentenceTransformer(str(minilm_snapshot), device=args["device"], local_files_only=True),
         MINILM_MODEL,
         MINILM_REVISION,
+        minilm_snapshot,
     )
     biomedical = EncoderBinding(
-        SentenceTransformer(BIOMED_MODEL, revision=BIOMED_REVISION, device=args["device"], local_files_only=True),
+        SentenceTransformer(str(biomedical_snapshot), device=args["device"], local_files_only=True),
         BIOMED_MODEL,
         BIOMED_REVISION,
+        biomedical_snapshot,
     )
     result = build_reembedded_bank(
         args["source"],
