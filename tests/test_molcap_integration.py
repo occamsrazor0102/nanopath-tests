@@ -1,4 +1,5 @@
 import io
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -87,3 +88,25 @@ def test_768d_training_sample_patch_route_and_checkpoint(tmp_path):
     restored.load_state_dict(torch.load(path, weights_only=True)["molcap_head"])
     for first, second in zip(head.parameters(), restored.parameters()):
         torch.testing.assert_close(first, second)
+
+
+def test_pca384_bank_forward_backward_and_checkpoint(tmp_path):
+    cfg = tiny_config(tmp_path, target_dim=384)
+    save_target_bank(
+        Path(cfg["molcap"]["targets"]),
+        ["TCGA-AA-0001"],
+        np.eye(1, 384, dtype=np.float32),
+        ["caption"],
+        "biomedical-pca384",
+    )
+    sample = TCGATileDataset(cfg, is_train=True)[0]
+    head = MolCapHead(8, 384)
+    features = torch.randn(2, 8, requires_grad=True)
+    loss = 1 - (head(features) * sample["molcap_target"]).sum(-1).mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert features.grad is not None and features.grad.norm() > 0
+    assert any(parameter.grad is not None and parameter.grad.norm() > 0 for parameter in head.parameters())
+    checkpoint = {"molcap_head": head.state_dict()}
+    restored = MolCapHead(8, 384)
+    restored.load_state_dict(checkpoint["molcap_head"])

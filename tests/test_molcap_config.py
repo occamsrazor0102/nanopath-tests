@@ -53,6 +53,21 @@ def test_biomedical_config_is_encoder_only_ab():
     assert biomedical["molcap"]["target_dim"] == 768
 
 
+def test_pca384_config_controls_width_and_head_capacity():
+    generic = yaml.safe_load(Path("configs/molcap-text-s7777.yaml").read_text())
+    pca384 = yaml.safe_load(Path("configs/molcap-biomed-pca384-s7777.yaml").read_text())
+    assert changed_leaves(generic, pca384) == {
+        "project.name", "project.output_dir", "molcap.targets"
+    }
+    assert pca384["project"]["name"] == "molcap-biomed-pca384-s7777"
+    assert pca384["molcap"]["targets"] == "/data/$USER/nanopath/molcap_biomed_pca384.npz"
+    assert pca384["molcap"]["target_dim"] == generic["molcap"]["target_dim"] == 384
+    assert pca384["train"] == generic["train"]
+    assert pca384["dino"] == generic["dino"]
+    assert pca384["fino"] == generic["fino"]
+    assert pca384["probe"] == generic["probe"]
+
+
 def test_training_source_wires_optional_molcap_without_probe_changes():
     source = Path("train.py").read_text()
 
