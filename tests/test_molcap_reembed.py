@@ -2,6 +2,7 @@ import hashlib
 import json
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -37,6 +38,7 @@ def test_constants_pin_models_and_shared_isotropy():
     assert BIOMED_MODEL == "pritamdeka/S-PubMedBert-MS-MARCO"
     assert BIOMED_REVISION == "96786c7024f95c5aac7f2b9a18086c7b97b23036"
     assert BIOMED_DIM == 768
+    assert reembed.FINO_PATIENT_COUNT == 9_389
     assert ISOTROPY_FLOOR == 0.05
     assert ISOTROPY_POWER == 0.1
 
@@ -63,10 +65,19 @@ def valid_geometry():
 
 def test_validate_candidate_accepts_valid_geometry_and_coverage():
     reference = {"normalized_effective_rank": 0.10, "normalized_participation_ratio": 0.06}
-    report = reembed.validate_candidate(reference, valid_geometry(), np.array(["P1", "P2"]), {"P1", "P2"})
+    report = reembed.validate_candidate(
+        reference, valid_geometry(), np.array(["P1", "P2"]), {"P1", "P2"}, expected_fino_count=2
+    )
     assert report["coverage_fraction"] == 1.0
+    assert report["thresholds"]["required_fino_count"] == 2
     assert report["normalized_effective_rank_ratio"] == 0.52
     assert report["normalized_participation_ratio_ratio"] == 0.5
+
+
+def test_validate_candidate_rejects_truncated_all_present_fino_set():
+    reference = {"normalized_effective_rank": 0.10, "normalized_participation_ratio": 0.06}
+    with pytest.raises(AssertionError, match="FINO count gate"):
+        reembed.validate_candidate(reference, valid_geometry(), np.array(["P1", "P2"]), {"P1", "P2"})
 
 
 @pytest.mark.parametrize(
@@ -92,7 +103,7 @@ def test_validate_candidate_rejects_each_hard_gate(mutation, patient_ids, fino_i
     reference = {"normalized_effective_rank": 0.10, "normalized_participation_ratio": 0.06}
     candidate = valid_geometry() | mutation
     with pytest.raises(AssertionError, match=gate):
-        reembed.validate_candidate(reference, candidate, patient_ids, fino_ids)
+        reembed.validate_candidate(reference, candidate, patient_ids, fino_ids, expected_fino_count=len(fino_ids))
 
 
 class FakeEncoder:
@@ -106,7 +117,7 @@ class FakeEncoder:
         return self.raw.copy()
 
 
-def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministically(tmp_path, monkeypatch):
+def make_reembed_case(tmp_path, monkeypatch):
     rows, dim = 128, 40
     patient_ids = np.array([f"P{i:03d}" for i in range(rows)])
     captions = np.array([f"caption {i}" for i in range(rows)])
@@ -121,27 +132,62 @@ def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministicall
     fino.write_text(json.dumps({"discrete": {"all": dict.fromkeys(patient_ids.tolist(), 1)}, "continuous": {}}))
     monkeypatch.setattr(reembed, "CANONICAL_ROWS", rows)
     monkeypatch.setattr(reembed, "BIOMED_DIM", dim)
-    minilm = FakeEncoder(minilm_raw, MINILM_REVISION)
-    biomedical = FakeEncoder(biomedical_raw, BIOMED_REVISION)
+    return types.SimpleNamespace(
+        rows=rows,
+        dim=dim,
+        patient_ids=patient_ids,
+        captions=captions,
+        minilm_raw=minilm_raw,
+        biomedical_raw=biomedical_raw,
+        source=source,
+        source_sha=source_sha,
+        fino=fino,
+    )
+
+
+def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministically(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = FakeEncoder(case.minilm_raw, MINILM_REVISION)
+    biomedical = FakeEncoder(case.biomedical_raw, BIOMED_REVISION)
+    minilm_binding = reembed.EncoderBinding(minilm, MINILM_MODEL, MINILM_REVISION)
+    biomedical_binding = reembed.EncoderBinding(biomedical, BIOMED_MODEL, BIOMED_REVISION)
     first, second = tmp_path / "first.npz", tmp_path / "second.npz"
     report, second_report = tmp_path / "first.json", tmp_path / "second.json"
 
-    returned = reembed.build_reembedded_bank(source, first, report, fino, minilm, biomedical, source_sha)
-    reembed.build_reembedded_bank(source, second, second_report, fino, minilm, biomedical, source_sha)
+    returned = reembed.build_reembedded_bank(
+        case.source,
+        first,
+        report,
+        case.fino,
+        minilm_binding,
+        biomedical_binding,
+        case.source_sha,
+        expected_fino_count=case.rows,
+    )
+    reembed.build_reembedded_bank(
+        case.source,
+        second,
+        second_report,
+        case.fino,
+        minilm_binding,
+        biomedical_binding,
+        case.source_sha,
+        expected_fino_count=case.rows,
+    )
 
     with np.load(first, allow_pickle=False) as bank:
         first_ids = bank["patient_ids"]
         first_captions = bank["captions"]
         assert bank["mode"].item() == "biomedical"
-        assert bank["targets"].shape == (rows, dim)
-    assert first_ids.tolist() == patient_ids.tolist()
-    assert first_captions.tolist() == captions.tolist()
+        assert bank["targets"].shape == (case.rows, case.dim)
+    assert first_ids.tolist() == case.patient_ids.tolist()
+    assert first_captions.tolist() == case.captions.tolist()
     assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(second.read_bytes()).digest()
     assert report.read_bytes() == second_report.read_bytes()
     assert json.loads(report.read_text())["models"]["biomedical"]["revision"] == BIOMED_REVISION
     assert returned == json.loads(report.read_text())
     expected_call = {
-        "captions": captions.tolist(),
+        "captions": case.captions.tolist(),
         "normalize_embeddings": True,
         "show_progress_bar": True,
         "batch_size": 64,
@@ -149,6 +195,104 @@ def test_build_reembedded_bank_copies_canonical_rows_and_writes_deterministicall
     }
     assert minilm.calls == [{**expected_call, "revision": MINILM_REVISION}] * 2
     assert biomedical.calls == [{**expected_call, "revision": BIOMED_REVISION}] * 2
+
+
+def test_build_reembedded_bank_rejects_wrong_encoder_revision(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = reembed.EncoderBinding(FakeEncoder(case.minilm_raw, "wrong"), MINILM_MODEL, "wrong")
+    biomedical = reembed.EncoderBinding(
+        FakeEncoder(case.biomedical_raw, BIOMED_REVISION), BIOMED_MODEL, BIOMED_REVISION
+    )
+    with pytest.raises(AssertionError, match="revision provenance gate"):
+        reembed.build_reembedded_bank(
+            case.source,
+            tmp_path / "wrong.npz",
+            tmp_path / "wrong.json",
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+            expected_fino_count=case.rows,
+        )
+
+
+def test_build_reembedded_bank_rejects_bare_unannotated_encoder(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    with pytest.raises(AssertionError, match="binding provenance gate"):
+        reembed.build_reembedded_bank(
+            case.source,
+            tmp_path / "bare.npz",
+            tmp_path / "bare.json",
+            case.fino,
+            FakeEncoder(case.minilm_raw, MINILM_REVISION),
+            FakeEncoder(case.biomedical_raw, BIOMED_REVISION),
+            case.source_sha,
+            expected_fino_count=case.rows,
+        )
+
+
+def test_report_replace_failure_rolls_back_preexisting_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = reembed.EncoderBinding(FakeEncoder(case.minilm_raw, MINILM_REVISION), MINILM_MODEL, MINILM_REVISION)
+    biomedical = reembed.EncoderBinding(
+        FakeEncoder(case.biomedical_raw, BIOMED_REVISION), BIOMED_MODEL, BIOMED_REVISION
+    )
+    output, report = tmp_path / "existing.npz", tmp_path / "existing.json"
+    output.write_bytes(b"preexisting output")
+    report.write_bytes(b"preexisting report")
+    original_replace = Path.replace
+
+    def fail_report_replace(self, target):
+        if self == report.with_name(report.name + ".tmp") and Path(target) == report:
+            raise OSError("injected report replace failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_report_replace)
+    with pytest.raises(OSError, match="injected report replace failure"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+            expected_fino_count=case.rows,
+        )
+    assert output.read_bytes() == b"preexisting output"
+    assert report.read_bytes() == b"preexisting report"
+    assert not [*tmp_path.glob("*.tmp"), *tmp_path.glob("*.check"), *tmp_path.glob("*.bak")]
+
+
+def test_deterministic_hash_failure_cleans_staging_artifacts(tmp_path, monkeypatch):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    minilm = reembed.EncoderBinding(FakeEncoder(case.minilm_raw, MINILM_REVISION), MINILM_MODEL, MINILM_REVISION)
+    biomedical = reembed.EncoderBinding(
+        FakeEncoder(case.biomedical_raw, BIOMED_REVISION), BIOMED_MODEL, BIOMED_REVISION
+    )
+    output, report = tmp_path / "failed.npz", tmp_path / "failed.json"
+    deterministic_save = reembed.save_target_bank
+
+    def mismatched_save(path, *args):
+        deterministic_save(path, *args)
+        if Path(path).name.endswith(".check"):
+            Path(path).write_bytes(Path(path).read_bytes() + b"mismatch")
+
+    monkeypatch.setattr(reembed, "save_target_bank", mismatched_save)
+    with pytest.raises(AssertionError, match="deterministic NPZ gate"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            minilm,
+            biomedical,
+            case.source_sha,
+            expected_fino_count=case.rows,
+        )
+    assert not output.exists()
+    assert not report.exists()
+    assert not [*tmp_path.glob("*.tmp"), *tmp_path.glob("*.check"), *tmp_path.glob("*.bak")]
 
 
 def test_build_reembedded_bank_rejects_wrong_hash_before_loading(tmp_path):
@@ -194,4 +338,8 @@ def test_cli_pins_revisions_and_stays_offline(tmp_path, monkeypatch):
         (MINILM_MODEL, {"revision": MINILM_REVISION, "device": "cpu", "local_files_only": True}),
         (BIOMED_MODEL, {"revision": BIOMED_REVISION, "device": "cpu", "local_files_only": True}),
     ]
+    assert isinstance(build_args[0][4], reembed.EncoderBinding)
+    assert (build_args[0][4].model, build_args[0][4].revision) == (MINILM_MODEL, MINILM_REVISION)
+    assert isinstance(build_args[0][5], reembed.EncoderBinding)
+    assert (build_args[0][5].model, build_args[0][5].revision) == (BIOMED_MODEL, BIOMED_REVISION)
     assert build_args[0][-1] == reembed.CANONICAL_SHA256
