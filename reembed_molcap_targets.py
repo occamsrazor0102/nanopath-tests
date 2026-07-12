@@ -73,15 +73,15 @@ def json_safe_payload(payload):
     return convert(payload, ""), non_finite_values
 
 
-def resolve_build_paths(source, output, report, fino_path):
-    resolved = {
+def build_path_model(source, output, report, fino_path):
+    paths = {
         "source": Path(source).resolve(),
         "output": Path(output).resolve(),
         "report": Path(report).resolve(),
         "fino": Path(fino_path).resolve(),
     }
-    output_path, report_path = resolved["output"], resolved["report"]
-    resolved.update(
+    output_path, report_path = paths["output"], paths["report"]
+    paths.update(
         {
             "output_tmp": output_path.with_name(output_path.name + ".tmp"),
             "output_check": output_path.with_name(output_path.name + ".check"),
@@ -91,11 +91,17 @@ def resolve_build_paths(source, output, report, fino_path):
         }
     )
     by_path = {}
-    for label, path in resolved.items():
+    for label, path in paths.items():
         by_path.setdefault(path, []).append(label)
     collisions = {str(path): labels for path, labels in by_path.items() if len(labels) > 1}
+    return {"paths": paths, "collisions": collisions}
+
+
+def resolve_build_paths(source, output, report, fino_path):
+    path_model = build_path_model(source, output, report, fino_path)
+    paths, collisions = path_model["paths"], path_model["collisions"]
     assert not collisions, f"path collision gate failed: {collisions}"
-    return resolved["source"], resolved["output"], resolved["report"], resolved["fino"]
+    return paths["source"], paths["output"], paths["report"], paths["fino"]
 
 
 def validate_encoder_binding(binding, expected_model, expected_revision, label):
@@ -387,35 +393,32 @@ def encode(encoder, captions, expected_dim):
     return raw
 
 
-def pca_staging_paths(output, report):
-    output, report = Path(output).resolve(), Path(report).resolve()
-    return (
-        output.with_name(output.name + ".tmp"),
-        output.with_name(output.name + ".check"),
-        output.with_name(output.name + ".bak"),
-        report.with_name(report.name + ".tmp"),
-        report.with_name(report.name + ".bak"),
-    )
-
-
 def persist_pca_build_failure(
     error,
-    source,
-    output,
-    report,
-    fino_path,
+    path_model,
     artifact_width,
     artifact_mode,
     preexisting_target_detected,
     preexisting_report_sha256,
 ):
-    source = Path(source).resolve()
-    output = Path(output).resolve()
-    report = Path(report).resolve()
-    fino_path = Path(fino_path).resolve()
+    paths, collisions = path_model["paths"], path_model["collisions"]
+    source, fino_path = paths["source"], paths["fino"]
+    output, report = paths["output"], paths["report"]
     protected_paths = {source, fino_path}
-    if output in protected_paths or report in protected_paths or output == report:
-        error.add_note("PCA failure boundary skipped unsafe colliding artifact paths")
+    unsafe_publication = {
+        label: paths[label]
+        for label in ("output", "report", "report_tmp")
+        if paths[label] in protected_paths
+    }
+    if unsafe_publication:
+        evidence = {
+            str(path): collisions.get(str(path), [label])
+            for label, path in unsafe_publication.items()
+        }
+        error.add_note(
+            "PCA failure report not written because resolved path collisions "
+            f"would overwrite an input: {evidence}"
+        )
         return None
 
     existing_failure = None
@@ -439,15 +442,26 @@ def persist_pca_build_failure(
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             pass
 
-    staging_paths = pca_staging_paths(output, report)
+    staging_labels = (
+        "output_tmp",
+        "output_check",
+        "output_backup",
+        "report_tmp",
+        "report_backup",
+    )
     cleanup_errors = {}
-    for path in (output, *staging_paths):
+    protected_input_aliases = {}
+    for label in ("output", *staging_labels):
+        path = paths[label]
+        if path in protected_paths:
+            protected_input_aliases[str(path)] = collisions.get(str(path), [label])
+            continue
         try:
             path.unlink(missing_ok=True)
         except OSError as cleanup_error:
             cleanup_errors[str(path)] = str(cleanup_error)
     target_path_cleared = not output.exists()
-    staging_paths_cleared = not any(path.exists() for path in staging_paths)
+    staging_paths_cleared = not any(paths[label].exists() for label in staging_labels)
 
     exception_message = str(error)
     gate = error.gate if isinstance(error, ValidationGateError) else "PCA build/publication"
@@ -506,12 +520,14 @@ def persist_pca_build_failure(
     }
     if cleanup_errors:
         payload["failure_boundary"]["cleanup_errors"] = cleanup_errors
+    if protected_input_aliases:
+        payload["failure_boundary"]["protected_input_aliases"] = protected_input_aliases
     payload, non_finite_values = json_safe_payload(payload)
     if non_finite_values:
         payload.setdefault("non_finite_values", {}).update(non_finite_values)
 
     report.parent.mkdir(parents=True, exist_ok=True)
-    failure_report_tmp = report.with_name(report.name + ".tmp")
+    failure_report_tmp = paths["report_tmp"]
     try:
         failure_report_tmp.write_text(
             json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
@@ -928,9 +944,11 @@ def build_reembedded_bank(
             variant=variant,
         )
 
-    preexisting_target_detected = Path(output).resolve().exists()
+    path_model = build_path_model(source, output, report, fino_path)
+    paths = path_model["paths"]
+    preexisting_target_detected = paths["output"].exists()
     preexisting_report_sha256 = None
-    report_path = Path(report).resolve()
+    report_path = paths["report"]
     try:
         if report_path.is_file():
             preexisting_report_sha256 = hashlib.sha256(report_path.read_bytes()).hexdigest()
@@ -952,10 +970,7 @@ def build_reembedded_bank(
         try:
             persist_pca_build_failure(
                 error,
-                source,
-                output,
-                report,
-                fino_path,
+                path_model,
                 VARIANT_SPECS[PCA384]["target_width"],
                 VARIANT_SPECS[PCA384]["artifact_mode"],
                 preexisting_target_detected,

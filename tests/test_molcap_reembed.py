@@ -1141,6 +1141,72 @@ def test_build_reembedded_bank_rejects_report_alias_with_source(tmp_path):
     assert source.read_bytes() == original_source
 
 
+@pytest.mark.parametrize("input_label", ["source", "fino"])
+@pytest.mark.parametrize(
+    "staging_label",
+    ["output_tmp", "output_check", "output_backup", "report_tmp", "report_backup"],
+)
+def test_pca_path_collision_never_deletes_inputs_aliased_to_staging(
+    tmp_path,
+    input_label,
+    staging_label,
+):
+    output = tmp_path / "candidate.npz"
+    report = tmp_path / "candidate.geometry.json"
+    staging = {
+        "output_tmp": output.with_name(output.name + ".tmp"),
+        "output_check": output.with_name(output.name + ".check"),
+        "output_backup": output.with_name(output.name + ".bak"),
+        "report_tmp": report.with_name(report.name + ".tmp"),
+        "report_backup": report.with_name(report.name + ".bak"),
+    }
+    source = tmp_path / "canonical.npz"
+    fino = tmp_path / "fino.json"
+    if input_label == "source":
+        source = staging[staging_label]
+    else:
+        fino = staging[staging_label]
+
+    source.write_bytes(b"canonical input bytes must survive")
+    fino.write_bytes(b"FINO input bytes must survive")
+    output.write_bytes(b"stale PCA target")
+    report.write_bytes(b"stale PCA report")
+    source_bytes = source.read_bytes()
+    fino_bytes = fino.read_bytes()
+    output_bytes = output.read_bytes()
+    report_bytes = report.read_bytes()
+
+    with pytest.raises(AssertionError, match="path collision gate failed") as raised:
+        reembed.build_reembedded_bank(
+            source,
+            output,
+            report,
+            fino,
+            None,
+            None,
+            None,
+            variant=reembed.PCA384,
+        )
+
+    assert source.read_bytes() == source_bytes
+    assert fino.read_bytes() == fino_bytes
+    if staging_label == "report_tmp":
+        assert output.read_bytes() == output_bytes
+        assert report.read_bytes() == report_bytes
+        notes = "\n".join(getattr(raised.value, "__notes__", []))
+        assert "PCA failure report not written" in notes
+        assert input_label in notes
+        assert "report_tmp" in notes
+    else:
+        assert not output.exists()
+        payload = json.loads(report.read_text())
+        assert payload["status"] == "failed"
+        assert payload["artifact"]["target_path_cleared"] is True
+        assert payload["failure_boundary"]["staging_paths_cleared"] is False
+        aliases = payload["failure_boundary"]["protected_input_aliases"]
+        assert aliases[str(staging[staging_label].resolve())] == [input_label, staging_label]
+
+
 def test_build_reembedded_bank_rejects_binding_from_wrong_snapshot_revision(tmp_path, monkeypatch):
     case = make_reembed_case(tmp_path, monkeypatch)
     minilm = fake_binding(case, tmp_path, case.minilm_raw, MINILM_MODEL, MINILM_REVISION)
