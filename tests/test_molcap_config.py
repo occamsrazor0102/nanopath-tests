@@ -3,10 +3,21 @@ from pathlib import Path
 import yaml
 
 
+MISSING = object()
+
+
 def changed_leaves(left, right, prefix=""):
     if isinstance(left, dict) and isinstance(right, dict):
-        return set().union(*(changed_leaves(left.get(key), right.get(key), f"{prefix}.{key}".strip(".")) for key in left.keys() | right.keys()))
+        return set().union(*(changed_leaves(left.get(key, MISSING), right.get(key, MISSING), f"{prefix}.{key}".strip(".")) for key in left.keys() | right.keys()))
     return {prefix} if left != right else set()
+
+
+def test_changed_leaves_reports_missing_null_value():
+    with_resume = {"train": {"resume": None}}
+    without_resume = {"train": {}}
+
+    assert changed_leaves(with_resume, without_resume) == {"train.resume"}
+    assert changed_leaves(without_resume, with_resume) == {"train.resume"}
 
 
 def test_molcap_config_is_exact_frontier_plus_auxiliary():
