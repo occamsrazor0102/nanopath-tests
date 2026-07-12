@@ -59,3 +59,4 @@ preserved_run_logs/
 build_molcap_targets.py
 tests/
 .superpowers/
+.worktrees/
