@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -669,6 +670,53 @@ def test_pca_source_failure_does_not_reuse_a_stale_failed_report(tmp_path, monke
     assert payload["gate_error"]["gate"] != "stale gate"
 
 
+def test_pca_unknown_entry_report_fingerprint_never_reuses_stale_failed_json(
+    tmp_path,
+    monkeypatch,
+):
+    case = make_reembed_case(tmp_path, monkeypatch)
+    monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
+    output, report = tmp_path / "unknown-fingerprint.npz", tmp_path / "unknown-fingerprint.json"
+    seed_stale_pca_artifacts(output, report, staging=True)
+    report.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "artifact": {"published": False},
+                "gate_error": {"gate": "stale gate", "message": "stale failure evidence"},
+            }
+        )
+        + "\n"
+    )
+    original_read_bytes = Path.read_bytes
+    entry_read_failed = False
+
+    def fail_entry_report_read_once(self):
+        nonlocal entry_read_failed
+        if self == report.resolve() and not entry_read_failed:
+            entry_read_failed = True
+            raise OSError("injected transient entry report read failure")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_entry_report_read_once)
+    with pytest.raises(AssertionError, match="source SHA-256 gate failed"):
+        reembed.build_reembedded_bank(
+            case.source,
+            output,
+            report,
+            case.fino,
+            None,
+            None,
+            "0" * 64,
+            variant=reembed.PCA384,
+        )
+
+    assert entry_read_failed is True
+    payload = json.loads(report.read_text())
+    assert payload["gate_error"]["gate"] != "stale gate"
+    assert "source SHA-256 gate failed" in payload["gate_error"]["message"]
+
+
 def test_pca_provenance_failure_replaces_stale_report_and_clears_all_artifacts(tmp_path, monkeypatch):
     case = make_reembed_case(tmp_path, monkeypatch)
     monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
@@ -1190,21 +1238,188 @@ def test_pca_path_collision_never_deletes_inputs_aliased_to_staging(
 
     assert source.read_bytes() == source_bytes
     assert fino.read_bytes() == fino_bytes
-    if staging_label == "report_tmp":
-        assert output.read_bytes() == output_bytes
-        assert report.read_bytes() == report_bytes
-        notes = "\n".join(getattr(raised.value, "__notes__", []))
-        assert "PCA failure report not written" in notes
-        assert input_label in notes
-        assert "report_tmp" in notes
+    assert output.read_bytes() == output_bytes
+    assert report.read_bytes() == report_bytes
+    notes = "\n".join(getattr(raised.value, "__notes__", []))
+    assert "PCA failure report not written" in notes
+    assert input_label in notes
+    assert staging_label in notes
+
+
+@pytest.mark.parametrize("input_label", ["source", "fino"])
+def test_pca_hardlinked_report_tmp_unlink_failure_preserves_input_and_report(
+    tmp_path,
+    monkeypatch,
+    input_label,
+):
+    source = tmp_path / "canonical.npz"
+    fino = tmp_path / "fino.json"
+    output = tmp_path / "candidate.npz"
+    report = tmp_path / "candidate.geometry.json"
+    report_tmp = report.with_name(report.name + ".tmp")
+    source.write_bytes(b"canonical input bytes must survive exactly")
+    fino.write_bytes(b"FINO input bytes must survive exactly")
+    output.write_bytes(b"stale PCA target must survive unsafe entry")
+    report.write_bytes(b"stale PCA report must survive unsafe entry")
+    protected_input = {"source": source, "fino": fino}[input_label]
+    os.link(protected_input, report_tmp)
+    before = {path: path.read_bytes() for path in (source, fino, output, report, report_tmp)}
+    original_unlink = Path.unlink
+
+    def fail_aliased_unlink(self, *args, **kwargs):
+        if self == report_tmp:
+            raise OSError("injected report-temp unlink failure")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_aliased_unlink)
+    with pytest.raises(AssertionError, match="path collision gate failed") as raised:
+        reembed.build_reembedded_bank(
+            source,
+            output,
+            report,
+            fino,
+            None,
+            None,
+            None,
+            variant=reembed.PCA384,
+        )
+
+    assert {path: path.read_bytes() for path in before} == before
+    assert "PCA failure report not written" in "\n".join(getattr(raised.value, "__notes__", []))
+
+
+def _seed_pca_publication_collision(tmp_path, collision_kind):
+    source = tmp_path / "canonical.npz"
+    fino = tmp_path / "fino.json"
+    output = tmp_path / "candidate.npz"
+    report = tmp_path / "candidate.geometry.json"
+    source.write_bytes(b"canonical source")
+    fino.write_bytes(b"canonical FINO")
+    output.write_bytes(b"stale target")
+    output_staging = {
+        "output_tmp": output.with_name(output.name + ".tmp"),
+        "output_check": output.with_name(output.name + ".check"),
+        "output_backup": output.with_name(output.name + ".bak"),
+    }
+    if collision_kind == "pathname_output_report":
+        report = output
+    elif collision_kind.startswith("pathname_report_"):
+        report = output_staging[collision_kind.removeprefix("pathname_report_")]
+        report.write_bytes(b"stale report at output staging path")
     else:
-        assert not output.exists()
-        payload = json.loads(report.read_text())
-        assert payload["status"] == "failed"
-        assert payload["artifact"]["target_path_cleared"] is True
-        assert payload["failure_boundary"]["staging_paths_cleared"] is False
-        aliases = payload["failure_boundary"]["protected_input_aliases"]
-        assert aliases[str(staging[staging_label].resolve())] == [input_label, staging_label]
+        report.write_bytes(b"stale report")
+        if collision_kind == "hardlink_output_report":
+            report.unlink()
+            os.link(output, report)
+        elif collision_kind.startswith("hardlink_report_tmp_"):
+            staging = output_staging[collision_kind.removeprefix("hardlink_report_tmp_")]
+            staging.write_bytes(b"stale output staging artifact")
+            os.link(staging, report.with_name(report.name + ".tmp"))
+        else:
+            staging = output_staging[collision_kind.removeprefix("hardlink_report_")]
+            os.link(report, staging)
+    paths = {
+        source,
+        fino,
+        output,
+        report,
+        report.with_name(report.name + ".tmp"),
+        report.with_name(report.name + ".bak"),
+        *output_staging.values(),
+    }
+    existing = {path: path.read_bytes() for path in paths if path.exists()}
+    return source, fino, output, report, existing
+
+
+@pytest.mark.parametrize(
+    "collision_kind",
+    [
+        "pathname_output_report",
+        "pathname_report_output_tmp",
+        "pathname_report_output_check",
+        "pathname_report_output_backup",
+        "hardlink_output_report",
+        "hardlink_report_output_tmp",
+        "hardlink_report_output_check",
+        "hardlink_report_output_backup",
+        "hardlink_report_tmp_output_tmp",
+        "hardlink_report_tmp_output_check",
+        "hardlink_report_tmp_output_backup",
+    ],
+)
+@pytest.mark.parametrize("unlink_would_fail", [False, True])
+def test_pca_publication_family_collisions_fail_closed_without_mutation(
+    tmp_path,
+    monkeypatch,
+    collision_kind,
+    unlink_would_fail,
+):
+    source, fino, output, report, before = _seed_pca_publication_collision(
+        tmp_path,
+        collision_kind,
+    )
+    unlink_calls = []
+    original_unlink = Path.unlink
+
+    def record_or_fail_unlink(self, *args, **kwargs):
+        unlink_calls.append(self)
+        if unlink_would_fail:
+            raise OSError("injected cleanup failure")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", record_or_fail_unlink)
+    with pytest.raises(AssertionError, match="path collision gate failed") as raised:
+        reembed.build_reembedded_bank(
+            source,
+            output,
+            report,
+            fino,
+            None,
+            None,
+            None,
+            variant=reembed.PCA384,
+        )
+
+    assert unlink_calls == []
+    assert {path: path.read_bytes() for path in before} == before
+    assert "PCA failure report not written" in "\n".join(getattr(raised.value, "__notes__", []))
+
+
+def test_pca_path_identity_uncertainty_fails_closed_without_mutation(tmp_path, monkeypatch):
+    source = tmp_path / "canonical.npz"
+    fino = tmp_path / "fino.json"
+    output = tmp_path / "candidate.npz"
+    report = tmp_path / "candidate.geometry.json"
+    for path, contents in (
+        (source, b"canonical source"),
+        (fino, b"canonical FINO"),
+        (output, b"stale target"),
+        (report, b"stale report"),
+    ):
+        path.write_bytes(contents)
+    before = {path: path.read_bytes() for path in (source, fino, output, report)}
+    original_samefile = Path.samefile
+
+    def uncertain_samefile(self, other):
+        if {self, Path(other)} == {source.resolve(), output.resolve()}:
+            raise OSError("injected identity uncertainty")
+        return original_samefile(self, other)
+
+    monkeypatch.setattr(Path, "samefile", uncertain_samefile)
+    with pytest.raises(AssertionError, match="path identity gate failed") as raised:
+        reembed.build_reembedded_bank(
+            source,
+            output,
+            report,
+            fino,
+            None,
+            None,
+            None,
+            variant=reembed.PCA384,
+        )
+
+    assert {path: path.read_bytes() for path in before} == before
+    assert "PCA failure report not written" in "\n".join(getattr(raised.value, "__notes__", []))
 
 
 def test_build_reembedded_bank_rejects_binding_from_wrong_snapshot_revision(tmp_path, monkeypatch):

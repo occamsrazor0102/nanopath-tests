@@ -90,17 +90,95 @@ def build_path_model(source, output, report, fino_path):
             "report_backup": report_path.with_name(report_path.name + ".bak"),
         }
     )
-    by_path = {}
+    resolved_paths = {label: path.resolve() for label, path in paths.items()}
+    by_resolved_path = {}
+    for label, path in resolved_paths.items():
+        by_resolved_path.setdefault(path, []).append(label)
+    collisions = {
+        str(path): labels
+        for path, labels in by_resolved_path.items()
+        if len(labels) > 1
+    }
+
+    entry_states = {}
+    identity_uncertainties = []
     for label, path in paths.items():
-        by_path.setdefault(path, []).append(label)
-    collisions = {str(path): labels for path, labels in by_path.items() if len(labels) > 1}
-    return {"paths": paths, "collisions": collisions}
+        try:
+            path.stat()
+        except FileNotFoundError:
+            entry_states[label] = "absent"
+        except OSError as error:
+            entry_states[label] = "unknown"
+            identity_uncertainties.append(
+                {"labels": [label], "paths": [str(path)], "error": str(error)}
+            )
+        else:
+            entry_states[label] = "present"
+
+    identity_collisions = []
+    path_items = list(paths.items())
+    for index, (left_label, left_path) in enumerate(path_items):
+        if entry_states[left_label] != "present":
+            continue
+        for right_label, right_path in path_items[index + 1 :]:
+            if entry_states[right_label] != "present":
+                continue
+            if resolved_paths[left_label] == resolved_paths[right_label]:
+                continue
+            try:
+                same_file = left_path.samefile(right_path)
+            except OSError as error:
+                identity_uncertainties.append(
+                    {
+                        "labels": [left_label, right_label],
+                        "paths": [str(left_path), str(right_path)],
+                        "error": str(error),
+                    }
+                )
+            else:
+                if same_file:
+                    identity_collisions.append(
+                        {
+                            "labels": [left_label, right_label],
+                            "paths": [str(left_path), str(right_path)],
+                        }
+                    )
+    return {
+        "paths": paths,
+        "resolved_paths": resolved_paths,
+        "collisions": collisions,
+        "identity_collisions": identity_collisions,
+        "identity_uncertainties": identity_uncertainties,
+        "entry_states": entry_states,
+    }
 
 
-def resolve_build_paths(source, output, report, fino_path):
-    path_model = build_path_model(source, output, report, fino_path)
-    paths, collisions = path_model["paths"], path_model["collisions"]
-    assert not collisions, f"path collision gate failed: {collisions}"
+def path_safety_evidence(path_model):
+    evidence = {}
+    if path_model["collisions"]:
+        evidence["resolved_path_collisions"] = path_model["collisions"]
+    if path_model["identity_collisions"]:
+        evidence["same_file_collisions"] = path_model["identity_collisions"]
+    if path_model["identity_uncertainties"]:
+        evidence["identity_uncertainties"] = path_model["identity_uncertainties"]
+    return evidence
+
+
+def resolve_build_paths(source, output, report, fino_path, path_model=None):
+    if path_model is None:
+        path_model = build_path_model(source, output, report, fino_path)
+    paths = path_model["paths"]
+    assert not path_model["collisions"], (
+        f"path collision gate failed: {path_model['collisions']}"
+    )
+    assert not path_model["identity_collisions"], (
+        "path collision gate failed: "
+        f"{{'same_file_collisions': {path_model['identity_collisions']}}}"
+    )
+    assert not path_model["identity_uncertainties"], (
+        "path identity gate failed: "
+        f"{path_model['identity_uncertainties']}"
+    )
     return paths["source"], paths["output"], paths["report"], paths["fino"]
 
 
@@ -399,25 +477,17 @@ def persist_pca_build_failure(
     artifact_width,
     artifact_mode,
     preexisting_target_detected,
-    preexisting_report_sha256,
+    entry_report_fingerprint,
 ):
-    paths, collisions = path_model["paths"], path_model["collisions"]
+    paths = path_model["paths"]
     source, fino_path = paths["source"], paths["fino"]
     output, report = paths["output"], paths["report"]
-    protected_paths = {source, fino_path}
-    unsafe_publication = {
-        label: paths[label]
-        for label in ("output", "report", "report_tmp")
-        if paths[label] in protected_paths
-    }
-    if unsafe_publication:
-        evidence = {
-            str(path): collisions.get(str(path), [label])
-            for label, path in unsafe_publication.items()
-        }
+    entry_safety_evidence = path_safety_evidence(path_model)
+    if entry_safety_evidence:
         error.add_note(
-            "PCA failure report not written because resolved path collisions "
-            f"would overwrite an input: {evidence}"
+            "PCA failure report not written because entry path safety was unsafe or "
+            "ambiguous; no cleanup or report mutation was attempted: "
+            f"{entry_safety_evidence}"
         )
         return None
 
@@ -433,8 +503,15 @@ def persist_pca_build_failure(
                 parse_constant=reject_nonstandard_constant,
             )
             current_report_sha256 = hashlib.sha256(report_bytes).hexdigest()
+            report_is_known_current = (
+                entry_report_fingerprint["state"] == "absent"
+                or (
+                    entry_report_fingerprint["state"] == "readable"
+                    and current_report_sha256 != entry_report_fingerprint["sha256"]
+                )
+            )
             if (
-                current_report_sha256 != preexisting_report_sha256
+                report_is_known_current
                 and isinstance(candidate, dict)
                 and candidate.get("status") == "failed"
             ):
@@ -450,18 +527,35 @@ def persist_pca_build_failure(
         "report_backup",
     )
     cleanup_errors = {}
-    protected_input_aliases = {}
     for label in ("output", *staging_labels):
         path = paths[label]
-        if path in protected_paths:
-            protected_input_aliases[str(path)] = collisions.get(str(path), [label])
-            continue
         try:
             path.unlink(missing_ok=True)
         except OSError as cleanup_error:
             cleanup_errors[str(path)] = str(cleanup_error)
     target_path_cleared = not output.exists()
     staging_paths_cleared = not any(paths[label].exists() for label in staging_labels)
+    if cleanup_errors:
+        error.add_note(
+            "PCA failure report not written because cleanup did not complete; "
+            f"publication aborted: {cleanup_errors}"
+        )
+        return None
+
+    publication_path_model = build_path_model(source, output, report, fino_path)
+    publication_safety_evidence = path_safety_evidence(publication_path_model)
+    if publication_safety_evidence:
+        error.add_note(
+            "PCA failure report not written because publication path safety was unsafe "
+            f"or ambiguous after cleanup: {publication_safety_evidence}"
+        )
+        return None
+    if publication_path_model["entry_states"]["report_tmp"] != "absent":
+        error.add_note(
+            "PCA failure report not written because report-temp absence could not be "
+            "established after cleanup"
+        )
+        return None
 
     exception_message = str(error)
     gate = error.gate if isinstance(error, ValidationGateError) else "PCA build/publication"
@@ -518,10 +612,6 @@ def persist_pca_build_failure(
         "target_path_cleared": target_path_cleared,
         "staging_paths_cleared": staging_paths_cleared,
     }
-    if cleanup_errors:
-        payload["failure_boundary"]["cleanup_errors"] = cleanup_errors
-    if protected_input_aliases:
-        payload["failure_boundary"]["protected_input_aliases"] = protected_input_aliases
     payload, non_finite_values = json_safe_payload(payload)
     if non_finite_values:
         payload.setdefault("non_finite_values", {}).update(non_finite_values)
@@ -549,13 +639,20 @@ def _build_reembedded_bank(
     expected_source_sha,
     device="cpu",
     variant=RAW768,
+    path_model=None,
 ):
     assert variant in VARIANT_SPECS, f"variant gate failed: {variant}"
     variant_spec = VARIANT_SPECS[variant]
     artifact_width = BIOMED_DIM if variant == RAW768 else variant_spec["target_width"]
     artifact_mode = variant_spec["artifact_mode"]
     pca_audit = None
-    source, output, report, fino_path = resolve_build_paths(source, output, report, fino_path)
+    source, output, report, fino_path = resolve_build_paths(
+        source,
+        output,
+        report,
+        fino_path,
+        path_model=path_model,
+    )
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
     if expected_source_sha is not None:
         assert source_sha == expected_source_sha.lower(), f"source SHA-256 gate failed: {source_sha}"
@@ -947,13 +1044,18 @@ def build_reembedded_bank(
     path_model = build_path_model(source, output, report, fino_path)
     paths = path_model["paths"]
     preexisting_target_detected = paths["output"].exists()
-    preexisting_report_sha256 = None
+    entry_report_fingerprint = {"state": "absent", "sha256": None}
     report_path = paths["report"]
-    try:
-        if report_path.is_file():
-            preexisting_report_sha256 = hashlib.sha256(report_path.read_bytes()).hexdigest()
-    except OSError:
-        pass
+    if path_model["entry_states"]["report"] == "unknown":
+        entry_report_fingerprint["state"] = "unknown"
+    elif path_model["entry_states"]["report"] == "present":
+        try:
+            entry_report_fingerprint = {
+                "state": "readable",
+                "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            }
+        except OSError:
+            entry_report_fingerprint["state"] = "unknown"
     try:
         return _build_reembedded_bank(
             source,
@@ -965,6 +1067,7 @@ def build_reembedded_bank(
             expected_source_sha,
             device=device,
             variant=variant,
+            path_model=path_model,
         )
     except Exception as error:
         try:
@@ -974,7 +1077,7 @@ def build_reembedded_bank(
                 VARIANT_SPECS[PCA384]["target_width"],
                 VARIANT_SPECS[PCA384]["artifact_mode"],
                 preexisting_target_detected,
-                preexisting_report_sha256,
+                entry_report_fingerprint,
             )
         except Exception as failure_boundary_error:
             error.add_note(f"PCA failure boundary failed: {failure_boundary_error}")
