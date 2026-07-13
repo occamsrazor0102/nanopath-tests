@@ -166,7 +166,31 @@ def path_safety_evidence(path_model):
 
 def resolve_build_paths(source, output, report, fino_path, path_model=None):
     if path_model is None:
-        path_model = build_path_model(source, output, report, fino_path)
+        resolved = {
+            "source": Path(source).resolve(),
+            "output": Path(output).resolve(),
+            "report": Path(report).resolve(),
+            "fino": Path(fino_path).resolve(),
+        }
+        output_path, report_path = resolved["output"], resolved["report"]
+        resolved.update(
+            {
+                "output_tmp": output_path.with_name(output_path.name + ".tmp"),
+                "output_check": output_path.with_name(output_path.name + ".check"),
+                "output_backup": output_path.with_name(output_path.name + ".bak"),
+                "report_tmp": report_path.with_name(report_path.name + ".tmp"),
+                "report_backup": report_path.with_name(report_path.name + ".bak"),
+            }
+        )
+        by_path = {}
+        for label, path in resolved.items():
+            by_path.setdefault(path, []).append(label)
+        collisions = {
+            str(path): labels for path, labels in by_path.items() if len(labels) > 1
+        }
+        assert not collisions, f"path collision gate failed: {collisions}"
+        return resolved["source"], resolved["output"], resolved["report"], resolved["fino"]
+
     paths = path_model["paths"]
     assert not path_model["collisions"], (
         f"path collision gate failed: {path_model['collisions']}"

@@ -379,6 +379,87 @@ def test_default_and_explicit_raw768_builds_are_byte_identical(tmp_path, monkeyp
     assert default_payload == explicit_payload
 
 
+def test_raw768_distinct_hardlinks_keep_legacy_pathname_only_behavior(tmp_path):
+    source = tmp_path / "canonical.npz"
+    output = tmp_path / "candidate.npz"
+    report = tmp_path / "candidate.json"
+    fino = tmp_path / "fino.json"
+    source.write_bytes(b"canonical source")
+    os.link(source, output)
+    fino.write_bytes(b"canonical FINO")
+    before = {path: path.read_bytes() for path in (source, output, fino)}
+
+    with pytest.raises(AssertionError, match="source SHA-256 gate failed"):
+        reembed.build_reembedded_bank(
+            source,
+            output,
+            report,
+            fino,
+            None,
+            None,
+            "0" * 64,
+            variant=reembed.RAW768,
+        )
+
+    assert {path: path.read_bytes() for path in before} == before
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("identity_probe", ["stat", "samefile"])
+def test_raw768_identity_uncertainty_skips_identity_probes(
+    tmp_path,
+    monkeypatch,
+    identity_probe,
+):
+    source = tmp_path / "canonical.npz"
+    output = tmp_path / "candidate.npz"
+    report = tmp_path / "candidate.json"
+    fino = tmp_path / "fino.json"
+    source.write_bytes(b"canonical source")
+    fino.write_bytes(b"canonical FINO")
+    source_path, fino_path = source.resolve(), fino.resolve()
+    identity_calls = []
+
+    if identity_probe == "stat":
+        original_stat = Path.stat
+
+        def uncertain_stat(self, *args, **kwargs):
+            if self == source_path:
+                identity_calls.append((self,))
+                raise OSError("injected identity uncertainty")
+            return original_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", uncertain_stat)
+    else:
+        original_samefile = Path.samefile
+
+        def uncertain_samefile(self, other):
+            if {self, Path(other)} == {source_path, fino_path}:
+                identity_calls.append((self, Path(other)))
+                raise OSError("injected identity uncertainty")
+            return original_samefile(self, other)
+
+        monkeypatch.setattr(Path, "samefile", uncertain_samefile)
+
+    with pytest.raises(AssertionError, match="source SHA-256 gate failed"):
+        reembed.build_reembedded_bank(
+            source,
+            output,
+            report,
+            fino,
+            None,
+            None,
+            "0" * 64,
+            variant=reembed.RAW768,
+        )
+
+    assert identity_calls == []
+    assert source.read_bytes() == b"canonical source"
+    assert fino.read_bytes() == b"canonical FINO"
+    assert not output.exists()
+    assert not report.exists()
+
+
 def build_pca_fixture(case, tmp_path, monkeypatch, output, report):
     monkeypatch.setitem(reembed.VARIANT_SPECS[reembed.PCA384], "target_width", 4)
     monkeypatch.setattr(reembed, "PCA_MIN_VARIANCE", 0.0)
