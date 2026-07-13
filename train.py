@@ -19,6 +19,7 @@ import sys
 import time
 from copy import deepcopy
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -212,6 +213,282 @@ def update_ema(student_module, teacher_module, momentum):
     torch._foreach_add_(teacher_params, student_params, alpha=1 - momentum)
     for bs, bt in zip(student_module.buffers(), teacher_module.buffers()):
         bt.copy_(bs)
+
+
+class Hierarchy(NamedTuple):
+    slide_ids: torch.Tensor
+    slide_means: torch.Tensor
+    slide_tile_counts: torch.Tensor
+    patient_ids: torch.Tensor
+    patient_means: torch.Tensor
+
+
+def crop_major_tile_mean(features, views, batch_size):
+    assert isinstance(views, int) and views > 0
+    assert isinstance(batch_size, int) and batch_size > 0
+    assert features.ndim == 2 and features.shape[0] == views * batch_size
+    return features.reshape(views, batch_size, -1).float().mean(0)
+
+
+# Pool tiles within slides before giving every present slide equal patient weight.
+def hierarchical_means(features, slide_ids, slide_to_patient):
+    assert features.ndim == 2 and features.shape[0] > 0 and torch.isfinite(features).all()
+    assert slide_ids.ndim == 1 and slide_ids.shape[0] == features.shape[0]
+    assert slide_ids.dtype == torch.int64 and slide_ids.device == features.device
+    assert slide_to_patient.ndim == 1 and slide_to_patient.numel() > 0
+    assert slide_to_patient.dtype == torch.int64 and slide_to_patient.device == features.device
+    assert torch.all(slide_ids >= 0) and torch.all(slide_ids < len(slide_to_patient))
+    assert torch.all(slide_to_patient >= 0)
+    unique_slides, tile_inverse = torch.unique(slide_ids, sorted=True, return_inverse=True)
+    tile_counts = torch.bincount(tile_inverse, minlength=len(unique_slides))
+    slide_sums = features.new_zeros((len(unique_slides), features.shape[-1]), dtype=torch.float32)
+    slide_sums.index_add_(0, tile_inverse, features.float())
+    slide_means = slide_sums / tile_counts[:, None]
+    slide_patients = slide_to_patient[unique_slides]
+    unique_patients, slide_inverse = torch.unique(slide_patients, sorted=True, return_inverse=True)
+    patient_sums = slide_means.new_zeros((len(unique_patients), slide_means.shape[-1]))
+    patient_sums.index_add_(0, slide_inverse, slide_means)
+    patient_counts = torch.bincount(slide_inverse, minlength=len(unique_patients))
+    return Hierarchy(
+        unique_slides,
+        slide_means,
+        tile_counts,
+        unique_patients,
+        patient_sums / patient_counts[:, None],
+    )
+
+
+def patient_targets_from_tiles(targets, present, tile_patient_ids, patient_ids):
+    assert targets.ndim == 2 and targets.shape[0] > 0
+    assert present.ndim == tile_patient_ids.ndim == patient_ids.ndim == 1
+    assert len(present) == len(tile_patient_ids) == len(targets)
+    assert targets.dtype == present.dtype == torch.float32
+    assert tile_patient_ids.dtype == patient_ids.dtype == torch.int64
+    assert targets.device == present.device == tile_patient_ids.device == patient_ids.device
+    assert torch.isfinite(present).all()
+    assert torch.all((present == 0) | (present == 1))
+    assert len(patient_ids) > 0
+    assert len(patient_ids) == 1 or torch.all(patient_ids[1:] > patient_ids[:-1])
+    inverse = torch.searchsorted(patient_ids, tile_patient_ids)
+    assert torch.all(inverse < len(patient_ids))
+    assert torch.equal(patient_ids[inverse], tile_patient_ids)
+    counts = torch.bincount(inverse, minlength=len(patient_ids))
+    assert torch.all(counts > 0)
+    grouped = targets.new_zeros((len(patient_ids), targets.shape[-1]))
+    grouped.index_add_(0, inverse, targets)
+    grouped = grouped / counts[:, None]
+    assert torch.allclose(targets, grouped[inverse], atol=1e-6, rtol=0)
+    grouped_present = present.new_zeros(len(patient_ids))
+    grouped_present.index_add_(0, inverse, present)
+    grouped_present = grouped_present / counts
+    assert torch.allclose(present, grouped_present[inverse], atol=1e-6, rtol=0)
+    return grouped, grouped_present
+
+
+def teacher_value_student_gradient(student, teacher):
+    assert student.shape == teacher.shape
+    assert student.dtype == teacher.dtype and student.device == teacher.device
+    return teacher.detach() + (student - student.detach())
+
+
+class CentroidProposal(NamedTuple):
+    base_state_step: int
+    slide_ids: torch.Tensor
+    next_slide_centroids: torch.Tensor
+    slide_tile_counts: torch.Tensor
+    patient_ids: torch.Tensor
+    patient_centroids: torch.Tensor
+    drift_cosines: torch.Tensor
+    historical_tile_fraction: torch.Tensor
+
+
+class HierarchicalCentroidBank(nn.Module):
+    def __init__(self, slide_to_patient, feature_dim, momentum):
+        super().__init__()
+        assert slide_to_patient.ndim == 1 and slide_to_patient.numel() > 0
+        assert slide_to_patient.dtype == torch.int64 and torch.all(slide_to_patient >= 0)
+        assert isinstance(feature_dim, int) and feature_dim > 0
+        assert float(momentum) == 0.9
+        mapping = slide_to_patient.detach().clone()
+        patient_count = int(mapping.max().item()) + 1
+        assert torch.equal(torch.unique(mapping), torch.arange(patient_count, device=mapping.device))
+        self.momentum = float(momentum)
+        self.register_buffer("slide_to_patient", mapping, persistent=False)
+        self.register_buffer(
+            "slide_centroids",
+            torch.zeros(len(mapping), feature_dim, dtype=torch.float32, device=mapping.device),
+        )
+        self.register_buffer(
+            "slide_counts", torch.zeros(len(mapping), dtype=torch.int64, device=mapping.device)
+        )
+        self.register_buffer(
+            "slide_tile_presentations",
+            torch.zeros(len(mapping), dtype=torch.int64, device=mapping.device),
+        )
+        self.register_buffer(
+            "centroid_state_step", torch.zeros((), dtype=torch.int64, device=mapping.device)
+        )
+        self.register_buffer(
+            "patient_sums",
+            torch.zeros(patient_count, feature_dim, dtype=torch.float32, device=mapping.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "patient_slide_counts",
+            torch.zeros(patient_count, dtype=torch.int64, device=mapping.device),
+            persistent=False,
+        )
+
+    # Build the exact next state without mutating any committed buffer.
+    def propose(self, teacher):
+        assert isinstance(teacher, Hierarchy)
+        slide_ids = teacher.slide_ids
+        assert slide_ids.ndim == 1 and slide_ids.numel() > 0
+        assert slide_ids.dtype == torch.int64 and slide_ids.device == self.slide_centroids.device
+        assert len(slide_ids) == 1 or torch.all(slide_ids[1:] > slide_ids[:-1])
+        assert torch.all(slide_ids >= 0) and torch.all(slide_ids < len(self.slide_to_patient))
+        assert teacher.slide_means.shape == (len(slide_ids), self.slide_centroids.shape[-1])
+        assert teacher.slide_means.dtype == self.slide_centroids.dtype
+        assert teacher.slide_means.device == self.slide_centroids.device
+        assert torch.isfinite(teacher.slide_means).all()
+        assert teacher.slide_tile_counts.shape == slide_ids.shape
+        assert teacher.slide_tile_counts.dtype == torch.int64
+        assert teacher.slide_tile_counts.device == self.slide_centroids.device
+        assert torch.all(teacher.slide_tile_counts > 0)
+        slide_patients = self.slide_to_patient[slide_ids]
+        patient_ids, inverse = torch.unique(slide_patients, sorted=True, return_inverse=True)
+        assert teacher.patient_ids.shape == patient_ids.shape
+        assert teacher.patient_ids.dtype == torch.int64
+        assert teacher.patient_ids.device == self.slide_centroids.device
+        assert torch.equal(teacher.patient_ids, patient_ids)
+        assert teacher.patient_means.shape == (len(patient_ids), self.slide_centroids.shape[-1])
+        assert teacher.patient_means.dtype == self.slide_centroids.dtype
+        assert teacher.patient_means.device == self.slide_centroids.device
+        current_sums = teacher.slide_means.new_zeros(teacher.patient_means.shape)
+        current_sums.index_add_(0, inverse, teacher.slide_means)
+        current_counts = torch.bincount(inverse, minlength=len(patient_ids))
+        assert torch.allclose(
+            teacher.patient_means, current_sums / current_counts[:, None], atol=1e-6, rtol=0
+        )
+        old = self.slide_centroids[slide_ids]
+        seen = self.slide_counts[slide_ids] > 0
+        teacher_means = teacher.slide_means.detach()
+        next_values = torch.where(
+            seen[:, None],
+            self.momentum * old + (1.0 - self.momentum) * teacher_means,
+            teacher_means,
+        )
+        sums = self.patient_sums[patient_ids].clone()
+        counts = self.patient_slide_counts[patient_ids].clone()
+        deltas = next_values - torch.where(seen[:, None], old, torch.zeros_like(old))
+        sums.index_add_(0, inverse, deltas)
+        counts.index_add_(0, inverse, (~seen).long())
+        assert torch.all(counts > 0)
+        historical_tile_fraction = (
+            teacher.slide_tile_counts[seen].sum().float()
+            / teacher.slide_tile_counts.sum().float()
+        )
+        return CentroidProposal(
+            int(self.centroid_state_step.item()),
+            slide_ids.detach().clone(),
+            next_values.detach().clone(),
+            teacher.slide_tile_counts.detach().clone(),
+            patient_ids.detach().clone(),
+            (sums / counts[:, None]).detach().clone(),
+            F.cosine_similarity(old[seen], next_values[seen], dim=-1).detach().clone(),
+            historical_tile_fraction.detach().clone(),
+        )
+
+    @torch.no_grad()
+    def commit(self, proposal, step):
+        # Validate the whole proposal before the first write, making rejection atomic.
+        assert isinstance(proposal, CentroidProposal)
+        state_step = int(self.centroid_state_step.item())
+        assert type(proposal.base_state_step) is int and proposal.base_state_step == state_step
+        assert type(step) is int and step == state_step + 1
+        maximum_int64 = torch.iinfo(torch.int64).max
+        assert step <= maximum_int64
+        slide_ids = proposal.slide_ids
+        assert slide_ids.ndim == 1 and slide_ids.numel() > 0
+        assert slide_ids.dtype == torch.int64 and slide_ids.device == self.slide_centroids.device
+        assert len(slide_ids) == 1 or torch.all(slide_ids[1:] > slide_ids[:-1])
+        assert torch.all(slide_ids >= 0) and torch.all(slide_ids < len(self.slide_to_patient))
+        assert proposal.next_slide_centroids.shape == (len(slide_ids), self.slide_centroids.shape[-1])
+        assert proposal.next_slide_centroids.dtype == self.slide_centroids.dtype
+        assert proposal.next_slide_centroids.device == self.slide_centroids.device
+        assert not proposal.next_slide_centroids.requires_grad
+        assert torch.isfinite(proposal.next_slide_centroids).all()
+        assert proposal.slide_tile_counts.shape == slide_ids.shape
+        assert proposal.slide_tile_counts.dtype == torch.int64
+        assert proposal.slide_tile_counts.device == self.slide_centroids.device
+        assert torch.all(proposal.slide_tile_counts > 0)
+        patients = self.slide_to_patient[slide_ids]
+        patient_ids, inverse = torch.unique(patients, sorted=True, return_inverse=True)
+        assert proposal.patient_ids.shape == patient_ids.shape
+        assert proposal.patient_ids.dtype == torch.int64
+        assert proposal.patient_ids.device == self.slide_centroids.device
+        assert torch.equal(proposal.patient_ids, patient_ids)
+        assert proposal.patient_centroids.shape == (len(patient_ids), self.slide_centroids.shape[-1])
+        assert proposal.patient_centroids.dtype == self.slide_centroids.dtype
+        assert proposal.patient_centroids.device == self.slide_centroids.device
+        assert not proposal.patient_centroids.requires_grad
+        assert torch.isfinite(proposal.patient_centroids).all()
+        old = self.slide_centroids[slide_ids]
+        seen = self.slide_counts[slide_ids] > 0
+        assert torch.all(self.slide_counts[slide_ids] < maximum_int64)
+        assert torch.all(
+            self.slide_tile_presentations[slide_ids]
+            <= maximum_int64 - proposal.slide_tile_counts
+        )
+        patient_increments = torch.zeros_like(patient_ids)
+        patient_increments.index_add_(0, inverse, (~seen).long())
+        assert torch.all(
+            self.patient_slide_counts[patient_ids] <= maximum_int64 - patient_increments
+        )
+        expected_sums = self.patient_sums[patient_ids].clone()
+        expected_counts = self.patient_slide_counts[patient_ids].clone()
+        expected_sums.index_add_(
+            0,
+            inverse,
+            proposal.next_slide_centroids
+            - torch.where(seen[:, None], old, torch.zeros_like(old)),
+        )
+        expected_counts.index_add_(0, inverse, (~seen).long())
+        assert torch.all(expected_counts > 0)
+        assert torch.allclose(
+            proposal.patient_centroids,
+            expected_sums / expected_counts[:, None],
+            atol=1e-6,
+            rtol=0,
+        )
+        expected_drift = F.cosine_similarity(old[seen], proposal.next_slide_centroids[seen], dim=-1)
+        assert proposal.drift_cosines.shape == expected_drift.shape
+        assert proposal.drift_cosines.dtype == self.slide_centroids.dtype
+        assert proposal.drift_cosines.device == self.slide_centroids.device
+        assert not proposal.drift_cosines.requires_grad and torch.isfinite(proposal.drift_cosines).all()
+        assert torch.allclose(proposal.drift_cosines, expected_drift, atol=1e-6, rtol=0)
+        expected_fraction = (
+            proposal.slide_tile_counts[seen].sum().float()
+            / proposal.slide_tile_counts.sum().float()
+        )
+        assert proposal.historical_tile_fraction.shape == expected_fraction.shape
+        assert proposal.historical_tile_fraction.dtype == self.slide_centroids.dtype
+        assert proposal.historical_tile_fraction.device == self.slide_centroids.device
+        assert not proposal.historical_tile_fraction.requires_grad
+        assert torch.isfinite(proposal.historical_tile_fraction)
+        assert torch.allclose(proposal.historical_tile_fraction, expected_fraction, atol=1e-6, rtol=0)
+        old = old.clone()
+        self.slide_centroids[slide_ids] = proposal.next_slide_centroids
+        self.slide_counts[slide_ids] += 1
+        self.slide_tile_presentations[slide_ids] += proposal.slide_tile_counts
+        self.patient_sums.index_add_(
+            0,
+            patients,
+            proposal.next_slide_centroids
+            - torch.where(seen[:, None], old, torch.zeros_like(old)),
+        )
+        self.patient_slide_counts.index_add_(0, patients, (~seen).long())
+        self.centroid_state_step.fill_(step)
 
 
 # Orchestrates one pretraining run: setup, train+probe loop, checkpoint, summary.
