@@ -23,6 +23,22 @@ def test_target_bank_lookup_and_missing_patient(tmp_path):
     assert bank.get("TCGA-CC-0003") is None
 
 
+def test_target_bank_can_return_canonical_patient_order(tmp_path):
+    path = tmp_path / "targets.npz"
+    save_target_bank(
+        path,
+        ["TCGA-BB-0002", "TCGA-AA-0001"],
+        np.eye(2, 4, dtype=np.float32),
+        ["second", "first"],
+        "structured",
+    )
+
+    bank, patient_ids = load_molcap_bank(path, 4, return_patient_ids=True)
+
+    assert patient_ids == ("TCGA-BB-0002", "TCGA-AA-0001")
+    assert set(bank) == set(patient_ids)
+
+
 def test_target_dimension_mismatch_fails(tmp_path):
     path = tmp_path / "targets.npz"
     save_target_bank(path, ["TCGA-AA-0001"], np.ones((1, 4), np.float32), ["first"], "structured")

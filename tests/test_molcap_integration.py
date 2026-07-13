@@ -1,9 +1,11 @@
+import hashlib
 import io
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 from PIL import Image
 
@@ -31,6 +33,63 @@ def tiny_config(tmp_path, enabled=True, target_dim=6):
     }
 
 
+@pytest.fixture
+def dense_identity_config(tmp_path):
+    data = tmp_path / "tiles"
+    data.mkdir(parents=True)
+    low_tissue = io.BytesIO()
+    Image.new("RGB", (224, 224), "gray").save(low_tissue, format="JPEG")
+    tissue = io.BytesIO()
+    Image.new("RGB", (224, 224), "pink").save(tissue, format="JPEG")
+    paths = [
+        "TCGA-BB-0002-02Z-00-DX1/low-tissue.jpg",
+        "TCGA-AA-0001-01Z-00-DX1/tissue.jpg",
+        "TCGA-BB-0002-01Z-00-DX1/tissue.jpg",
+    ]
+    pq.write_table(
+        pa.table(
+            {
+                "path": paths,
+                "jpeg": [low_tissue.getvalue(), tissue.getvalue(), tissue.getvalue()],
+            }
+        ),
+        data / "shard-00000.parquet",
+        row_group_size=1,
+    )
+    bank = tmp_path / "targets.npz"
+    patient_ids = ["TCGA-BB-0002", "TCGA-AA-0001"] + [
+        f"TCGA-ZZ-{index:05d}" for index in range(11_426)
+    ]
+    targets = np.zeros((len(patient_ids), 384), dtype=np.float32)
+    targets[:, 0] = 1.0
+    save_target_bank(bank, patient_ids, targets, ["caption"] * len(patient_ids), "text")
+    target_sha256 = hashlib.sha256(bank.read_bytes()).hexdigest()
+    return {
+        "config_path": str(tmp_path / "config.yaml"),
+        "data": {
+            "dataset_dir": str(data),
+            "split_seed": 7777,
+            "val_fraction": 0.0,
+            "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225],
+            "global_crop_scale": [1.0, 1.0],
+            "local_crop_scale": [1.0, 1.0],
+            "color_jitter": 0.0,
+            "color_jitter_saturation": 0.0,
+            "hed_jitter": 0.0,
+            "tissue_thresh": 0.0,
+        },
+        "train": {"global_views": 2, "local_views": 1, "global_size": 28, "local_size": 28},
+        "molcap": {
+            "enabled": True,
+            "targets": str(bank),
+            "target_sha256": target_sha256,
+            "target_dim": 384,
+            "route": "probe_cls_hierarchical",
+        },
+    }
+
+
 def test_dataset_emits_target_only_when_enabled(tmp_path):
     enabled = TCGATileDataset(tiny_config(tmp_path / "on"), is_train=True)[0]
     disabled = TCGATileDataset(tiny_config(tmp_path / "off", enabled=False), is_train=True)[0]
@@ -38,6 +97,58 @@ def test_dataset_emits_target_only_when_enabled(tmp_path):
     assert enabled["molcap_present"].item() == 1.0
     assert enabled["molcap_target"].shape == (6,)
     assert "molcap_target" not in disabled
+
+
+def test_dataset_emits_deterministic_dense_centroid_indices(dense_identity_config, monkeypatch):
+    dataset = TCGATileDataset(dense_identity_config, is_train=True)
+
+    assert dataset.molcap_patient_ids == ("TCGA-BB-0002", "TCGA-AA-0001")
+    assert dataset.molcap_slide_ids == (
+        "TCGA-AA-0001-01Z-00-DX1",
+        "TCGA-BB-0002-01Z-00-DX1",
+        "TCGA-BB-0002-02Z-00-DX1",
+    )
+    np.testing.assert_array_equal(dataset.molcap_slide_to_patient, [1, 0, 0])
+    assert len(dataset.molcap_mapping_digest) == 64
+    int(dataset.molcap_mapping_digest, 16)
+    assert dataset.molcap_target_sha256 == dense_identity_config["molcap"]["target_sha256"]
+
+    items = [dataset[index] for index in range(len(dataset))]
+    assert [
+        (item["molcap_slide_idx"].item(), item["molcap_patient_idx"].item())
+        for item in items
+    ] == [(2, 0), (0, 1), (1, 0)]
+    assert all(item["molcap_slide_idx"].dtype == torch.int64 for item in items)
+    assert all(item["molcap_patient_idx"].dtype == torch.int64 for item in items)
+
+    dataset.tissue_thresh = 0.5
+    monkeypatch.setattr("dataloader.random.randint", lambda low, high: 1)
+    resampled = dataset[0]
+    assert resampled["sample_idx"].item() == 1
+    assert resampled["molcap_slide_idx"].item() == 0
+    assert resampled["molcap_patient_idx"].item() == 1
+
+
+def test_routed_dataset_rejects_corrupt_target_sha(dense_identity_config):
+    dense_identity_config["molcap"]["target_sha256"] = "0" * 64
+
+    with pytest.raises(AssertionError, match="target_sha256"):
+        TCGATileDataset(dense_identity_config, is_train=True)
+
+
+def test_routed_dataset_rejects_noncanonical_target_width(dense_identity_config):
+    target_path = Path(dense_identity_config["molcap"]["targets"])
+    with np.load(target_path, allow_pickle=False) as artifact:
+        patient_ids = artifact["patient_ids"]
+        captions = artifact["captions"]
+    narrow_targets = np.zeros((len(patient_ids), 2), dtype=np.float32)
+    narrow_targets[:, 0] = 1.0
+    save_target_bank(target_path, patient_ids, narrow_targets, captions, "text")
+    dense_identity_config["molcap"]["target_dim"] = 2
+    dense_identity_config["molcap"]["target_sha256"] = hashlib.sha256(target_path.read_bytes()).hexdigest()
+
+    with pytest.raises(AssertionError, match="384"):
+        TCGATileDataset(dense_identity_config, is_train=True)
 
 
 def test_tiny_patch_route_checkpoint_and_gradient_diagnostics(tmp_path):
