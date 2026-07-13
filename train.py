@@ -291,6 +291,80 @@ def teacher_value_student_gradient(student, teacher):
     return teacher.detach() + (student - student.detach())
 
 
+# Measure raw patient-centroid geometry deterministically on CPU in float64.
+def centroid_geometry(patient_centroids):
+    assert isinstance(patient_centroids, torch.Tensor)
+    x = patient_centroids.detach().to(device="cpu", dtype=torch.float64)
+    assert x.ndim == 2 and x.shape[0] >= 2 and torch.isfinite(x).all()
+    norms = x.norm(dim=1)
+    assert torch.all(norms > 0)
+    centered = x - x.mean(dim=0, keepdim=True)
+    covariance = centered.T @ centered / (x.shape[0] - 1)
+    eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0)
+    total = eigenvalues.sum()
+    assert torch.isfinite(eigenvalues).all() and total > 0
+    probabilities = eigenvalues[eigenvalues > 0] / total
+    effective_rank = torch.exp(-(probabilities * probabilities.log()).sum())
+    participation_ratio = total.square() / eigenvalues.square().sum()
+    unit = x / norms[:, None]
+    mean_offdiag_cosine = (
+        unit.sum(dim=0).square().sum() - x.shape[0]
+    ) / (x.shape[0] * (x.shape[0] - 1))
+    metrics = {
+        "patient_count": int(x.shape[0]),
+        "min_norm": float(norms.min().item()),
+        "effective_rank": float(effective_rank.item()),
+        "participation_ratio": float(participation_ratio.item()),
+        "mean_offdiag_cosine": float(mean_offdiag_cosine.item()),
+    }
+    assert all(math.isfinite(value) for value in metrics.values())
+    return metrics
+
+
+def _diagnostic_centroid_geometry(patient_centroids):
+    x = patient_centroids.detach().to(device="cpu", dtype=torch.float64)
+    assert x.ndim == 2 and torch.isfinite(x).all()
+    norms = x.norm(dim=1)
+    centered_energy = (x - x.mean(dim=0, keepdim=True)).square().sum() if len(x) else 0
+    if len(x) >= 2 and torch.all(norms > 0) and centered_energy > 0:
+        return centroid_geometry(x)
+    return {
+        "patient_count": int(x.shape[0]),
+        "min_norm": float(norms.min().item()) if len(norms) else None,
+        "effective_rank": None,
+        "participation_ratio": None,
+        "mean_offdiag_cosine": None,
+    }
+
+
+def _metadata_exactly_matches(actual, expected):
+    if type(actual) is not type(expected):
+        return False
+    if type(actual) is dict:
+        if len(actual) != len(expected):
+            return False
+        for actual_key, actual_value in actual.items():
+            matching_keys = [
+                expected_key
+                for expected_key in expected
+                if type(actual_key) is type(expected_key) and actual_key == expected_key
+            ]
+            if len(matching_keys) != 1:
+                return False
+            if not _metadata_exactly_matches(actual_value, expected[matching_keys[0]]):
+                return False
+        return True
+    if type(actual) in (tuple, list):
+        return len(actual) == len(expected) and all(
+            _metadata_exactly_matches(actual_value, expected_value)
+            for actual_value, expected_value in zip(actual, expected)
+        )
+    try:
+        return bool(actual == expected)
+    except (TypeError, ValueError):
+        return False
+
+
 class CentroidProposal(NamedTuple):
     base_state_step: int
     slide_ids: torch.Tensor
@@ -338,6 +412,39 @@ class HierarchicalCentroidBank(nn.Module):
             torch.zeros(patient_count, dtype=torch.int64, device=mapping.device),
             persistent=False,
         )
+
+    # Return the exact eligible equal-slide patient population used by geometry.
+    # The reduction is deliberately CPU float64 and traverses ascending slide ids.
+    def patient_centroids(self, min_slide_updates=1):
+        assert type(min_slide_updates) is int and min_slide_updates >= 1
+        slide_counts = self.slide_counts.detach().cpu()
+        slide_ids = (slide_counts >= min_slide_updates).nonzero().flatten()
+        centroids = self.slide_centroids.detach().to(device="cpu", dtype=torch.float64)
+        mapping = self.slide_to_patient.detach().cpu()
+        patients = mapping[slide_ids]
+        patient_ids, inverse = torch.unique(patients, sorted=True, return_inverse=True)
+        sums = centroids.new_zeros((len(patient_ids), centroids.shape[-1]))
+        if len(slide_ids):
+            sums.index_add_(0, inverse, centroids[slide_ids])
+        counts = torch.bincount(inverse, minlength=len(patient_ids))
+        return patient_ids, sums / counts[:, None] if len(patient_ids) else sums
+
+    def sample_weighted_mature_coverage(self, min_slide_updates=2):
+        assert type(min_slide_updates) is int and min_slide_updates >= 1
+        presentations = self.slide_tile_presentations.detach().cpu()
+        counts = self.slide_counts.detach().cpu()
+        total = presentations.sum()
+        assert total > 0
+        mature = presentations[counts >= min_slide_updates].sum()
+        return float((mature.double() / total.double()).item())
+
+    def _assert_canonical_state_dtypes(self):
+        assert self.slide_to_patient.dtype == torch.int64
+        assert self.slide_centroids.dtype == self.patient_sums.dtype == torch.float32
+        assert self.slide_counts.dtype == torch.int64
+        assert self.slide_tile_presentations.dtype == torch.int64
+        assert self.centroid_state_step.dtype == torch.int64
+        assert self.patient_slide_counts.dtype == torch.int64
 
     # Build the exact next state without mutating any committed buffer.
     def propose(self, teacher):
@@ -489,6 +596,122 @@ class HierarchicalCentroidBank(nn.Module):
         )
         self.patient_slide_counts.index_add_(0, patients, (~seen).long())
         self.centroid_state_step.fill_(step)
+
+    def export_state(self, metadata):
+        assert type(metadata) is dict
+        self._assert_canonical_state_dtypes()
+        return {
+            "metadata": dict(metadata),
+            "slide_centroids": self.slide_centroids.detach().cpu().clone(),
+            "slide_counts": self.slide_counts.detach().cpu().clone(),
+            "slide_tile_presentations": self.slide_tile_presentations.detach().cpu().clone(),
+            "centroid_state_step": self.centroid_state_step.detach().cpu().clone(),
+        }
+
+    @torch.no_grad()
+    def restore_state(self, payload, expected_metadata, expected_step):
+        # Validate and stage every authoritative and derived value before the first write.
+        state_names = (
+            "slide_centroids",
+            "slide_counts",
+            "slide_tile_presentations",
+            "centroid_state_step",
+        )
+        self._assert_canonical_state_dtypes()
+        assert type(payload) is dict
+        assert len(payload) == len(state_names) + 1
+        assert all(type(name) is str for name in payload)
+        assert set(payload) == {"metadata", *state_names}
+        assert type(payload["metadata"]) is dict and type(expected_metadata) is dict
+        assert _metadata_exactly_matches(payload["metadata"], expected_metadata)
+        assert type(expected_step) is int and expected_step >= 0
+
+        staged = {}
+        for name in state_names:
+            source = payload[name]
+            target = getattr(self, name)
+            assert isinstance(source, torch.Tensor) and source.layout == torch.strided
+            assert not source.requires_grad
+            assert source.shape == target.shape and source.dtype == target.dtype
+            staged[name] = source.detach().to(device=target.device).clone()
+
+        centroids = staged["slide_centroids"]
+        counts = staged["slide_counts"]
+        presentations = staged["slide_tile_presentations"]
+        state_step = int(staged["centroid_state_step"].item())
+        assert state_step == expected_step
+        assert torch.isfinite(centroids).all()
+        assert torch.all(counts >= 0) and torch.all(counts <= state_step)
+        assert sum(int(value) for value in counts.detach().cpu().tolist()) >= state_step
+        assert torch.all(presentations >= 0) and torch.all(presentations >= counts)
+        assert torch.equal(counts == 0, presentations == 0)
+        observed = counts > 0
+        assert state_step == 0 or torch.any(observed)
+        if torch.any(~observed):
+            assert torch.count_nonzero(centroids[~observed]) == 0
+
+        rebuilt_sums = torch.zeros_like(self.patient_sums)
+        rebuilt_counts = torch.zeros_like(self.patient_slide_counts)
+        patients = self.slide_to_patient[observed]
+        if len(patients):
+            rebuilt_sums.index_add_(0, patients, centroids[observed])
+            rebuilt_counts.index_add_(0, patients, torch.ones_like(patients))
+        assert torch.isfinite(rebuilt_sums).all()
+
+        for name in state_names:
+            getattr(self, name).copy_(staged[name])
+        self.patient_sums.copy_(rebuilt_sums)
+        self.patient_slide_counts.copy_(rebuilt_counts)
+
+
+def centroid_audit(bank, min_slide_updates=2):
+    assert isinstance(bank, HierarchicalCentroidBank)
+    assert type(min_slide_updates) is int and min_slide_updates >= 1
+    _, observed = bank.patient_centroids(1)
+    _, mature = bank.patient_centroids(min_slide_updates)
+    return {
+        "sample_weighted_mature_coverage": bank.sample_weighted_mature_coverage(
+            min_slide_updates
+        ),
+        "all_observed": centroid_geometry(observed),
+        "mature_only": _diagnostic_centroid_geometry(mature),
+    }
+
+
+def require_centroid_gate(audit, history_cfg):
+    hard = audit["all_observed"]
+    coverage = audit["sample_weighted_mature_coverage"]
+    patient_count = hard["patient_count"]
+    effective_rank = hard["effective_rank"]
+    participation_ratio = hard["participation_ratio"]
+    mean_offdiag_cosine = hard["mean_offdiag_cosine"]
+    min_norm = hard["min_norm"]
+    assert type(patient_count) is int
+    assert all(
+        math.isfinite(float(value))
+        for value in (
+            coverage,
+            effective_rank,
+            participation_ratio,
+            mean_offdiag_cosine,
+            min_norm,
+        )
+    )
+    thresholds = {
+        "min_sample_weighted_coverage": float(history_cfg["min_sample_weighted_coverage"]),
+        "min_effective_rank": float(history_cfg["min_effective_rank"]),
+        "min_participation_ratio": float(history_cfg["min_participation_ratio"]),
+        "max_mean_offdiag_cosine": float(history_cfg["max_mean_offdiag_cosine"]),
+        "min_centroid_norm": float(history_cfg["min_centroid_norm"]),
+    }
+    assert type(history_cfg["min_geometry_patients"]) is int
+    assert all(math.isfinite(value) for value in thresholds.values())
+    assert coverage >= thresholds["min_sample_weighted_coverage"]
+    assert patient_count >= history_cfg["min_geometry_patients"]
+    assert effective_rank >= thresholds["min_effective_rank"]
+    assert participation_ratio >= thresholds["min_participation_ratio"]
+    assert mean_offdiag_cosine < thresholds["max_mean_offdiag_cosine"]
+    assert min_norm > thresholds["min_centroid_norm"]
 
 
 # Orchestrates one pretraining run: setup, train+probe loop, checkpoint, summary.
