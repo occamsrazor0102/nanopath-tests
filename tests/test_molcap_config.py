@@ -29,9 +29,18 @@ def test_route_and_centroid_configs_differ_at_exactly_four_leaves():
         "project.output_dir",
         "molcap.history.enabled",
     }
+    assert route["project"]["name"] == "molcap-probe-route-s7777"
+    assert route["project"]["recipe_id"] == "dinov2-vits14-reg-jepa-mask10-molcap-probe-route"
+    assert route["project"]["output_dir"] == "/data/$USER/nanopath/molcap/molcap-probe-route-s7777"
+    assert route["molcap"]["history"]["enabled"] is False
+    assert centroid["project"]["name"] == "molcap-ema-centroid-s7777"
+    assert centroid["project"]["recipe_id"] == "dinov2-vits14-reg-jepa-mask10-molcap-ema-centroid"
+    assert centroid["project"]["output_dir"] == "/data/$USER/nanopath/molcap/molcap-ema-centroid-s7777"
+    assert centroid["molcap"]["history"]["enabled"] is True
 
 
 def test_route_and_centroid_configs_freeze_registered_contract():
+    base = yaml.safe_load(Path("configs/molcap-text-s7777.yaml").read_text())
     route = yaml.safe_load(Path("configs/molcap-probe-route-s7777.yaml").read_text())
     centroid = yaml.safe_load(Path("configs/molcap-ema-centroid-s7777.yaml").read_text())
     expected_history = {
@@ -45,10 +54,50 @@ def test_route_and_centroid_configs_freeze_registered_contract():
         "max_mean_offdiag_cosine": 0.95,
         "min_centroid_norm": 1.0e-6,
     }
-    for config in (route, centroid):
+    expected_molcap = {
+        **base["molcap"],
+        "target_sha256": "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577",
+        "diagnose": True,
+        "route": "probe_cls_hierarchical",
+        "feature_blocks": [4, 6, 8, 11],
+        "input_dim": 1536,
+        "head_hidden_dim": 512,
+        "forward_source": "teacher",
+        "gradient_source": "student_identity_ste",
+    }
+    expected_train_controls = {
+        "batch_size": 128,
+        "global_views": 2,
+        "local_views": 8,
+        "global_size": 224,
+        "local_size": 112,
+    }
+    base_preserved_sections = ("data", "model", "train", "dino", "probe", "fino")
+    registered_project_leaves = {"name", "recipe_id", "output_dir"}
+    for config, history_enabled in ((route, False), (centroid, True)):
+        assert set(config) == set(base)
+        for section in base_preserved_sections:
+            assert config[section] == base[section]
+        assert {
+            key: value for key, value in config["project"].items()
+            if key not in registered_project_leaves
+        } == {
+            key: value for key, value in base["project"].items()
+            if key not in registered_project_leaves
+        }
+        assert config["molcap"] == {
+            **expected_molcap,
+            "history": {"enabled": history_enabled, **expected_history},
+        }
+        assert config["molcap"]["enabled"] is True
         assert config["train"]["seed"] == config["data"]["split_seed"] == 7777
         assert config["train"]["max_train_samples"] == 1_000_000
         assert config["train"]["activation_checkpointing"] is False
+        assert {
+            key: config["train"][key] for key in expected_train_controls
+        } == {
+            key: base["train"][key] for key in expected_train_controls
+        } == expected_train_controls
         assert config["molcap"]["targets"] == "/data/$USER/nanopath/molcap_text_384.npz"
         assert config["molcap"]["target_sha256"] == "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
         assert config["molcap"]["route"] == "probe_cls_hierarchical"
@@ -63,9 +112,9 @@ def test_route_and_centroid_configs_freeze_registered_contract():
         assert config["molcap"]["ramp_len"] == 0.25
         assert config["molcap"]["diagnose"] is True
         assert {k: v for k, v in config["molcap"]["history"].items() if k != "enabled"} == expected_history
-        assert config["probe"] == route["probe"]
-        assert config["fino"] == route["fino"]
-        assert config["dino"] == route["dino"]
+        assert config["probe"] == base["probe"]
+        assert config["fino"] == base["fino"]
+        assert config["dino"] == base["dino"]
 
 
 def test_molcap_config_is_exact_frontier_plus_auxiliary():
