@@ -21,6 +21,7 @@ DINOV2_VARIANTS = {
     "dinov2_vitb14_reg": (768, 12, 12, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth"),
     "dinov2_vitg14_reg": (1536, 40, 24, 37, "swiglu", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_reg4_pretrain.pth"),
 }
+PROBE_FEATURE_BLOCKS = (4, 6, 8, 11)
 
 
 def probe_transforms():
@@ -159,19 +160,26 @@ class DinoV2ViT(nn.Module):
     # Returns the dict shape Meta's `forward_features` returns; used by train.py and probe.py.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    def forward(self, x, masks=None, checkpoint=False):
+    def forward(self, x, masks=None, checkpoint=False, feature_blocks=()):
         x = self._prepare_tokens(x, masks)
-        for blk in self.blocks:
+        selected = []
+        for i, blk in enumerate(self.blocks):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
+            if i in feature_blocks:
+                selected.append(self.norm(x)[:, 0])
         x = self.norm(x)
-        return {
+        output = {
             "x_norm_clstoken": x[:, 0],
             "x_norm_regtokens": x[:, 1 : 1 + self.registers],
             "x_norm_patchtokens": x[:, 1 + self.registers :],
         }
+        if feature_blocks:
+            assert len(selected) == len(feature_blocks)
+            output["x_norm_probe_features"] = torch.cat(selected, dim=-1)
+        return output
 
     # Probe readouts fuse intermediate normalized tokens: denser patch detail for seg,
     # and strided-depth CLS features that are less tied to the final DINO head.
@@ -196,12 +204,7 @@ class DinoV2ViT(nn.Module):
         return torch.cat([regs, dense], dim=1)
 
     def probe_features(self, x):
-        xt, feats = self._prepare_tokens(x), []
-        for i, blk in enumerate(self.blocks):
-            xt = blk(xt)
-            if i in (4, 6, 8, 11):
-                feats.append(self.norm(xt)[:, 0])
-        return torch.cat(feats, dim=-1)
+        return self(x, feature_blocks=PROBE_FEATURE_BLOCKS)["x_norm_probe_features"]
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.

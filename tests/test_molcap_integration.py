@@ -151,6 +151,25 @@ def test_routed_dataset_rejects_noncanonical_target_width(dense_identity_config)
         TCGATileDataset(dense_identity_config, is_train=True)
 
 
+def test_shared_probe_readout_matches_probe_and_independent_oracle():
+    torch.manual_seed(13)
+    model = DinoV2ViT(variant_cfg=(8, 12, 2, 2, "mlp", True, "unused", 0)).eval()
+    x = torch.randn(3, 3, 28, 28)
+    with torch.no_grad():
+        xt, expected = model._prepare_tokens(x), []
+        for i, block in enumerate(model.blocks):
+            xt = block(xt)
+            if i in (4, 6, 8, 11):
+                expected.append(model.norm(xt)[:, 0])
+        expected = torch.cat(expected, dim=-1)
+        default = model(x)
+        routed = model(x, feature_blocks=(4, 6, 8, 11))
+    assert set(default) == {"x_norm_clstoken", "x_norm_regtokens", "x_norm_patchtokens"}
+    assert routed["x_norm_probe_features"].shape == (3, 32)
+    torch.testing.assert_close(routed["x_norm_probe_features"], expected, atol=2e-5, rtol=0)
+    torch.testing.assert_close(model.probe_features(x), expected, atol=2e-5, rtol=0)
+
+
 def test_tiny_patch_route_checkpoint_and_gradient_diagnostics(tmp_path):
     torch.manual_seed(11)
     model = DinoV2ViT(variant_cfg=(8, 1, 2, 2, "mlp", True, "unused", 0))
