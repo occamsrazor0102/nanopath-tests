@@ -93,6 +93,42 @@ def dirty_restore_target():
     return bank
 
 
+def production_shaped_checkpoint_bank_with_natural_cache_drift():
+    feature_dim = 1536
+    bank = HierarchicalCentroidBank(torch.tensor([0, 0]), feature_dim, momentum=0.9)
+
+    # A valid 7,813-step EMA history: copy slide 0 at step 1 and slide 1 at
+    # step 2, then move one slide coordinate upward by one float32 ULP per step.
+    # Each EMA teacher value is solved so the registered 0.9/0.1 update reaches
+    # exactly that next float32 value. Adding half-ULP deltas to the 1.5 cache
+    # rounds away while the authoritative slide value continues to advance.
+    value = torch.tensor(0.5, dtype=torch.float32)
+    incremental_sum = torch.tensor(1.5, dtype=torch.float32)
+    positive_infinity = torch.tensor(float("inf"), dtype=torch.float32)
+    for _ in range(3, 7_814):
+        next_value = torch.nextafter(value, positive_infinity)
+        teacher_value = (next_value - 0.9 * value) / 0.1
+        assert torch.equal(0.9 * value + 0.1 * teacher_value, next_value)
+        incremental_sum += next_value - value
+        value = next_value
+
+    slide_zero = torch.zeros(feature_dim, dtype=torch.float32)
+    slide_one = torch.zeros(feature_dim, dtype=torch.float32)
+    for block_start in range(0, feature_dim, 384):
+        slide_zero[block_start] = 1.0
+        slide_one[block_start] = value
+        slide_one[block_start + 1] = torch.sqrt(1.0 - value.square())
+    bank.slide_centroids.copy_(torch.stack((slide_zero, slide_one)))
+    bank.slide_counts.copy_(torch.tensor([1, 7_812]))
+    bank.slide_tile_presentations.copy_(bank.slide_counts)
+    bank.centroid_state_step.fill_(7_813)
+    bank.patient_sums.copy_(bank.slide_centroids.sum(dim=0, keepdim=True))
+    for block_start in range(0, feature_dim, 384):
+        bank.patient_sums[0, block_start] = incremental_sum
+    bank.patient_slide_counts.fill_(2)
+    return bank
+
+
 def assert_restore_rejected_atomically(payload, *, expected_metadata=None, expected_step=2):
     bank = dirty_restore_target()
     before = snapshot_buffers(bank)
@@ -663,9 +699,61 @@ def test_export_state_has_exact_authoritative_cpu_clone_payload():
 
 def test_export_state_rejects_a_noncanonical_float_bank():
     bank = committed_state_bank().half()
+    before = snapshot_buffers(bank)
 
     with pytest.raises(AssertionError):
         bank.export_state(HISTORY_METADATA)
+
+    assert_buffers_unchanged(bank, before)
+
+
+def test_checkpoint_export_canonicalizes_derived_cache_for_exact_resume_behavior():
+    source = production_shaped_checkpoint_bank_with_natural_cache_drift()
+    metadata = {**HISTORY_METADATA, "feature_width": 1536}
+    canonical_sum = source.slide_centroids.sum(dim=0, keepdim=True)
+    before_drift = float((source.patient_sums - canonical_sum).abs().max())
+    authoritative_before = {name: getattr(source, name).clone() for name in STATE_NAMES}
+    block_view = source.slide_centroids.reshape(2, 4, 384)
+    torch.testing.assert_close(block_view.norm(dim=-1), torch.ones(2, 4))
+    teacher = hierarchical_means(
+        source.slide_centroids[1:2].clone(),
+        torch.tensor([1]),
+        source.slide_to_patient,
+    )
+    drifted_next = source.propose(teacher)
+
+    payload = source.export_state(metadata)
+    restored = HierarchicalCentroidBank(torch.tensor([0, 0]), 1536, momentum=0.9)
+    restored.restore_state(payload, metadata, expected_step=7_813)
+    uninterrupted_next = source.propose(teacher)
+    restored_next = restored.propose(teacher)
+    pre_export_next_drift = float(
+        (drifted_next.patient_centroids - restored_next.patient_centroids).abs().max()
+    )
+
+    assert before_drift == pytest.approx(0.00046563148498535156)
+    assert pre_export_next_drift > 0.0002
+    for name, expected in authoritative_before.items():
+        assert torch.equal(getattr(source, name), expected), name
+        assert torch.equal(payload[name], expected), name
+    assert torch.equal(source.patient_sums, canonical_sum)
+    assert torch.equal(source.patient_sums, restored.patient_sums)
+    assert torch.equal(source.patient_slide_counts, restored.patient_slide_counts)
+    for field in uninterrupted_next._fields:
+        assert torch.equal(
+            torch.as_tensor(getattr(uninterrupted_next, field)),
+            torch.as_tensor(getattr(restored_next, field)),
+        ), field
+
+
+def test_failed_export_metadata_validation_does_not_canonicalize_any_buffer():
+    bank = production_shaped_checkpoint_bank_with_natural_cache_drift()
+    before = snapshot_buffers(bank)
+
+    with pytest.raises(AssertionError):
+        bank.export_state(tuple(HISTORY_METADATA.items()))
+
+    assert_buffers_unchanged(bank, before)
 
 
 def test_restore_round_trip_is_bitwise_and_rebuilds_caches_for_matching_next_proposal():
@@ -693,7 +781,7 @@ def test_restore_round_trip_is_bitwise_and_rebuilds_caches_for_matching_next_pro
         assert torch.equal(getattr(expected, field), getattr(actual, field)), field
 
 
-def test_restore_next_proposal_matches_after_realistic_float_cache_drift():
+def test_export_then_restore_canonicalizes_realistic_float_cache_drift_exactly():
     generator = torch.Generator().manual_seed(41)
     mapping = torch.tensor([0, 0, 0, 1, 1, 2])
     source = HierarchicalCentroidBank(mapping, feature_dim=4, momentum=0.9)
@@ -708,7 +796,8 @@ def test_restore_next_proposal_matches_after_realistic_float_cache_drift():
     payload = source.export_state(HISTORY_METADATA)
     restored = HierarchicalCentroidBank(mapping, feature_dim=4, momentum=0.9)
     restored.restore_state(payload, HISTORY_METADATA, expected_step=20)
-    assert not torch.equal(source.patient_sums, restored.patient_sums)
+    assert torch.equal(source.patient_sums, restored.patient_sums)
+    assert torch.equal(source.patient_slide_counts, restored.patient_slide_counts)
     next_teacher = hierarchical_means(
         torch.randn(3, 4, generator=generator),
         torch.tensor([0, 3, 5]),
@@ -720,12 +809,7 @@ def test_restore_next_proposal_matches_after_realistic_float_cache_drift():
 
     assert expected.base_state_step == actual.base_state_step
     for field in expected._fields[1:]:
-        if field == "patient_centroids":
-            torch.testing.assert_close(
-                getattr(expected, field), getattr(actual, field), atol=1e-6, rtol=0
-            )
-        else:
-            assert torch.equal(getattr(expected, field), getattr(actual, field)), field
+        assert torch.equal(getattr(expected, field), getattr(actual, field)), field
 
 
 @pytest.mark.parametrize("mutation", ["missing", "unexpected", "not-dict"])

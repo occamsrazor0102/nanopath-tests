@@ -446,6 +446,25 @@ class HierarchicalCentroidBank(nn.Module):
         assert self.centroid_state_step.dtype == torch.int64
         assert self.patient_slide_counts.dtype == torch.int64
 
+    def _rebuild_patient_caches_cpu(self, slide_centroids, slide_counts):
+        assert slide_centroids.shape == self.slide_centroids.shape
+        assert slide_centroids.dtype == torch.float32
+        assert slide_counts.shape == self.slide_counts.shape
+        assert slide_counts.dtype == torch.int64
+        centroids = slide_centroids.detach().to(device="cpu", dtype=torch.float32)
+        counts = slide_counts.detach().to(device="cpu", dtype=torch.int64)
+        mapping = self.slide_to_patient.detach().to(device="cpu", dtype=torch.int64)
+        observed = counts > 0
+        observed_patients = mapping[observed]
+        patient_sums = torch.zeros(self.patient_sums.shape, dtype=torch.float32)
+        if len(observed_patients):
+            patient_sums.index_add_(0, observed_patients, centroids[observed])
+        patient_slide_counts = torch.bincount(
+            observed_patients, minlength=len(self.patient_slide_counts)
+        )
+        assert patient_slide_counts.shape == self.patient_slide_counts.shape
+        return patient_sums, patient_slide_counts
+
     # Build the exact next state without mutating any committed buffer.
     def propose(self, teacher):
         assert isinstance(teacher, Hierarchy)
@@ -597,9 +616,17 @@ class HierarchicalCentroidBank(nn.Module):
         self.patient_slide_counts.index_add_(0, patients, (~seen).long())
         self.centroid_state_step.fill_(step)
 
+    @torch.no_grad()
     def export_state(self, metadata):
         assert type(metadata) is dict
         self._assert_canonical_state_dtypes()
+        rebuilt_sums, rebuilt_counts = self._rebuild_patient_caches_cpu(
+            self.slide_centroids, self.slide_counts
+        )
+        staged_sums = rebuilt_sums.to(device=self.patient_sums.device)
+        staged_counts = rebuilt_counts.to(device=self.patient_slide_counts.device)
+        self.patient_sums.copy_(staged_sums)
+        self.patient_slide_counts.copy_(staged_counts)
         return {
             "metadata": dict(metadata),
             "slide_centroids": self.slide_centroids.detach().cpu().clone(),
@@ -650,12 +677,11 @@ class HierarchicalCentroidBank(nn.Module):
         if torch.any(~observed):
             assert torch.count_nonzero(centroids[~observed]) == 0
 
-        rebuilt_sums = torch.zeros_like(self.patient_sums)
-        rebuilt_counts = torch.zeros_like(self.patient_slide_counts)
-        patients = self.slide_to_patient[observed]
-        if len(patients):
-            rebuilt_sums.index_add_(0, patients, centroids[observed])
-            rebuilt_counts.index_add_(0, patients, torch.ones_like(patients))
+        rebuilt_sums_cpu, rebuilt_counts_cpu = self._rebuild_patient_caches_cpu(
+            centroids, counts
+        )
+        rebuilt_sums = rebuilt_sums_cpu.to(device=self.patient_sums.device)
+        rebuilt_counts = rebuilt_counts_cpu.to(device=self.patient_slide_counts.device)
         assert torch.isfinite(rebuilt_sums).all()
 
         for name in state_names:
