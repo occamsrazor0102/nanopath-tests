@@ -42,3 +42,16 @@ The S-PubMedBERT build passed every absolute gate (identity, finiteness, unit no
 The disciplined response is a **new, width-controlled pre-registration** (not a post-hoc change to this frozen gate): PCA-reduce the biomedical embedding 768→384 *before* isotropy, so (a) width parity makes the normalized-ratio gate meaningful, (b) the MolCap head shape (→384) is held constant with the MiniLM arm — making it a truer encoder-only A/B. Reducing 768→384 loses negligible signal (corrected effective rank is only ~33). Alternatively the *next* experiment is the already-approved EMA patient-centroid variant.
 
 **Failure-path hardening (this PR).** Mirrors the fork's post-run review: the artifact is written to a staging path and **published only on a full pass**; on failure staging is removed and any stale target at the fixed path is cleared (`publish_or_clear`), a `status=failed`/`published=false` report with the full gate audit is still written, and non-finite audit values serialize as strict-JSON `null` with recorded field paths (`json_safe`). Covered by `test_publish_on_pass_and_clear_on_fail`, `test_json_safe_*`, and `test_gates_reproduce_biomed_width_confounded_failure`.
+
+## Pre-registration 2: width-controlled biomedical A/B (the actual encoder test)
+
+The strict 768 arm above is aborted and **frozen** as history — this is a **new, separately pre-registered** experiment, not a post-hoc edit to it. One declared change vs. strict: **PCA-reduce the biomedical embedding 768→384 before the identical isotropy** (`reembed_molcap_targets.py target_width=384`). Rationale:
+1. **Width parity** makes the normalized-ratio gate apples-to-apples — the strict arm failed it only because `norm_rank = rank/width` halves at 2× width (predicted ratio ≈ 0.90 → passes; verified in `test_gates_width_matched_pass`).
+2. **Head-shape parity** — a 384-d target holds the `MolCapHead` output width constant with the MiniLM arm, so this is a *truer* encoder-only A/B (the strict arm also varied head capacity, a second confound).
+3. **Negligible loss** — the biomedical corrected effective rank is only ~33, so the top 384 principal dims retain essentially all signal (the run records `pca_variance_retained`; expect ≈1.0).
+
+Everything else is unchanged and still frozen: same captions/ids, same isotropy procedure + constants, all nine gates (with the width gate now checking 384), the MiniLM reproduction precondition, and the failure-path hygiene. The fork config becomes `molcap-biomed384-s7777.yaml` with `molcap.target_dim: 384`; still holds seed 7777, weight 0.03, ramp, routing, FINO, and the locked probe mapping identical to the MiniLM arm.
+
+**Decision rule is unchanged** (§Decision rule): does mean(molecular AUC, survival c-index) rise ≥0.003 while linear/kNN each decline <0.003, judged paired against `molcap-text-s7777`. This is the run that actually answers the encoder-semantics question the strict arm left inconclusive. If it too fails the primary endpoint, advance the EMA patient-centroid hypothesis.
+
+Run in the fork: `python reembed_molcap_targets.py canonical=… biomed_out=molcap_biomed384.npz report_out=… target_width=384` → confirm `status=passed`, `published=true`, `pca_variance_retained≈1.0` → tests → CPU integration → H100 smoke → locked seed-7777 probe → submit regardless of outcome.

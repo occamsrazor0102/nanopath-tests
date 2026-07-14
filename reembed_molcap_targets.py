@@ -116,6 +116,18 @@ def fit_isotropy(emb):
     return _l2((xc @ V) * scale @ V.T).astype(np.float32)
 
 
+# Width-controlled A/B: PCA-reduce a wider encoder to k dims (center -> project onto top-k principal
+# directions) BEFORE isotropy, so a 768-d biomedical encoder is width-matched to MiniLM's 384. This
+# makes the normalized-ratio gate apples-to-apples and holds the MolCap head shape (->384) constant
+# with the MiniLM arm. The effective rank (~33) is far below 384, so essentially all signal is kept.
+def pca_reduce(emb, k):
+    xc = emb.astype(np.float64) - emb.astype(np.float64).mean(0)
+    _, _, vt = np.linalg.svd(xc, full_matrices=False)
+    reduced = xc @ vt[:k].T
+    retained = float(reduced.var(0).sum() / xc.var(0).sum())
+    return reduced, retained
+
+
 # Deterministic .npz: fixed member order + fixed zip timestamps + no pickle, so byte-identical writes
 # of identical arrays hash identically (the determinism gate).
 def deterministic_savez(path, arrays):
@@ -135,7 +147,7 @@ def _sha256(path):
 # Evaluate every hard gate on the staged artifact `corrected`, returning an audit table plus the
 # verdict and first failing gate (frozen order). No exceptions: the caller writes a status report and
 # publishes the NPZ only on a full pass.
-def evaluate_gates(ids, captions, canon_ids, canon_captions, corrected, geom, tile_ids, staging_path):
+def evaluate_gates(ids, captions, canon_ids, canon_captions, corrected, geom, tile_ids, target_width, staging_path):
     missing = len(set(map(str, tile_ids.tolist())) - set(map(str, ids.tolist())))
     dtmp = staging_path + ".dtmp"
     deterministic_savez(dtmp, {"patient_ids": ids, "captions": captions, "targets": corrected})
@@ -148,7 +160,7 @@ def evaluate_gates(ids, captions, canon_ids, canon_captions, corrected, geom, ti
         ("unique_ids", len(set(ids.tolist())), CANON_ROWS, len(set(ids.tolist())) == CANON_ROWS),
         ("ids_match_canonical", "elementwise", "equal", bool(np.array_equal(ids, canon_ids))),
         ("captions_match_canonical", "elementwise", "equal", bool(np.array_equal(captions, canon_captions))),
-        ("width", int(corrected.shape[1]), BIOMED_WIDTH, corrected.shape[1] == BIOMED_WIDTH),
+        ("width", int(corrected.shape[1]), target_width, corrected.shape[1] == target_width),
         ("finite", bool(np.isfinite(corrected).all()), True, bool(np.isfinite(corrected).all())),
         ("max_unit_norm_error", geom["max_unit_norm_error"], MAX_ROWNORM_ERR, geom["max_unit_norm_error"] <= MAX_ROWNORM_ERR),
         ("deterministic_npz", deterministic, True, deterministic),
@@ -212,10 +224,14 @@ def selftest():
     d = {"patient_ids": np.array(["A", "B"]), "captions": np.array(["x", "y"]), "targets": _l2(rng.normal(size=(2, BIOMED_WIDTH))).astype(np.float32)}
     deterministic_savez("/tmp/_st1.npz", d); deterministic_savez("/tmp/_st2.npz", d)
     assert _sha256("/tmp/_st1.npz") == _sha256("/tmp/_st2.npz")
-    print("selftest OK: effective-rank/participation/off-diag-cosine, isotropy unit-norm+decorrelation, deterministic NPZ")
+    lowrank = rng.normal(size=(300, 5)) @ rng.normal(size=(5, 40))   # rank-5 signal embedded in 40-d
+    red, ret = pca_reduce(lowrank, 8)
+    assert red.shape == (300, 8) and ret > 0.999   # top-8 dims keep the rank-5 signal (width-controlled A/B)
+    print("selftest OK: effective-rank/participation/off-diag-cosine, isotropy unit-norm+decorrelation, PCA reduction, deterministic NPZ")
 
 
-def build(canonical, biomed_out, report_out, tile_ids_path=None):
+def build(canonical, biomed_out, report_out, tile_ids_path=None, target_width=BIOMED_WIDTH):
+    target_width = int(target_width)   # BIOMED_WIDTH (768) = strict A/B; 384 = width-controlled A/B
     assert _sha256(canonical) == CANON_SHA256, "canonical NPZ hash mismatch — wrong or modified source artifact"
     z = np.load(canonical, allow_pickle=False)
     order = np.argsort(z["patient_ids"].astype(str))   # canonical order: sorted by submitter_id
@@ -225,18 +241,23 @@ def build(canonical, biomed_out, report_out, tile_ids_path=None):
     # the canonical corrected targets, or caption order / isotropy drifted.
     assert np.allclose(fit_isotropy(encode(MINILM_MODEL, MINILM_REV, captions)), z["targets"][order], atol=MINILM_REPRO_ATOL), "MiniLM reproduction failed — caption order or isotropy drift"
     raw = encode(BIOMED_MODEL, BIOMED_REV, captions)
+    # Width-controlled A/B (a distinct pre-registration): PCA-reduce to target_width BEFORE isotropy so
+    # the encoder is width-matched to MiniLM. Strict mode (target_width == native) leaves raw untouched.
+    pca_retained = 1.0
+    if target_width < raw.shape[1]:
+        raw, pca_retained = pca_reduce(raw, target_width)
     corrected = fit_isotropy(raw)
     geom_raw, geom_corr = geometry(raw), geometry(corrected)
     staging = biomed_out + ".staging"
     deterministic_savez(staging, {"patient_ids": ids, "captions": captions, "targets": corrected})
-    audit, passed, first_failed = evaluate_gates(ids, captions, ids, captions, corrected, geom_corr, tile_ids, staging)
+    audit, passed, first_failed = evaluate_gates(ids, captions, ids, captions, corrected, geom_corr, tile_ids, target_width, staging)
     published, stale_cleared = publish_or_clear(passed, staging, biomed_out)
     nonfinite = []
     report = json_safe({
         "status": "passed" if passed else "failed", "published": published,
         "first_failed_gate": first_failed, "stale_target_cleared": stale_cleared,
         "artifact_sha256": _sha256(biomed_out) if published else None,
-        "canonical_sha256": CANON_SHA256,
+        "canonical_sha256": CANON_SHA256, "target_width": target_width, "pca_variance_retained": pca_retained,
         "encoders": {"minilm": {"model": MINILM_MODEL, "revision": MINILM_REV, "width": MINILM_WIDTH},
                      "biomed": {"model": BIOMED_MODEL, "revision": BIOMED_REV, "width": BIOMED_WIDTH}},
         "isotropy": {"floor_frac": ISO_FLOOR_FRAC, "power": ISO_POWER},
@@ -247,7 +268,7 @@ def build(canonical, biomed_out, report_out, tile_ids_path=None):
     }, nonfinite)
     report["nonfinite_fields"] = nonfinite
     json.dump(report, open(report_out, "w"), indent=2, sort_keys=True, allow_nan=False)
-    print(f"status={'passed' if passed else 'failed'} published={published} first_failed={first_failed}; report -> {report_out}")
+    print(f"status={'passed' if passed else 'failed'} published={published} target_width={target_width} first_failed={first_failed}; report -> {report_out}")
     sys.exit(0 if passed else 1)
 
 
@@ -256,4 +277,4 @@ if __name__ == "__main__":
     if args.get("selftest"):
         selftest()
     else:
-        build(args["canonical"], args["biomed_out"], args["report_out"], args.get("tile_ids"))
+        build(args["canonical"], args["biomed_out"], args["report_out"], args.get("tile_ids"), args.get("target_width", BIOMED_WIDTH))

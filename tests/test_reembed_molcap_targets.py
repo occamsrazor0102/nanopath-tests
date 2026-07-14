@@ -61,10 +61,11 @@ def _passing(tmp="/tmp/_gate_pass.npz"):
                 corrected=corrected, geom=geom, tile_ids=tile_ids, staging=tmp)
 
 
-def _verdict(**over):
+def _verdict(target_width=None, **over):
     a = _passing(); a.update(over)
+    tw = R.BIOMED_WIDTH if target_width is None else target_width
     _, passed, first_failed = R.evaluate_gates(a["ids"], a["captions"], a["canon_ids"], a["canon_captions"],
-                                               a["corrected"], a["geom"], a["tile_ids"], a["staging"])
+                                               a["corrected"], a["geom"], a["tile_ids"], tw, a["staging"])
     return passed, first_failed
 
 
@@ -100,6 +101,30 @@ def test_gates_reproduce_biomed_width_confounded_failure():
             "participation_ratio": 19.35, "norm_participation_ratio": 19.35 / 768}
     passed, first_failed = _verdict(geom=geom)
     assert not passed and first_failed == "norm_effrank_ratio"
+
+
+# Width-controlled A/B: the SAME biomedical absolute geometry that failed the ratio gate at width 768
+# (eff rank 33.19, participation 19.35) now PASSES once width-matched to 384 (ratio ~0.90 vs ~0.45).
+def test_gates_width_matched_pass():
+    n = R.CANON_ROWS
+    ids = np.array([f"TCGA-{i:06d}" for i in range(n)]); captions = np.array([f"cap {i}" for i in range(n)])
+    corrected = np.zeros((n, 384), np.float32); corrected[:, 0] = 1.0
+    geom = {"mean_offdiag_cosine": 0.0007, "effective_rank": 33.19, "norm_effective_rank": 33.19 / 384,
+            "participation_ratio": 19.35, "norm_participation_ratio": 19.35 / 384, "var_cv": 0.46,
+            "max_unit_norm_error": 1e-8}
+    R.deterministic_savez("/tmp/_wm.npz", {"patient_ids": ids, "captions": captions, "targets": corrected})
+    _, passed, first_failed = R.evaluate_gates(ids, captions, ids, captions, corrected, geom,
+                                               ids[:R.TILE_PATIENTS], 384, "/tmp/_wm.npz")
+    assert passed and first_failed is None
+
+
+def test_pca_reduce_shape_variance_determinism():
+    rng = np.random.default_rng(7)
+    lowrank = rng.normal(size=(400, 6)) @ rng.normal(size=(6, 64))   # rank-6 signal embedded in 64-d
+    red, ret = R.pca_reduce(lowrank, 10)
+    assert red.shape == (400, 10) and ret > 0.999                    # top-10 keeps the rank-6 signal
+    assert np.allclose(red, R.pca_reduce(lowrank, 10)[0])            # deterministic
+    assert R.pca_reduce(lowrank, 3)[1] < 0.95                        # under-reducing loses variance
 
 
 def test_publish_on_pass_and_clear_on_fail():
