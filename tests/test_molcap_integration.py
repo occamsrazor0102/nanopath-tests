@@ -26,10 +26,13 @@ from train import (
     isolated_torch_rng,
     maybe_arm_labless_autosubmit,
     molcap_head_input_dim,
+    molcap_gradient_diagnostic_summary,
     molcap_route_enabled,
     molcap_step_diagnostics,
+    new_molcap_gradient_diagnostics,
     maybe_paired_routed_molcap,
     paired_routed_molcap,
+    record_molcap_gradient_diagnostic,
     restore_molcap_history,
     restore_sample_order_prefix,
     run_centroid_ramp_gate,
@@ -525,11 +528,11 @@ def preflight_config(probe_enabled=False):
 def test_training_preflight_enforces_single_gpu_and_non_scored_short_runner_cap():
     assert training_preflight(preflight_config(), {}) == (1_000_000, False)
     assert training_preflight(
+        preflight_config(), {"NANOPATH_RUNNER_STOP_AFTER_SAMPLES": "1024"}
+    ) == (1_024, True)
+    assert training_preflight(
         preflight_config(), {"WORLD_SIZE": "1", "NANOPATH_RUNNER_STOP_AFTER_SAMPLES": "32768"}
     ) == (32_768, True)
-    assert training_preflight(
-        preflight_config(), {"NANOPATH_RUNNER_STOP_AFTER_SAMPLES": "1000"}
-    ) == (1_000, True)
     assert training_preflight(
         preflight_config(probe_enabled=True),
         {"NANOPATH_RUNNER_STOP_AFTER_SAMPLES": "1000000"},
@@ -545,6 +548,7 @@ def test_training_preflight_enforces_single_gpu_and_non_scored_short_runner_cap(
     invalid_environments = [
         {"WORLD_SIZE": "2"},
         {"NANOPATH_RUNNER_STOP_AFTER_SAMPLES": "0"},
+        {"NANOPATH_RUNNER_STOP_AFTER_SAMPLES": "1000"},
         {"NANOPATH_RUNNER_STOP_AFTER_SAMPLES": "1000001"},
         {
             "NANOPATH_RUNNER_STOP_AFTER_SAMPLES": "32768",
@@ -554,6 +558,17 @@ def test_training_preflight_enforces_single_gpu_and_non_scored_short_runner_cap(
     for environment in invalid_environments:
         with pytest.raises(AssertionError):
             training_preflight(preflight_config(), environment)
+
+    zero_batch = preflight_config()
+    zero_batch["train"]["batch_size"] = 0
+    with pytest.raises(AssertionError):
+        training_preflight(zero_batch, {})
+
+    for invalid_count in (0, 1.0, True):
+        invalid_probe = preflight_config(probe_enabled=True)
+        invalid_probe["probe"]["count"] = invalid_count
+        with pytest.raises(AssertionError):
+            training_preflight(invalid_probe, {})
 
     with pytest.raises(AssertionError):
         training_preflight(
@@ -1007,6 +1022,10 @@ def test_molcap_summary_contains_pairing_provenance_digest_and_latest_bank_state
         molcap_patient_ids=("P0",),
         molcap_slide_ids=("S0",),
     )
+    gradient_diagnostics = new_molcap_gradient_diagnostics()
+    record_molcap_gradient_diagnostic(
+        gradient_diagnostics, step=20, cosine=0.25, norm_ratio=1.5
+    )
     summary = build_molcap_summary(
         routed_result=result,
         molcap_head=head,
@@ -1019,8 +1038,7 @@ def test_molcap_summary_contains_pairing_provenance_digest_and_latest_bank_state
         sample_order_available=True,
         centroid_gate_report=None,
         centroid_gate_passed=False,
-        molcap_grad_cosine=0.25,
-        molcap_grad_norm_ratio=1.5,
+        molcap_grad_diagnostics=gradient_diagnostics,
     )
     expected_digest = hashlib.sha256(np.asarray([7, 9], dtype="<i8").tobytes()).hexdigest()
     assert summary["molcap_mapping_digest"] == "b" * 64
@@ -1033,4 +1051,43 @@ def test_molcap_summary_contains_pairing_provenance_digest_and_latest_bank_state
     assert summary["molcap_bank_state_digest"] == centroid_bank_state_digest(bank)
     assert summary["molcap_grad_cosine"] == 0.25
     assert summary["molcap_grad_norm_ratio"] == 1.5
+    assert summary["molcap_grad_diagnostic_count"] == 1
+    assert summary["molcap_grad_diagnostic_last_step"] == 20
+    assert summary["molcap_grad_cosine_last"] == 0.25
+    assert summary["molcap_grad_cosine_mean"] == 0.25
+    assert summary["molcap_grad_norm_ratio_last"] == 1.5
+    assert summary["molcap_grad_norm_ratio_mean"] == 1.5
+    json.dumps(summary, allow_nan=False)
+
+
+def test_molcap_gradient_diagnostic_summary_distinguishes_no_observation_and_aggregates():
+    diagnostics = new_molcap_gradient_diagnostics()
+
+    assert molcap_gradient_diagnostic_summary(diagnostics) == {
+        "molcap_grad_diagnostic_count": 0,
+        "molcap_grad_diagnostic_last_step": None,
+        "molcap_grad_cosine_last": None,
+        "molcap_grad_cosine_mean": None,
+        "molcap_grad_norm_ratio_last": None,
+        "molcap_grad_norm_ratio_mean": None,
+        "molcap_grad_cosine": None,
+        "molcap_grad_norm_ratio": None,
+    }
+
+    record_molcap_gradient_diagnostic(
+        diagnostics, step=20, cosine=0.25, norm_ratio=1.5
+    )
+    record_molcap_gradient_diagnostic(
+        diagnostics, step=40, cosine=-0.05, norm_ratio=0.5
+    )
+
+    summary = molcap_gradient_diagnostic_summary(diagnostics)
+    assert summary["molcap_grad_diagnostic_count"] == 2
+    assert summary["molcap_grad_diagnostic_last_step"] == 40
+    assert summary["molcap_grad_cosine_last"] == -0.05
+    assert summary["molcap_grad_cosine_mean"] == pytest.approx(0.1)
+    assert summary["molcap_grad_norm_ratio_last"] == 0.5
+    assert summary["molcap_grad_norm_ratio_mean"] == 1.0
+    assert summary["molcap_grad_cosine"] == summary["molcap_grad_cosine_last"]
+    assert summary["molcap_grad_norm_ratio"] == summary["molcap_grad_norm_ratio_last"]
     json.dumps(summary, allow_nan=False)

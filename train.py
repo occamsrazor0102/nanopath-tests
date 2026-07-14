@@ -245,12 +245,18 @@ def training_preflight(cfg, environment=None):
     environment = os.environ if environment is None else environment
     assert int(environment.get("WORLD_SIZE", "1")) == 1
     max_train_samples = int(cfg["train"]["max_train_samples"])
+    batch_size = int(cfg["train"]["batch_size"])
+    assert batch_size > 0
+    if probe_enabled(cfg):
+        probe_count = cfg["probe"]["count"]
+        assert type(probe_count) is int and probe_count >= 1
     raw_cap = environment.get("NANOPATH_RUNNER_STOP_AFTER_SAMPLES")
     if raw_cap is None:
         return max_train_samples, False
     runner_stop_after_samples = int(raw_cap)
     assert 0 < runner_stop_after_samples <= max_train_samples
     runner_cap_active = runner_stop_after_samples < max_train_samples
+    assert not runner_cap_active or runner_stop_after_samples % batch_size == 0
     assert not runner_cap_active or not probe_enabled(cfg)
     assert not runner_cap_active or not environment.get("LABLESS_AUTOSUBMIT_FILE")
     return runner_stop_after_samples, runner_cap_active
@@ -1288,6 +1294,61 @@ def restore_sample_order_prefix(checkpoint, *, routed):
     return values, available and len(values) == 8192
 
 
+def new_molcap_gradient_diagnostics():
+    return {
+        "count": 0,
+        "last_step": None,
+        "cosine_last": None,
+        "cosine_sum": 0.0,
+        "norm_ratio_last": None,
+        "norm_ratio_sum": 0.0,
+    }
+
+
+def record_molcap_gradient_diagnostic(diagnostics, *, step, cosine, norm_ratio):
+    assert type(step) is int and step >= 1
+    cosine = float(cosine)
+    norm_ratio = float(norm_ratio)
+    assert math.isfinite(cosine) and math.isfinite(norm_ratio)
+    last_step = diagnostics["last_step"]
+    assert last_step is None or step > last_step
+    diagnostics["count"] += 1
+    diagnostics["last_step"] = step
+    diagnostics["cosine_last"] = cosine
+    diagnostics["cosine_sum"] += cosine
+    diagnostics["norm_ratio_last"] = norm_ratio
+    diagnostics["norm_ratio_sum"] += norm_ratio
+
+
+def molcap_gradient_diagnostic_summary(diagnostics):
+    count = int(diagnostics["count"])
+    assert count >= 0
+    if count == 0:
+        assert diagnostics["last_step"] is None
+        cosine_last = cosine_mean = norm_ratio_last = norm_ratio_mean = None
+    else:
+        assert type(diagnostics["last_step"]) is int
+        cosine_last = float(diagnostics["cosine_last"])
+        norm_ratio_last = float(diagnostics["norm_ratio_last"])
+        cosine_mean = float(diagnostics["cosine_sum"]) / count
+        norm_ratio_mean = float(diagnostics["norm_ratio_sum"]) / count
+        assert all(
+            math.isfinite(value)
+            for value in (cosine_last, cosine_mean, norm_ratio_last, norm_ratio_mean)
+        )
+    return {
+        "molcap_grad_diagnostic_count": count,
+        "molcap_grad_diagnostic_last_step": diagnostics["last_step"],
+        "molcap_grad_cosine_last": cosine_last,
+        "molcap_grad_cosine_mean": cosine_mean,
+        "molcap_grad_norm_ratio_last": norm_ratio_last,
+        "molcap_grad_norm_ratio_mean": norm_ratio_mean,
+        # Legacy scalar names continue to mean the latest active observation.
+        "molcap_grad_cosine": cosine_last,
+        "molcap_grad_norm_ratio": norm_ratio_last,
+    }
+
+
 def build_molcap_summary(
     *,
     routed_result,
@@ -1301,13 +1362,8 @@ def build_molcap_summary(
     sample_order_available,
     centroid_gate_report,
     centroid_gate_passed,
-    molcap_grad_cosine,
-    molcap_grad_norm_ratio,
+    molcap_grad_diagnostics,
 ):
-    molcap_grad_cosine = float(molcap_grad_cosine)
-    molcap_grad_norm_ratio = float(molcap_grad_norm_ratio)
-    assert math.isfinite(molcap_grad_cosine)
-    assert math.isfinite(molcap_grad_norm_ratio)
     summary = {}
     if routed_result is not None:
         summary.update(
@@ -1337,8 +1393,7 @@ def build_molcap_summary(
             "molcap_sample_order_digest": sample_order_digest,
             "molcap_sample_order_count": sample_order_count,
             "molcap_centroid_gate_passed": centroid_gate_passed,
-            "molcap_grad_cosine": molcap_grad_cosine,
-            "molcap_grad_norm_ratio": molcap_grad_norm_ratio,
+            **molcap_gradient_diagnostic_summary(molcap_grad_diagnostics),
         }
     )
     return summary
@@ -1680,8 +1735,7 @@ def main():
     centroid_gate_path = output_dir / "molcap_centroid_ramp_gate.json"
     last_routed_result = None
     centroid_gate_boundary_proposal = None
-    last_molcap_grad_cosine = 0.0
-    last_molcap_grad_norm_ratio = 0.0
+    molcap_grad_diagnostics = new_molcap_gradient_diagnostics()
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
     local_patches = (train_cfg["local_size"] // student_backbone.patch_size) ** 2
@@ -1852,6 +1906,7 @@ def main():
                     for _, L in terms: meta_loss = meta_loss + L
         molcap = sg["x_norm_clstoken"].new_zeros(())
         grad_cosine = grad_norm_ratio = molcap
+        grad_diagnostic_active = False
         if molcap_target is not None:
             if routed_step:
                 assert routed_result is not None
@@ -1863,7 +1918,8 @@ def main():
             if diagnose and molcap_scale > 0 and molcap_present.any():
                 base = local_loss + global_loss + jepa_loss + kde + meta_loss
                 grad_cosine, grad_norm_ratio = gradient_alignment(base, molcap, student_backbone.blocks[-1].attn.qkv.weight)
-        return local_loss + global_loss, jepa_loss, kde, meta_loss, molcap, grad_cosine, grad_norm_ratio, routed_result
+                grad_diagnostic_active = True
+        return local_loss + global_loss, jepa_loss, kde, meta_loss, molcap, grad_cosine, grad_norm_ratio, grad_diagnostic_active, routed_result
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -1884,7 +1940,7 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v, _, _, _, _, routed_result = compute_losses(
+                dino_l, jepa_l, kde_v, _, _, _, _, _, routed_result = compute_losses(
                     gf,
                     lf,
                     b,
@@ -2025,7 +2081,7 @@ def main():
                     molcap_present = batch["molcap_present"].to(device, non_blocking=True) if molcap_cfg else None
                     molcap_slide_idx = batch["molcap_slide_idx"].to(device, non_blocking=True) if molcap_routed else None
                     molcap_patient_idx = batch["molcap_patient_idx"].to(device, non_blocking=True) if molcap_routed else None
-                    dino_loss_value, jepa_loss, kde, meta_loss, molcap, molcap_grad_cosine, molcap_grad_norm_ratio, routed_result = compute_losses(
+                    dino_loss_value, jepa_loss, kde, meta_loss, molcap, molcap_grad_cosine, molcap_grad_norm_ratio, molcap_grad_diagnostic_active, routed_result = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing, meta=meta, cond=cond, molcap_target=molcap_target,
                         molcap_present=molcap_present, molcap_slide_idx=molcap_slide_idx,
@@ -2071,9 +2127,13 @@ def main():
                 update_ema(student_dino_head, teacher_dino_head, m)
             if routed_result is not None:
                 last_routed_result = routed_result
-                if should_log:
-                    last_molcap_grad_cosine = float(molcap_grad_cosine)
-                    last_molcap_grad_norm_ratio = float(molcap_grad_norm_ratio)
+            if molcap_grad_diagnostic_active:
+                record_molcap_gradient_diagnostic(
+                    molcap_grad_diagnostics,
+                    step=completed_step,
+                    cosine=molcap_grad_cosine,
+                    norm_ratio=molcap_grad_norm_ratio,
+                )
             step_seconds = time.monotonic() - batch_started_at
             examples_seen += batch_size
             visible_patch_presentations += visible_now
@@ -2157,8 +2217,7 @@ def main():
                             sample_order_available=sample_order_available,
                             centroid_gate_report=centroid_gate_report,
                             centroid_gate_passed=centroid_gate_passed,
-                            molcap_grad_cosine=molcap_grad_cosine,
-                            molcap_grad_norm_ratio=molcap_grad_norm_ratio,
+                            molcap_grad_diagnostics=molcap_grad_diagnostics,
                         )
                     )
                     train_log["runner_stop_after_samples"] = runner_stop_after_samples
@@ -2242,8 +2301,7 @@ def main():
             sample_order_available=sample_order_available,
             centroid_gate_report=centroid_gate_report,
             centroid_gate_passed=centroid_gate_passed,
-            molcap_grad_cosine=last_molcap_grad_cosine,
-            molcap_grad_norm_ratio=last_molcap_grad_norm_ratio,
+            molcap_grad_diagnostics=molcap_grad_diagnostics,
         )
     # Summary is the small, stable artifact downstream scripts and humans compare across runs.
     summary = {
