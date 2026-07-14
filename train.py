@@ -296,6 +296,22 @@ def crop_major_tile_mean(features, views, batch_size):
     return features.reshape(views, batch_size, -1).float().mean(0)
 
 
+def deterministic_grouped_sum(values, group_ids, group_count):
+    assert values.ndim == 2 and values.shape[0] > 0
+    assert values.dtype == torch.float32 and torch.isfinite(values).all()
+    assert group_ids.shape == (len(values),)
+    assert group_ids.dtype == torch.int64 and group_ids.device == values.device
+    assert type(group_count) is int and group_count > 0
+    assert torch.all(group_ids >= 0) and torch.all(group_ids < group_count)
+    lengths = torch.bincount(group_ids, minlength=group_count)
+    assert lengths.shape == (group_count,) and torch.all(lengths > 0)
+    order = torch.argsort(group_ids, stable=True)
+    grouped = torch.segment_reduce(values[order], "sum", lengths=lengths, axis=0)
+    assert grouped.shape == (group_count, values.shape[-1])
+    assert grouped.dtype == values.dtype and grouped.device == values.device
+    return grouped
+
+
 # Pool tiles within slides before giving every present slide equal patient weight.
 def hierarchical_means(features, slide_ids, slide_to_patient):
     assert features.ndim == 2 and features.shape[0] > 0 and torch.isfinite(features).all()
@@ -307,13 +323,15 @@ def hierarchical_means(features, slide_ids, slide_to_patient):
     assert torch.all(slide_to_patient >= 0)
     unique_slides, tile_inverse = torch.unique(slide_ids, sorted=True, return_inverse=True)
     tile_counts = torch.bincount(tile_inverse, minlength=len(unique_slides))
-    slide_sums = features.new_zeros((len(unique_slides), features.shape[-1]), dtype=torch.float32)
-    slide_sums.index_add_(0, tile_inverse, features.float())
+    slide_sums = deterministic_grouped_sum(
+        features.float(), tile_inverse, len(unique_slides)
+    )
     slide_means = slide_sums / tile_counts[:, None]
     slide_patients = slide_to_patient[unique_slides]
     unique_patients, slide_inverse = torch.unique(slide_patients, sorted=True, return_inverse=True)
-    patient_sums = slide_means.new_zeros((len(unique_patients), slide_means.shape[-1]))
-    patient_sums.index_add_(0, slide_inverse, slide_means)
+    patient_sums = deterministic_grouped_sum(
+        slide_means, slide_inverse, len(unique_patients)
+    )
     patient_counts = torch.bincount(slide_inverse, minlength=len(unique_patients))
     return Hierarchy(
         unique_slides,
@@ -853,8 +871,9 @@ class HierarchicalCentroidBank(nn.Module):
         assert teacher.patient_means.shape == (len(patient_ids), self.slide_centroids.shape[-1])
         assert teacher.patient_means.dtype == self.slide_centroids.dtype
         assert teacher.patient_means.device == self.slide_centroids.device
-        current_sums = teacher.slide_means.new_zeros(teacher.patient_means.shape)
-        current_sums.index_add_(0, inverse, teacher.slide_means)
+        current_sums = deterministic_grouped_sum(
+            teacher.slide_means, inverse, len(patient_ids)
+        )
         current_counts = torch.bincount(inverse, minlength=len(patient_ids))
         assert torch.allclose(
             teacher.patient_means, current_sums / current_counts[:, None], atol=1e-6, rtol=0
@@ -867,11 +886,13 @@ class HierarchicalCentroidBank(nn.Module):
             self.momentum * old + (1.0 - self.momentum) * teacher_means,
             teacher_means,
         )
-        sums = self.patient_sums[patient_ids].clone()
-        counts = self.patient_slide_counts[patient_ids].clone()
         deltas = next_values - torch.where(seen[:, None], old, torch.zeros_like(old))
-        sums.index_add_(0, inverse, deltas)
-        counts.index_add_(0, inverse, (~seen).long())
+        sums = self.patient_sums[patient_ids] + deterministic_grouped_sum(
+            deltas, inverse, len(patient_ids)
+        )
+        counts = self.patient_slide_counts[patient_ids] + torch.bincount(
+            inverse[~seen], minlength=len(patient_ids)
+        )
         assert torch.all(counts > 0)
         historical_tile_fraction = (
             teacher.slide_tile_counts[seen].sum().float()
@@ -929,20 +950,19 @@ class HierarchicalCentroidBank(nn.Module):
             self.slide_tile_presentations[slide_ids]
             <= maximum_int64 - proposal.slide_tile_counts
         )
-        patient_increments = torch.zeros_like(patient_ids)
-        patient_increments.index_add_(0, inverse, (~seen).long())
+        patient_increments = torch.bincount(
+            inverse[~seen], minlength=len(patient_ids)
+        )
         assert torch.all(
             self.patient_slide_counts[patient_ids] <= maximum_int64 - patient_increments
         )
-        expected_sums = self.patient_sums[patient_ids].clone()
-        expected_counts = self.patient_slide_counts[patient_ids].clone()
-        expected_sums.index_add_(
-            0,
-            inverse,
+        expected_sums = self.patient_sums[patient_ids] + deterministic_grouped_sum(
             proposal.next_slide_centroids
             - torch.where(seen[:, None], old, torch.zeros_like(old)),
+            inverse,
+            len(patient_ids),
         )
-        expected_counts.index_add_(0, inverse, (~seen).long())
+        expected_counts = self.patient_slide_counts[patient_ids] + patient_increments
         assert torch.all(expected_counts > 0)
         assert torch.allclose(
             proposal.patient_centroids,
@@ -970,13 +990,8 @@ class HierarchicalCentroidBank(nn.Module):
         self.slide_centroids[slide_ids] = proposal.next_slide_centroids
         self.slide_counts[slide_ids] += 1
         self.slide_tile_presentations[slide_ids] += proposal.slide_tile_counts
-        self.patient_sums.index_add_(
-            0,
-            patients,
-            proposal.next_slide_centroids
-            - torch.where(seen[:, None], old, torch.zeros_like(old)),
-        )
-        self.patient_slide_counts.index_add_(0, patients, (~seen).long())
+        self.patient_sums[patient_ids] = expected_sums
+        self.patient_slide_counts[patient_ids] = expected_counts
         self.centroid_state_step.fill_(step)
 
     @torch.no_grad()

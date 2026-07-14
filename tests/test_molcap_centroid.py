@@ -16,6 +16,7 @@ from train import (
     centroid_audit,
     centroid_geometry,
     crop_major_tile_mean,
+    deterministic_grouped_sum,
     hierarchical_means,
     patient_targets_from_tiles,
     require_centroid_gate,
@@ -32,6 +33,119 @@ def assert_buffers_unchanged(module, expected):
     assert actual.keys() == expected.keys()
     for name, value in expected.items():
         assert torch.equal(actual[name], value), name
+
+
+def test_deterministic_grouped_sum_preserves_values_output_order_and_gradients():
+    values = torch.tensor(
+        [
+            [7.0, 11.0],
+            [1.0, 2.0],
+            [5.0, 8.0],
+            [3.0, 4.0],
+            [13.0, 17.0],
+            [19.0, 23.0],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    groups = torch.tensor([2, 0, 1, 0, 2, 1], dtype=torch.int64)
+    expected = torch.tensor(
+        [[4.0, 6.0], [24.0, 31.0], [20.0, 28.0]], dtype=torch.float32
+    )
+
+    actual = deterministic_grouped_sum(values, groups, group_count=3)
+    permutation = torch.tensor([5, 3, 0, 2, 1, 4])
+    permuted = deterministic_grouped_sum(
+        values.detach()[permutation], groups[permutation], group_count=3
+    )
+
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
+    assert torch.equal(permuted, expected)
+    weights = torch.tensor([[2.0, 3.0], [5.0, 7.0], [11.0, 13.0]])
+    (actual * weights).sum().backward()
+    assert torch.equal(values.grad, weights[groups])
+
+
+def test_deterministic_grouped_sum_rejects_missing_groups():
+    with pytest.raises(AssertionError):
+        deterministic_grouped_sum(
+            torch.ones(2, 3), torch.tensor([0, 2]), group_count=3
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_production_shaped_cuda_centroid_commits_are_deterministic_and_match_cpu_oracle():
+    device = torch.device("cuda")
+    batch_size, views, feature_dim = 128, 2, 1536
+    slide_to_patient = torch.cat(
+        (
+            torch.tensor([0, 0, 1, 1], device=device),
+            torch.arange(2, 126, device=device),
+        )
+    ).long()
+    slide_ids = torch.arange(batch_size, device=device)
+    generator = torch.Generator(device=device).manual_seed(7777)
+    crop_major_steps = [
+        2.0
+        * torch.randn(
+            views, batch_size, feature_dim, generator=generator, device=device
+        )
+        for _ in range(2)
+    ]
+    for crop_major in crop_major_steps:
+        crop_major.requires_grad_()
+
+    def run_two_steps(*, backward=False):
+        bank = HierarchicalCentroidBank(
+            slide_to_patient, feature_dim=feature_dim, momentum=0.9
+        )
+        for step, crop_major in enumerate(crop_major_steps, start=1):
+            tile_means = crop_major_tile_mean(
+                crop_major.flatten(0, 1), views, batch_size
+            )
+            teacher = hierarchical_means(tile_means, slide_ids, slide_to_patient)
+            bank.commit(bank.propose(teacher), step=step)
+            if backward and step == 2:
+                teacher.patient_means.square().sum().backward()
+        return bank
+
+    deterministic_before = torch.are_deterministic_algorithms_enabled()
+    warn_only_before = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        first = run_two_steps(backward=True)
+        second = run_two_steps()
+    finally:
+        torch.use_deterministic_algorithms(
+            deterministic_before, warn_only=warn_only_before
+        )
+
+    for name in (
+        "slide_centroids",
+        "slide_counts",
+        "slide_tile_presentations",
+        "centroid_state_step",
+        "patient_sums",
+        "patient_slide_counts",
+    ):
+        assert torch.equal(getattr(first, name), getattr(second, name)), name
+    assert first.centroid_state_step.item() == 2
+    assert crop_major_steps[1].grad is not None
+    assert torch.isfinite(crop_major_steps[1].grad).all()
+    assert crop_major_steps[1].grad.norm() > 0
+
+    oracle_sums = torch.zeros(126, feature_dim, dtype=torch.float64)
+    oracle_counts = torch.zeros(126, dtype=torch.int64)
+    centroids = first.slide_centroids.detach().cpu().double()
+    mapping = slide_to_patient.cpu()
+    for slide_id, patient_id in enumerate(mapping.tolist()):
+        oracle_sums[patient_id] += centroids[slide_id]
+        oracle_counts[patient_id] += 1
+    torch.testing.assert_close(
+        first.patient_sums.detach().cpu().double(), oracle_sums, rtol=0, atol=2e-5
+    )
+    assert torch.equal(first.patient_slide_counts.cpu(), oracle_counts)
 
 
 def initial_teacher(*, requires_grad=False):
