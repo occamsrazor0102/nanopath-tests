@@ -1688,10 +1688,6 @@ def run_centroid_ramp_gate(
                 "passed": False,
                 "failures": ["unknown_gate_version"],
                 "failure": failure,
-                "persistence": {
-                    "strategy": "atomic_temp_flush_fsync_replace_parent_fsync",
-                    "durable_before_return": True,
-                },
             }
             _write_matched_latest_gate_report(report, report_path)
             raise AssertionError(failure)
@@ -1712,11 +1708,7 @@ def run_centroid_ramp_gate(
             boundary_shadow_proposal=boundary_shadow_proposal,
         )
         report = evaluate_matched_latest_gate(audit, history_cfg)
-        report["persistence"] = {
-            "strategy": "atomic_temp_flush_fsync_replace_parent_fsync",
-            "durable_before_return": True,
-        }
-        _write_matched_latest_gate_report(report, report_path)
+        report = _write_matched_latest_gate_report(report, report_path)
         if not report["passed"]:
             raise AssertionError(
                 "matched_latest_v1 gate failures: " + ", ".join(report["failures"])

@@ -5,47 +5,76 @@ import hashlib
 import json
 import math
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 
-# Measure sample-covariance geometry deterministically on CPU in float64.
-def centroid_spectral_geometry(patient_centroids):
+def _centroid_spectral_geometry_with_availability(patient_centroids):
     assert isinstance(patient_centroids, torch.Tensor)
     x = patient_centroids.detach().to(device="cpu", dtype=torch.float64)
-    assert x.ndim == 2 and x.shape[0] >= 2 and torch.isfinite(x).all()
+    null = _null_centroid_spectral_geometry()
+    if x.ndim != 2 or x.shape[0] < 2:
+        return null, ["geometry:insufficient_population"]
+    if not bool(torch.isfinite(x).all()):
+        return null, ["geometry:nonfinite"]
     norms = x.norm(dim=1)
-    assert torch.all(norms > 0)
     centered = x - x.mean(dim=0, keepdim=True)
     covariance = centered.T @ centered / (x.shape[0] - 1)
     spectrum = torch.linalg.eigvalsh(covariance).clamp_min(0).flip(0)
     total = spectrum.sum()
-    assert total > 0
-    probabilities = spectrum[spectrum > 0] / total
-    unit = x / norms[:, None]
-    return {
-        "compute_device": str(x.device),
-        "compute_dtype": str(x.dtype),
-        "trace": float(centered.square().sum().item() / (x.shape[0] - 1)),
-        "spectrum": spectrum.tolist(),
-        "effective_rank": float(
+    trace = float(centered.square().sum().item() / (x.shape[0] - 1))
+    unavailable = []
+    if bool(total > 0):
+        probabilities = spectrum[spectrum > 0] / total
+        effective_rank = float(
             torch.exp(-(probabilities * probabilities.log()).sum()).item()
-        ),
-        "participation_ratio": float(
-            (total.square() / spectrum.square().sum()).item()
-        ),
-        "mean_offdiag_cosine": float(
+        )
+        participation = total.square() / spectrum.square().sum()
+        if not bool(torch.isfinite(participation)):
+            participation = 1.0 / probabilities.square().sum()
+        participation_ratio = float(participation.item())
+    else:
+        effective_rank = None
+        participation_ratio = None
+        unavailable.extend(
+            (
+                "diagnostic:effective_rank:zero_trace",
+                "diagnostic:participation_ratio:zero_trace",
+            )
+        )
+    if bool(torch.all(norms > 0)):
+        unit = x / norms[:, None]
+        mean_offdiag_cosine = float(
             (
                 (unit.sum(dim=0).square().sum() - x.shape[0])
                 / (x.shape[0] * (x.shape[0] - 1))
             ).item()
-        ),
+        )
+    else:
+        mean_offdiag_cosine = None
+        unavailable.append("diagnostic:mean_offdiag_cosine:zero_norm")
+    geometry = {
+        "compute_device": str(x.device),
+        "compute_dtype": str(x.dtype),
+        "trace": trace,
+        "spectrum": spectrum.tolist(),
+        "effective_rank": effective_rank,
+        "participation_ratio": participation_ratio,
+        "mean_offdiag_cosine": mean_offdiag_cosine,
         "min_norm": float(norms.min().item()),
     }
+    return geometry, unavailable
 
 
-def relative_centroid_geometry(
+# Measure sample-covariance geometry deterministically on CPU in float64.
+def centroid_spectral_geometry(patient_centroids):
+    geometry, _ = _centroid_spectral_geometry_with_availability(patient_centroids)
+    return geometry
+
+
+def _relative_centroid_geometry_with_availability(
     ema_centroids, latest_centroids, *, ema_geometry=None, latest_geometry=None
 ):
     assert isinstance(ema_centroids, torch.Tensor)
@@ -57,9 +86,6 @@ def relative_centroid_geometry(
     ema0 = ema - ema.mean(dim=0, keepdim=True)
     latest0 = latest - latest.mean(dim=0, keepdim=True)
     ema_norm, latest_norm = ema0.norm(), latest0.norm()
-    assert ema_norm > 0 and latest_norm > 0
-    cross = ema0.T @ latest0
-    ema_gram, latest_gram = ema0.T @ ema0, latest0.T @ latest0
     ema_geometry = (
         centroid_spectral_geometry(ema) if ema_geometry is None else ema_geometry
     )
@@ -68,33 +94,95 @@ def relative_centroid_geometry(
         if latest_geometry is None
         else latest_geometry
     )
-    return {
-        "ema": ema_geometry,
-        "latest": latest_geometry,
-        "trace_ratio": ema_geometry["trace"] / latest_geometry["trace"],
-        "effective_rank_ratio": (
+    unavailable = []
+    trace_ratio = None
+    if latest_geometry["trace"] is not None and latest_geometry["trace"] > 0:
+        trace_ratio = ema_geometry["trace"] / latest_geometry["trace"]
+    else:
+        unavailable.append("relative.trace_ratio:latest_zero_trace")
+    effective_rank_ratio = None
+    if (
+        ema_geometry["effective_rank"] is not None
+        and latest_geometry["effective_rank"] is not None
+    ):
+        effective_rank_ratio = (
             ema_geometry["effective_rank"] / latest_geometry["effective_rank"]
-        ),
-        "participation_ratio": (
+        )
+    else:
+        unavailable.append("relative.effective_rank_ratio:input_unavailable")
+    participation_ratio = None
+    if (
+        ema_geometry["participation_ratio"] is not None
+        and latest_geometry["participation_ratio"] is not None
+    ):
+        participation_ratio = (
             ema_geometry["participation_ratio"]
             / latest_geometry["participation_ratio"]
-        ),
-        "alignment": float(
+        )
+    else:
+        unavailable.append("relative.participation_ratio:input_unavailable")
+    alignment = None
+    linear_cka = None
+    if bool(ema_norm > 0 and latest_norm > 0):
+        alignment = float(
             ((ema0 * latest0).sum() / (ema_norm * latest_norm)).item()
-        ),
-        "linear_cka": float(
+        )
+        ema_scaled = ema0 / ema0.abs().max()
+        latest_scaled = latest0 / latest0.abs().max()
+        cross = ema_scaled.T @ latest_scaled
+        ema_gram = ema_scaled.T @ ema_scaled
+        latest_gram = latest_scaled.T @ latest_scaled
+        linear_cka = float(
             (
                 cross.square().sum()
                 / torch.sqrt(
                     ema_gram.square().sum() * latest_gram.square().sum()
                 )
             ).item()
-        ),
-        "mean_offdiag_cosine_delta": (
+        )
+    else:
+        unavailable.extend(
+            (
+                "relative.alignment:zero_centered_norm",
+                "diagnostic:relative.linear_cka:zero_centered_norm",
+            )
+        )
+    raw_cosine_delta = None
+    if (
+        ema_geometry["mean_offdiag_cosine"] is not None
+        and latest_geometry["mean_offdiag_cosine"] is not None
+    ):
+        raw_cosine_delta = (
             ema_geometry["mean_offdiag_cosine"]
             - latest_geometry["mean_offdiag_cosine"]
-        ),
+        )
+    else:
+        unavailable.append(
+            "diagnostic:relative.mean_offdiag_cosine_delta:input_unavailable"
+        )
+    geometry = {
+        "ema": ema_geometry,
+        "latest": latest_geometry,
+        "trace_ratio": trace_ratio,
+        "effective_rank_ratio": effective_rank_ratio,
+        "participation_ratio": participation_ratio,
+        "alignment": alignment,
+        "linear_cka": linear_cka,
+        "mean_offdiag_cosine_delta": raw_cosine_delta,
     }
+    return geometry, unavailable
+
+
+def relative_centroid_geometry(
+    ema_centroids, latest_centroids, *, ema_geometry=None, latest_geometry=None
+):
+    geometry, _ = _relative_centroid_geometry_with_availability(
+        ema_centroids,
+        latest_centroids,
+        ema_geometry=ema_geometry,
+        latest_geometry=latest_geometry,
+    )
+    return geometry
 
 
 def matched_latest_permutation_seed(target_sha256, mapping_digest):
@@ -217,7 +305,7 @@ def _boundary_teacher_drift(bank, boundary_proposal):
     }
 
 
-def _boundary_shadow_provenance(bank, boundary_proposal):
+def _boundary_proposal_provenance(bank, boundary_proposal):
     state_step = int(bank.centroid_state_step.item())
     if boundary_proposal is None:
         return {
@@ -261,7 +349,7 @@ def _boundary_shadow_provenance(bank, boundary_proposal):
     }
 
 
-def _missing_boundary_shadow_provenance(boundary_proposal):
+def _missing_boundary_proposal_provenance(boundary_proposal):
     return {
         "present": boundary_proposal is not None,
         "committed_match": False if boundary_proposal is not None else None,
@@ -340,19 +428,23 @@ def _null_centroid_spectral_geometry():
 
 
 def _nullable_centroid_spectral_geometry(patient_centroids):
-    x = patient_centroids.detach().to(device="cpu", dtype=torch.float64)
-    reason = None
-    if x.ndim != 2 or x.shape[0] < 2:
-        reason = "insufficient_population"
-    elif not bool(torch.isfinite(x).all()):
-        reason = "nonfinite"
-    elif not bool(torch.all(x.norm(dim=1) > 0)):
-        reason = "zero_norm"
-    elif not bool((x - x.mean(dim=0, keepdim=True)).square().sum() > 0):
-        reason = "zero_trace"
-    if reason is None:
-        return centroid_spectral_geometry(x), None
-    return _null_centroid_spectral_geometry(), reason
+    return _centroid_spectral_geometry_with_availability(patient_centroids)
+
+
+def _prefix_geometry_unavailable(bank_name, reasons):
+    prefixed = []
+    for reason in reasons:
+        if reason.startswith("diagnostic:"):
+            prefixed.append(
+                f"diagnostic:{bank_name}.{reason.removeprefix('diagnostic:')}"
+            )
+        elif reason.startswith("geometry:"):
+            prefixed.append(
+                f"{bank_name}_geometry:{reason.removeprefix('geometry:')}"
+            )
+        else:
+            prefixed.append(f"{bank_name}.{reason}")
+    return prefixed
 
 
 def _unavailable_permutation_audit(
@@ -376,8 +468,33 @@ def _unavailable_permutation_audit(
     }
 
 
+def _legacy_geometry_projection(geometry, patient_count):
+    if geometry is None:
+        return {
+            "patient_count": patient_count,
+            "min_norm": None,
+            "effective_rank": None,
+            "participation_ratio": None,
+            "mean_offdiag_cosine": None,
+        }
+    return {
+        "patient_count": patient_count,
+        "min_norm": geometry["min_norm"],
+        "effective_rank": geometry["effective_rank"],
+        "participation_ratio": geometry["participation_ratio"],
+        "mean_offdiag_cosine": geometry["mean_offdiag_cosine"],
+    }
+
+
 def _unavailable_relative_legacy_diagnostics(
-    bank, min_slide_updates, observed_ids, mature_ids, boundary_proposal
+    bank,
+    min_slide_updates,
+    observed_ids,
+    mature_ids,
+    boundary_proposal,
+    *,
+    observed_geometry=None,
+    mature_geometry=None,
 ):
     counts = bank.slide_counts.detach().cpu()
     mapping = bank.slide_to_patient.detach().cpu()
@@ -386,19 +503,16 @@ def _unavailable_relative_legacy_diagnostics(
         mapping[observed_slides], minlength=len(bank.patient_slide_counts)
     )
     observed_per_patient = observed_per_patient[observed_per_patient > 0]
-    null_geometry = lambda patient_count: {
-        "patient_count": patient_count,
-        "min_norm": None,
-        "effective_rank": None,
-        "participation_ratio": None,
-        "mean_offdiag_cosine": None,
-    }
     return {
         "sample_weighted_mature_coverage": bank.sample_weighted_mature_coverage(
             min_slide_updates
         ),
-        "all_observed": null_geometry(int(len(observed_ids))),
-        "mature_only": null_geometry(int(len(mature_ids))),
+        "all_observed": _legacy_geometry_projection(
+            observed_geometry, int(len(observed_ids))
+        ),
+        "mature_only": _legacy_geometry_projection(
+            mature_geometry, int(len(mature_ids))
+        ),
         "population_sizes": {
             "mature_min_slide_updates": min_slide_updates,
             "observed_slides": int(observed_slides.sum().item()),
@@ -441,19 +555,31 @@ def _missing_latest_centroid_audit(
 ):
     min_slide_updates = 2
     ema_ids, ema_matrix = ema_bank.patient_centroids(1)
-    ema_mature_ids, _ = ema_bank.patient_centroids(min_slide_updates)
+    ema_mature_ids, ema_mature = ema_bank.patient_centroids(min_slide_updates)
     ema_geometry, ema_unavailable = _nullable_centroid_spectral_geometry(ema_matrix)
-    legacy = (
-        legacy_audit(ema_bank, min_slide_updates, boundary_proposal)
-        if ema_unavailable is None
-        else _unavailable_relative_legacy_diagnostics(
+    ema_boundary = _boundary_proposal_provenance(ema_bank, boundary_proposal)
+    shadow_boundary = _missing_boundary_proposal_provenance(
+        boundary_shadow_proposal
+    )
+    safe_boundary_proposal = (
+        boundary_proposal if ema_boundary["committed_match"] is True else None
+    )
+    ema_hard_unavailable = any(
+        not reason.startswith("diagnostic:") for reason in ema_unavailable
+    )
+    if ema_unavailable:
+        ema_mature_geometry, _ = _nullable_centroid_spectral_geometry(ema_mature)
+        legacy = _unavailable_relative_legacy_diagnostics(
             ema_bank,
             min_slide_updates,
             ema_ids,
             ema_mature_ids,
-            boundary_proposal,
+            safe_boundary_proposal,
+            observed_geometry=ema_geometry,
+            mature_geometry=ema_mature_geometry,
         )
-    )
+    else:
+        legacy = legacy_audit(ema_bank, min_slide_updates, safe_boundary_proposal)
     ema_counts = ema_bank.slide_counts.detach().cpu()
     null_geometry = _null_centroid_spectral_geometry()
     null_relative = {
@@ -500,6 +626,12 @@ def _missing_latest_centroid_audit(
                     "matrix_shapes_equal",
                 )
             },
+            "boundary_proposals": {
+                "presence_equal": ema_boundary["present"]
+                == shadow_boundary["present"],
+                "ema": ema_boundary,
+                "shadow": shadow_boundary,
+            },
             "ema": {
                 "momentum": ema_bank.momentum,
                 "state_step": int(ema_bank.centroid_state_step.item()),
@@ -537,17 +669,15 @@ def _missing_latest_centroid_audit(
             "state_step": None,
             "bank_state_digest": None,
             "post_pass_action": "none",
-            "boundary_proposal": _missing_boundary_shadow_provenance(
-                boundary_shadow_proposal
-            ),
+            "boundary_proposal": shadow_boundary,
         },
         "unavailable": [
             "latest_shadow",
-            *([f"ema_geometry:{ema_unavailable}"] if ema_unavailable else []),
+            *_prefix_geometry_unavailable("ema", ema_unavailable),
             "latest_geometry:missing_shadow",
             "relative_geometry",
             "permutation",
-            *(["legacy_diagnostics"] if ema_unavailable else []),
+            *(["legacy_diagnostics"] if ema_hard_unavailable else []),
         ],
     }
 
@@ -620,35 +750,46 @@ def matched_latest_centroid_audit(
     latest_geometry, latest_unavailable = _nullable_centroid_spectral_geometry(
         latest_matrix
     )
-    unavailable = []
-    if ema_unavailable is not None:
-        unavailable.append(f"ema_geometry:{ema_unavailable}")
-    if latest_unavailable is not None:
-        unavailable.append(f"latest_geometry:{latest_unavailable}")
-    relative_available = (
-        ema_unavailable is latest_unavailable is None
+    unavailable = [
+        *_prefix_geometry_unavailable("ema", ema_unavailable),
+        *_prefix_geometry_unavailable("latest", latest_unavailable),
+    ]
+    relative_inputs_available = (
+        ema_geometry["trace"] is not None
+        and latest_geometry["trace"] is not None
         and matches["matrix_shapes_equal"]
         and matches["patient_ids_equal"]
     )
-    if relative_available:
-        relative_geometry = relative_centroid_geometry(
-            ema_matrix,
-            latest_matrix,
-            ema_geometry=ema_geometry,
-            latest_geometry=latest_geometry,
+    if relative_inputs_available:
+        relative_geometry, relative_unavailable = (
+            _relative_centroid_geometry_with_availability(
+                ema_matrix,
+                latest_matrix,
+                ema_geometry=ema_geometry,
+                latest_geometry=latest_geometry,
+            )
         )
         relative = {
             name: value
             for name, value in relative_geometry.items()
             if name not in ("ema", "latest")
         }
-        permutation = matched_latest_permutation_audit(
-            ema_matrix,
-            latest_matrix,
-            target_sha256,
-            mapping_digest,
-            permutation_count=256,
-        )
+        unavailable.extend(relative_unavailable)
+        ema_centered = ema_matrix - ema_matrix.mean(dim=0, keepdim=True)
+        latest_centered = latest_matrix - latest_matrix.mean(dim=0, keepdim=True)
+        if bool(ema_centered.norm() > 0 and latest_centered.norm() > 0):
+            permutation = matched_latest_permutation_audit(
+                ema_matrix,
+                latest_matrix,
+                target_sha256,
+                mapping_digest,
+                permutation_count=256,
+            )
+        else:
+            permutation = _unavailable_permutation_audit(
+                target_sha256, mapping_digest, 256
+            )
+            unavailable.append("permutation:zero_centered_norm")
     else:
         relative = {
             name: None
@@ -693,22 +834,35 @@ def matched_latest_centroid_audit(
         ),
         "world_size": world_size,
     }
-    legacy = (
-        legacy_audit(ema_bank, min_slide_updates, boundary_proposal)
-        if ema_unavailable is None
-        else _unavailable_relative_legacy_diagnostics(
+    ema_boundary_provenance = _boundary_proposal_provenance(
+        ema_bank, boundary_proposal
+    )
+    shadow_boundary_provenance = _boundary_proposal_provenance(
+        latest_bank, boundary_shadow_proposal
+    )
+    safe_boundary_proposal = (
+        boundary_proposal
+        if ema_boundary_provenance["committed_match"] is True
+        else None
+    )
+    ema_hard_unavailable = any(
+        not reason.startswith("diagnostic:") for reason in ema_unavailable
+    )
+    if ema_unavailable:
+        ema_mature_geometry, _ = _nullable_centroid_spectral_geometry(ema_mature)
+        legacy = _unavailable_relative_legacy_diagnostics(
             ema_bank,
             min_slide_updates,
             ema_ids,
             ema_mature_ids,
-            boundary_proposal,
+            safe_boundary_proposal,
+            observed_geometry=ema_geometry,
+            mature_geometry=ema_mature_geometry,
         )
-    )
-    if ema_unavailable is not None:
+    else:
+        legacy = legacy_audit(ema_bank, min_slide_updates, safe_boundary_proposal)
+    if ema_hard_unavailable:
         unavailable.append("legacy_diagnostics")
-    shadow_boundary_provenance = _boundary_shadow_provenance(
-        latest_bank, boundary_shadow_proposal
-    )
     finite_payload = {
         "legacy": legacy,
         "population": population,
@@ -716,6 +870,7 @@ def matched_latest_centroid_audit(
         "latest": latest_geometry,
         "relative": relative,
         "permutation": permutation,
+        "ema_boundary_proposal": ema_boundary_provenance,
         "shadow_boundary_proposal": shadow_boundary_provenance,
     }
     state = {
@@ -724,6 +879,12 @@ def matched_latest_centroid_audit(
         "latest_finite": bool(torch.isfinite(latest_bank.slide_centroids).all()),
         "reported_scalars_finite": _reported_scalars_finite(finite_payload),
         "matches": matches,
+        "boundary_proposals": {
+            "presence_equal": ema_boundary_provenance["present"]
+            == shadow_boundary_provenance["present"],
+            "ema": ema_boundary_provenance,
+            "shadow": shadow_boundary_provenance,
+        },
         "ema": {
             "momentum": ema_bank.momentum,
             "state_step": int(ema_bank.centroid_state_step.item()),
@@ -819,6 +980,11 @@ def evaluate_matched_latest_gate(audit, history_cfg):
     def at_most(value, threshold):
         return type(value) in (int, float) and math.isfinite(value) and value <= threshold
 
+    boundary_proposals = state.get("boundary_proposals")
+    ema_boundary = None if boundary_proposals is None else boundary_proposals["ema"]
+    shadow_boundary = (
+        None if boundary_proposals is None else boundary_proposals["shadow"]
+    )
     checks = (
         ("target_sha256_match", provenance["target_sha256_match"]),
         ("mapping_digest_match", provenance["mapping_digest_match"]),
@@ -827,10 +993,20 @@ def evaluate_matched_latest_gate(audit, history_cfg):
             audit.get("shadow", {}).get("audit_time_present", True),
         ),
         (
+            "boundary_proposal_presence_parity",
+            boundary_proposals is None or boundary_proposals["presence_equal"],
+        ),
+        (
+            "boundary_ema_proposal_committed",
+            ema_boundary is None
+            or not ema_boundary["present"]
+            or ema_boundary["committed_match"] is True,
+        ),
+        (
             "boundary_shadow_proposal_committed",
-            audit.get("shadow", {}).get("boundary_proposal") is None
-            or not audit["shadow"]["boundary_proposal"]["present"]
-            or audit["shadow"]["boundary_proposal"]["committed_match"] is True,
+            shadow_boundary is None
+            or not shadow_boundary["present"]
+            or shadow_boundary["committed_match"] is True,
         ),
         ("world_size_one", provenance["world_size"] == 1),
         ("min_slide_updates_exact", state["min_slide_updates"] == 2),
@@ -862,7 +1038,11 @@ def evaluate_matched_latest_gate(audit, history_cfg):
         ("max_permutation_p_value", at_most(permutation["p_value"], 0.01)),
     )
     failures.extend(name for name, passed in checks if not passed)
-    failures.extend(f"audit_available:{name}" for name in audit["unavailable"])
+    failures.extend(
+        f"audit_available:{name}"
+        for name in audit["unavailable"]
+        if not name.startswith("diagnostic:")
+    )
     observed = {
         "ema_mature_coverage": population["ema_mature_coverage"],
         "latest_mature_coverage": population["latest_mature_coverage"],
@@ -902,13 +1082,224 @@ def _fsync_parent_directory(directory, *, platform_name=None):
     return True
 
 
-def _write_matched_latest_gate_report(report, report_path):
+def _normalize_report_nonfinite(
+    value, path, nonfinite_paths, unsupported_paths
+):
+    if isinstance(value, torch.Tensor):
+        try:
+            value = value.detach().to(device="cpu").tolist()
+        except (RuntimeError, TypeError, ValueError):
+            unsupported_paths.append(path or "$")
+            return None
+    elif isinstance(value, np.ndarray):
+        try:
+            value = value.tolist()
+        except (TypeError, ValueError):
+            unsupported_paths.append(path or "$")
+            return None
+    if isinstance(value, np.bool_):
+        value = bool(value)
+    if isinstance(value, np.floating):
+        value = float(value)
+    elif isinstance(value, np.integer):
+        value = int(value)
+    if type(value) is float and not math.isfinite(value):
+        nonfinite_paths.append(path or "$")
+        return None
+    if isinstance(value, complex):
+        issue_paths = (
+            nonfinite_paths
+            if not (math.isfinite(value.real) and math.isfinite(value.imag))
+            else unsupported_paths
+        )
+        issue_paths.append(path or "$")
+        return None
+    if isinstance(value, dict):
+        normalized = {}
+        for index, (key, item) in enumerate(value.items()):
+            if type(key) is not str:
+                unsupported_paths.append(
+                    f"{path}.<key[{index}]>" if path else f"<key[{index}]>"
+                )
+                key = f"__unsupported_key_{index}__"
+                while key in normalized:
+                    key = f"_{key}"
+            normalized[key] = _normalize_report_nonfinite(
+                item,
+                f"{path}.{key}" if path else str(key),
+                nonfinite_paths,
+                unsupported_paths,
+            )
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_report_nonfinite(
+                item,
+                f"{path}[{index}]",
+                nonfinite_paths,
+                unsupported_paths,
+            )
+            for index, item in enumerate(value)
+        ]
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    unsupported_paths.append(path or "$")
+    return None
+
+
+def finalize_matched_latest_report(report):
+    assert type(report) is dict
+    detected_paths = []
+    detected_unsupported_paths = []
+    staged = _normalize_report_nonfinite(
+        report, "", detected_paths, detected_unsupported_paths
+    )
+    prior_paths = staged.get("nonfinite_paths", [])
+    prior_paths = prior_paths if isinstance(prior_paths, list) else []
+    nonfinite_paths = list(dict.fromkeys((*prior_paths, *detected_paths)))
+    staged["nonfinite_paths"] = nonfinite_paths
+    prior_unsupported_paths = staged.get("unsupported_paths", [])
+    prior_unsupported_paths = (
+        prior_unsupported_paths
+        if isinstance(prior_unsupported_paths, list)
+        else []
+    )
+    unsupported_paths = list(
+        dict.fromkeys((*prior_unsupported_paths, *detected_unsupported_paths))
+    )
+    if unsupported_paths:
+        staged["unsupported_paths"] = unsupported_paths
+    failures_value = staged.get("failures", [])
+    failures = list(failures_value) if isinstance(failures_value, list) else []
+    for path in nonfinite_paths:
+        failure = f"report_nonfinite:{path}"
+        if failure not in failures:
+            failures.append(failure)
+    for path in unsupported_paths:
+        failure = f"report_unserializable:{path}"
+        if failure not in failures:
+            failures.append(failure)
+    staged["failures"] = failures
+    if nonfinite_paths or unsupported_paths:
+        staged["passed"] = False
+        if type(staged.get("state")) is dict:
+            staged["state"]["reported_scalars_finite"] = False
+    json.dumps(staged, allow_nan=False)
+    return staged
+
+
+def _windows_write_through_replace(
+    source,
+    destination,
+    *,
+    move_file_ex=None,
+    get_last_error=None,
+    format_error=None,
+):
+    import ctypes
+
+    if move_file_ex is None:
+        move_file_ex = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+        move_file_ex.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+        ]
+        move_file_ex.restype = ctypes.c_int
+    source = str(Path(source).resolve())
+    destination = str(Path(destination).resolve())
+    flags = 0x00000001 | 0x00000008
+    if move_file_ex(source, destination, flags):
+        return
+    error_code = (
+        ctypes.get_last_error() if get_last_error is None else get_last_error()
+    )
+    message = (
+        ctypes.FormatError(error_code)
+        if format_error is None
+        else format_error(error_code)
+    )
+    raise OSError(error_code, message, destination)
+
+
+def _matched_latest_persistence(platform_name):
+    if platform_name == "nt":
+        strategy = "windows_movefileex_replace_existing_write_through"
+    elif platform_name == "posix":
+        strategy = "posix_temp_flush_fsync_replace_parent_fsync"
+    else:
+        raise OSError(f"unsupported durable report platform: {platform_name!r}")
+    return {"strategy": strategy, "durable_before_return": True}
+
+
+def _write_matched_latest_gate_report(
+    report,
+    report_path,
+    *,
+    platform_name=None,
+    move_file_ex=None,
+    get_last_error=None,
+    format_error=None,
+    replace_operation=None,
+):
     report_path = Path(report_path)
+    platform_name = os.name if platform_name is None else platform_name
+    report = dict(report)
+    report["persistence"] = _matched_latest_persistence(platform_name)
+    report = finalize_matched_latest_report(report)
     serialized = json.dumps(report, allow_nan=False, indent=2) + "\n"
-    temporary_path = report_path.with_name(f".{report_path.name}.tmp")
-    with temporary_path.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(serialized)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary_path, report_path)
-    _fsync_parent_directory(report_path.parent)
+    temporary_path = None
+    raw_descriptor = None
+    primary_error = None
+    try:
+        raw_descriptor, temporary_name = tempfile.mkstemp(
+            dir=report_path.parent,
+            prefix=f".{report_path.name}.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+        handle = os.fdopen(
+            raw_descriptor, "w", encoding="utf-8", newline="\n"
+        )
+        raw_descriptor = None
+        with handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if platform_name == "nt":
+            _windows_write_through_replace(
+                temporary_path,
+                report_path,
+                move_file_ex=move_file_ex,
+                get_last_error=get_last_error,
+                format_error=format_error,
+            )
+        elif platform_name == "posix":
+            replace = os.replace if replace_operation is None else replace_operation
+            replace(temporary_path, report_path)
+            _fsync_parent_directory(
+                report_path.parent, platform_name=platform_name
+            )
+        else:
+            raise OSError(
+                f"unsupported durable report platform: {platform_name!r}"
+            )
+        return report
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_error = None
+        if raw_descriptor is not None:
+            try:
+                os.close(raw_descriptor)
+            except Exception as error:
+                cleanup_error = error
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None and primary_error is None:
+            raise cleanup_error

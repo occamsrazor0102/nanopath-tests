@@ -7,6 +7,7 @@ import json
 import sys
 import types
 from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -142,6 +143,20 @@ def test_relative_centroid_geometry_reports_trace_rank_participation_and_raw_cos
     )
     assert geometry["ema"]["spectrum"] == pytest.approx([3.0, 1.0])
     assert geometry["latest"]["spectrum"] == pytest.approx([4.0, 0.75])
+
+
+def test_linear_cka_stays_finite_for_extreme_finite_subnormal_centroids():
+    pattern = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]],
+        dtype=torch.float32,
+    )
+    ema = pattern * 1.0e-41
+    latest = pattern * 2.0e-41
+
+    geometry = train_module.relative_centroid_geometry(ema, latest)
+
+    assert math.isfinite(geometry["linear_cka"])
+    assert geometry["linear_cka"] == pytest.approx(1.0, rel=1e-12, abs=1e-12)
 
 
 def test_matched_latest_permutation_seed_uses_unsigned_big_endian_digest_prefix():
@@ -646,29 +661,14 @@ def test_matched_latest_audit_uses_strict_json_nulls_when_shapes_preclude_relati
     assert "NaN" not in json_text and "Infinity" not in json_text
 
 
-@pytest.mark.parametrize(
-    ("latest_values", "reason"),
-    [
-        (
-            [[0.0, 0.0], [0.0, 1.0], [-2.0, 0.0], [0.0, -1.0]],
-            "zero_norm",
-        ),
-        (
-            [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
-            "zero_trace",
-        ),
-        (
-            [[float("nan"), 0.0], [0.0, 1.0], [-2.0, 0.0], [0.0, -1.0]],
-            "nonfinite",
-        ),
-    ],
-)
-def test_matched_latest_audit_names_hard_math_unavailability_without_nonfinite_json(
-    latest_values, reason
-):
+def test_matched_latest_audit_names_nonfinite_geometry_without_nonfinite_json():
     ema, latest = oracle_matched_banks()
     with torch.no_grad():
-        latest.slide_centroids.copy_(torch.tensor(latest_values))
+        latest.slide_centroids.copy_(
+            torch.tensor(
+                [[float("nan"), 0.0], [0.0, 1.0], [-2.0, 0.0], [0.0, -1.0]]
+            )
+        )
     target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
     mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
     metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
@@ -697,11 +697,201 @@ def test_matched_latest_audit_names_hard_math_unavailability_without_nonfinite_j
     assert all(value is None for value in audit["relative"].values())
     assert audit["permutation"]["alignments"] is None
     assert audit["unavailable"] == [
-        f"latest_geometry:{reason}",
+        "latest_geometry:nonfinite",
         "relative_geometry",
         "permutation",
     ]
     json.dumps(audit, allow_nan=False)
+
+
+def test_zero_row_preserves_every_centered_metric_and_permutation_evidence():
+    ema, latest = oracle_matched_banks()
+    with torch.no_grad():
+        latest.slide_centroids[0].zero_()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+    report = train_module.evaluate_matched_latest_gate(audit, relative_gate_config())
+
+    assert audit["latest"]["min_norm"] == 0.0
+    assert audit["latest"]["trace"] > 0.0
+    assert len(audit["latest"]["spectrum"]) == 2
+    assert audit["latest"]["effective_rank"] is not None
+    assert audit["latest"]["participation_ratio"] is not None
+    assert audit["latest"]["mean_offdiag_cosine"] is None
+    for name in (
+        "trace_ratio",
+        "effective_rank_ratio",
+        "participation_ratio",
+        "alignment",
+        "linear_cka",
+    ):
+        assert audit["relative"][name] is not None, name
+    assert audit["relative"]["mean_offdiag_cosine_delta"] is None
+    assert len(audit["permutation"]["alignments"]) == 256
+    assert audit["unavailable"] == [
+        "diagnostic:latest.mean_offdiag_cosine:zero_norm",
+        "diagnostic:relative.mean_offdiag_cosine_delta:input_unavailable",
+    ]
+    assert "latest_min_centroid_norm_strict" in report["failures"]
+    assert not any(
+        failure.startswith("audit_available:diagnostic:")
+        for failure in report["failures"]
+    )
+    json.dumps(report, allow_nan=False)
+
+
+def test_zero_row_on_ema_preserves_partial_legacy_evidence_without_hard_unavailability():
+    ema, latest = oracle_matched_banks()
+    with torch.no_grad():
+        ema.slide_centroids[0].zero_()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+    report = train_module.evaluate_matched_latest_gate(audit, relative_gate_config())
+
+    assert audit["ema"]["min_norm"] == 0.0
+    assert audit["ema"]["trace"] > 0.0
+    assert len(audit["ema"]["spectrum"]) == 2
+    assert audit["all_observed"] == {
+        "patient_count": 4,
+        "min_norm": 0.0,
+        "effective_rank": audit["ema"]["effective_rank"],
+        "participation_ratio": audit["ema"]["participation_ratio"],
+        "mean_offdiag_cosine": None,
+    }
+    assert all(
+        audit["relative"][name] is not None
+        for name in (
+            "trace_ratio",
+            "effective_rank_ratio",
+            "participation_ratio",
+            "alignment",
+            "linear_cka",
+        )
+    )
+    assert len(audit["permutation"]["alignments"]) == 256
+    assert "legacy_diagnostics" not in audit["unavailable"]
+    assert "ema_min_centroid_norm_strict" in report["failures"]
+    assert "audit_available:legacy_diagnostics" not in report["failures"]
+    json.dumps(report, allow_nan=False)
+
+
+def test_constant_nonzero_bank_preserves_zero_spectrum_trace_norm_and_other_bank():
+    ema, latest = oracle_matched_banks()
+    with torch.no_grad():
+        latest.slide_centroids.fill_(1.0)
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+    report = train_module.evaluate_matched_latest_gate(audit, relative_gate_config())
+
+    assert audit["ema"]["trace"] > 0.0
+    assert len(audit["ema"]["spectrum"]) == 2
+    assert audit["latest"]["trace"] == 0.0
+    assert audit["latest"]["spectrum"] == [0.0, 0.0]
+    assert audit["latest"]["min_norm"] == pytest.approx(math.sqrt(2.0))
+    assert audit["latest"]["effective_rank"] is None
+    assert audit["latest"]["participation_ratio"] is None
+    assert audit["latest"]["mean_offdiag_cosine"] == pytest.approx(1.0)
+    assert audit["relative"]["trace_ratio"] is None
+    assert audit["relative"]["effective_rank_ratio"] is None
+    assert audit["relative"]["participation_ratio"] is None
+    assert audit["relative"]["alignment"] is None
+    assert audit["relative"]["linear_cka"] is None
+    assert audit["relative"]["mean_offdiag_cosine_delta"] is not None
+    assert audit["permutation"]["alignments"] is None
+    assert audit["unavailable"] == [
+        "diagnostic:latest.effective_rank:zero_trace",
+        "diagnostic:latest.participation_ratio:zero_trace",
+        "relative.trace_ratio:latest_zero_trace",
+        "relative.effective_rank_ratio:input_unavailable",
+        "relative.participation_ratio:input_unavailable",
+        "relative.alignment:zero_centered_norm",
+        "diagnostic:relative.linear_cka:zero_centered_norm",
+        "permutation:zero_centered_norm",
+    ]
+    assert "latest_trace_positive" in report["failures"]
+    assert "ema_trace_positive" not in report["failures"]
+    json.dumps(report, allow_nan=False)
+
+
+def test_constant_nonzero_ema_preserves_partial_legacy_and_latest_positive_trace():
+    ema, latest = oracle_matched_banks()
+    with torch.no_grad():
+        ema.slide_centroids.fill_(1.0)
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+    report = train_module.evaluate_matched_latest_gate(audit, relative_gate_config())
+
+    assert audit["ema"]["trace"] == 0.0
+    assert audit["ema"]["spectrum"] == [0.0, 0.0]
+    assert audit["ema"]["min_norm"] == pytest.approx(math.sqrt(2.0))
+    assert audit["latest"]["trace"] > 0.0
+    assert audit["all_observed"] == {
+        "patient_count": 4,
+        "min_norm": pytest.approx(math.sqrt(2.0)),
+        "effective_rank": None,
+        "participation_ratio": None,
+        "mean_offdiag_cosine": pytest.approx(1.0),
+    }
+    assert audit["relative"]["trace_ratio"] == 0.0
+    assert audit["relative"]["effective_rank_ratio"] is None
+    assert audit["relative"]["participation_ratio"] is None
+    assert audit["relative"]["alignment"] is None
+    assert audit["relative"]["linear_cka"] is None
+    assert audit["relative"]["mean_offdiag_cosine_delta"] is not None
+    assert audit["permutation"]["alignments"] is None
+    assert "legacy_diagnostics" not in audit["unavailable"]
+    assert "ema_trace_positive" in report["failures"]
+    assert "latest_trace_positive" not in report["failures"]
+    assert "audit_available:legacy_diagnostics" not in report["failures"]
+    json.dumps(report, allow_nan=False)
 
 
 def test_matched_latest_gate_names_unavailable_null_metrics_without_short_circuiting():
@@ -750,6 +940,80 @@ def large_matched_gate_banks(*, latest_sign=1.0):
     return ema, latest
 
 
+def committed_boundary_proposal(bank):
+    slide_ids = torch.arange(len(bank.slide_centroids), dtype=torch.int64)
+    return train_module.CentroidProposal(
+        base_state_step=int(bank.centroid_state_step.item()) - 1,
+        slide_ids=slide_ids,
+        next_slide_centroids=bank.slide_centroids.detach().clone(),
+        slide_tile_counts=torch.ones_like(slide_ids),
+        patient_ids=slide_ids.clone(),
+        patient_centroids=bank.slide_centroids.detach().clone(),
+        drift_cosines=torch.ones(len(slide_ids), dtype=bank.slide_centroids.dtype),
+        historical_tile_fraction=torch.tensor(1.0),
+    )
+
+
+@pytest.mark.parametrize(
+    ("ema_case", "shadow_case", "expected_failure"),
+    [
+        ("invalid", "valid", "boundary_ema_proposal_committed"),
+        ("valid", "invalid", "boundary_shadow_proposal_committed"),
+        ("valid", "absent", "boundary_proposal_presence_parity"),
+        ("absent", "valid", "boundary_proposal_presence_parity"),
+    ],
+)
+def test_relative_runner_persists_symmetric_boundary_proposal_failures(
+    tmp_path, ema_case, shadow_case, expected_failure
+):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    choices = {
+        "valid": None,
+        "invalid": object(),
+        "absent": None,
+    }
+    choices["valid_ema"] = committed_boundary_proposal(ema)
+    choices["valid_shadow"] = committed_boundary_proposal(latest)
+    ema_proposal = choices["valid_ema"] if ema_case == "valid" else choices[ema_case]
+    shadow_proposal = (
+        choices["valid_shadow"] if shadow_case == "valid" else choices[shadow_case]
+    )
+    path = tmp_path / f"proposal-{ema_case}-{shadow_case}.json"
+
+    with pytest.raises(AssertionError, match=expected_failure):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+            boundary_proposal=ema_proposal,
+            boundary_shadow_proposal=shadow_proposal,
+        )
+
+    report = json.loads(path.read_text())
+    proposals = report["state"]["boundary_proposals"]
+    assert proposals["ema"]["present"] is (ema_case != "absent")
+    assert proposals["shadow"]["present"] is (shadow_case != "absent")
+    assert proposals["presence_equal"] is (
+        (ema_case == "absent") == (shadow_case == "absent")
+    )
+    if ema_case == "invalid":
+        assert proposals["ema"]["committed_match"] is False
+    if shadow_case == "invalid":
+        assert proposals["shadow"]["committed_match"] is False
+    assert expected_failure in report["failures"]
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
+
+
 def test_relative_runner_rejects_negative_alignment_even_when_cka_is_one_with_complete_json(
     tmp_path,
 ):
@@ -788,35 +1052,13 @@ def test_relative_runner_rejects_negative_alignment_even_when_cka_is_one_with_co
 
 
 def test_relative_runner_durably_passes_with_absolute_geometry_only_diagnostic(
-    tmp_path, monkeypatch
+    tmp_path,
 ):
     ema, latest = large_matched_gate_banks(latest_sign=1.0)
     target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
     mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
     metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
     path = tmp_path / "relative-pass.json"
-    events = []
-    original_fsync, original_replace = train_module.os.fsync, train_module.os.replace
-    original_directory_fsync = relative_gate_module._fsync_parent_directory
-
-    def observed_fsync(fd):
-        events.append("fsync")
-        return original_fsync(fd)
-
-    def observed_replace(source, destination):
-        events.append("replace")
-        return original_replace(source, destination)
-
-    def observed_directory_fsync(directory):
-        events.append("directory_fsync")
-        return original_directory_fsync(directory)
-
-    monkeypatch.setattr(train_module.os, "fsync", observed_fsync)
-    monkeypatch.setattr(train_module.os, "replace", observed_replace)
-    monkeypatch.setattr(
-        relative_gate_module, "_fsync_parent_directory", observed_directory_fsync
-    )
-
     report = train_module.run_centroid_ramp_gate(
         ema,
         relative_gate_config(),
@@ -835,11 +1077,15 @@ def test_relative_runner_durably_passes_with_absolute_geometry_only_diagnostic(
     assert report["ema"]["mean_offdiag_cosine"] > 0.95
     assert report["relative"]["alignment"] == pytest.approx(1.0)
     assert report["permutation"]["p_value"] <= 0.01
+    expected_strategy = (
+        "windows_movefileex_replace_existing_write_through"
+        if relative_gate_module.os.name == "nt"
+        else "posix_temp_flush_fsync_replace_parent_fsync"
+    )
     assert report["persistence"] == {
-        "strategy": "atomic_temp_flush_fsync_replace_parent_fsync",
+        "strategy": expected_strategy,
         "durable_before_return": True,
     }
-    assert events == ["fsync", "replace", "directory_fsync"]
     assert json.loads(path.read_text()) == report
 
 
@@ -872,6 +1118,282 @@ def test_parent_directory_fsync_opens_syncs_and_closes_posix_directory(
     assert events[1:] == [("fsync", directory_fd), ("close", directory_fd)]
 
 
+def minimal_relative_report():
+    return {
+        "gate_version": "matched_latest_v1",
+        "passed": False,
+        "failures": ["synthetic_failure"],
+    }
+
+
+def test_windows_write_through_publish_uses_replace_and_write_through_flags(
+    tmp_path,
+):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "report.json"
+    source.write_text("strict report\n")
+    calls = []
+
+    def move_file_ex(source_name, destination_name, flags):
+        calls.append((source_name, destination_name, flags))
+        relative_gate_module.os.replace(source_name, destination_name)
+        return 1
+
+    relative_gate_module._windows_write_through_replace(
+        source,
+        destination,
+        move_file_ex=move_file_ex,
+    )
+
+    assert calls == [
+        (
+            str(source.resolve()),
+            str(destination.resolve()),
+            0x00000001 | 0x00000008,
+        )
+    ]
+    assert destination.read_text() == "strict report\n"
+    assert not source.exists()
+
+
+def test_windows_writer_persists_truthful_strategy_and_cleans_native_failure_temp(
+    tmp_path, monkeypatch
+):
+    success_path = tmp_path / "windows-success.json"
+    failure_path = tmp_path / "windows-failure.json"
+    calls = []
+
+    def successful_move(source_name, destination_name, flags):
+        calls.append((Path(source_name), Path(destination_name), flags))
+        relative_gate_module.os.replace(source_name, destination_name)
+        return 1
+
+    monkeypatch.setattr(
+        relative_gate_module,
+        "_fsync_parent_directory",
+        lambda *args, **kwargs: pytest.fail(
+            "Windows publication must not claim or call parent-directory fsync"
+        ),
+    )
+
+    persisted = relative_gate_module._write_matched_latest_gate_report(
+        minimal_relative_report(),
+        success_path,
+        platform_name="nt",
+        move_file_ex=successful_move,
+    )
+
+    assert persisted["persistence"] == {
+        "strategy": "windows_movefileex_replace_existing_write_through",
+        "durable_before_return": True,
+    }
+    assert json.loads(success_path.read_text()) == persisted
+    assert calls[0][2] == 0x00000001 | 0x00000008
+
+    failed_sources = []
+
+    def failed_move(source_name, destination_name, flags):
+        failed_sources.append(Path(source_name))
+        return 0
+
+    with pytest.raises(OSError, match="Access is denied"):
+        relative_gate_module._write_matched_latest_gate_report(
+            minimal_relative_report(),
+            failure_path,
+            platform_name="nt",
+            move_file_ex=failed_move,
+            get_last_error=lambda: 5,
+            format_error=lambda code: "Access is denied",
+        )
+
+    assert len(failed_sources) == 1
+    assert not failed_sources[0].exists()
+    assert not failure_path.exists()
+
+
+def test_report_writer_sanitizes_non_deepcopyable_tensor_before_publication(tmp_path):
+    path = tmp_path / "non-deepcopyable.json"
+    nonleaf = torch.tensor(float("nan"), requires_grad=True) * 1.0
+    source = minimal_relative_report()
+    source["nested"] = {"nonleaf_tensor": nonleaf}
+
+    def successful_move(source_name, destination_name, flags):
+        relative_gate_module.os.replace(source_name, destination_name)
+        return 1
+
+    persisted = relative_gate_module._write_matched_latest_gate_report(
+        source,
+        path,
+        platform_name="nt",
+        move_file_ex=successful_move,
+    )
+
+    assert persisted["nested"]["nonleaf_tensor"] is None
+    assert "nested.nonleaf_tensor" in persisted["nonfinite_paths"]
+    assert "report_nonfinite:nested.nonleaf_tensor" in persisted["failures"]
+    assert persisted["passed"] is False
+    assert json.loads(path.read_text()) == persisted
+    assert "persistence" not in source
+    assert torch.isnan(source["nested"]["nonleaf_tensor"])
+
+
+def test_report_writer_uses_unique_same_directory_temps_and_cleans_publish_failures(
+    tmp_path,
+):
+    path = tmp_path / "report.json"
+    sources = []
+
+    class PublishFailure(RuntimeError):
+        pass
+
+    def failed_replace(source, destination):
+        sources.append(Path(source))
+        raise PublishFailure("replace failed")
+
+    for _ in range(2):
+        with pytest.raises(PublishFailure, match="replace failed"):
+            relative_gate_module._write_matched_latest_gate_report(
+                minimal_relative_report(),
+                path,
+                platform_name="posix",
+                replace_operation=failed_replace,
+            )
+
+    assert len(set(sources)) == 2
+    assert all(source.parent == tmp_path for source in sources)
+    assert all(not source.exists() for source in sources)
+    assert not path.exists()
+
+
+def test_report_writer_cleans_fsync_failure_without_masking_original_cleanup_error(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "report.json"
+    cleanup_attempts = []
+
+    class FsyncFailure(RuntimeError):
+        pass
+
+    class CleanupFailure(RuntimeError):
+        pass
+
+    original_unlink = relative_gate_module.Path.unlink
+
+    def failed_fsync(fd):
+        raise FsyncFailure("fsync failed")
+
+    def failed_cleanup(candidate, *args, **kwargs):
+        if candidate.parent == tmp_path and candidate.name.startswith(".report.json."):
+            cleanup_attempts.append(candidate)
+            raise CleanupFailure("cleanup failed")
+        return original_unlink(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(relative_gate_module.os, "fsync", failed_fsync)
+    monkeypatch.setattr(relative_gate_module.Path, "unlink", failed_cleanup)
+
+    with pytest.raises(FsyncFailure, match="fsync failed"):
+        relative_gate_module._write_matched_latest_gate_report(
+            minimal_relative_report(), path, platform_name="posix"
+        )
+
+    assert len(cleanup_attempts) == 1
+    original_unlink(cleanup_attempts[0])
+
+
+def test_report_writer_cleans_unique_temp_after_fdopen_failure(tmp_path, monkeypatch):
+    path = tmp_path / "open-failure.json"
+
+    class OpenFailure(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        relative_gate_module.os,
+        "fdopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OpenFailure("fdopen failed")),
+    )
+
+    with pytest.raises(OpenFailure, match="fdopen failed"):
+        relative_gate_module._write_matched_latest_gate_report(
+            minimal_relative_report(), path, platform_name="posix"
+        )
+
+    assert list(tmp_path.glob(".open-failure.json.*.tmp")) == []
+
+
+def test_report_writer_cleans_unique_temp_after_write_failure(tmp_path, monkeypatch):
+    path = tmp_path / "write-failure.json"
+    original_fdopen = relative_gate_module.os.fdopen
+
+    class WriteFailure(RuntimeError):
+        pass
+
+    class FailingWriteHandle:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+        def write(self, value):
+            raise WriteFailure("write failed")
+
+        def flush(self):
+            self.handle.flush()
+
+        def fileno(self):
+            return self.handle.fileno()
+
+    monkeypatch.setattr(
+        relative_gate_module.os,
+        "fdopen",
+        lambda *args, **kwargs: FailingWriteHandle(
+            original_fdopen(*args, **kwargs)
+        ),
+    )
+
+    with pytest.raises(WriteFailure, match="write failed"):
+        relative_gate_module._write_matched_latest_gate_report(
+            minimal_relative_report(), path, platform_name="posix"
+        )
+
+    assert list(tmp_path.glob(".write-failure.json.*.tmp")) == []
+
+
+def test_relative_runner_write_failure_leaves_live_shadow_state_undisposed(
+    tmp_path, monkeypatch
+):
+    ema, latest = large_matched_gate_banks()
+    before = train_module.centroid_bank_state_digest(latest)
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    def failed_write(report, report_path):
+        raise OSError("durable publish failed")
+
+    monkeypatch.setattr(
+        train_module, "_write_matched_latest_gate_report", failed_write
+    )
+
+    with pytest.raises(OSError, match="durable publish failed"):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            tmp_path / "failed.json",
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+        )
+
+    assert train_module.centroid_bank_state_digest(latest) == before
+
+
 def test_centroid_gate_unknown_explicit_version_fails_closed_with_strict_report(tmp_path):
     ema, latest = large_matched_gate_banks()
     config = relative_gate_config()
@@ -883,15 +1405,21 @@ def test_centroid_gate_unknown_explicit_version_fails_closed_with_strict_report(
             ema, config, path, latest_bank=latest
         )
 
+    expected_strategy = (
+        "windows_movefileex_replace_existing_write_through"
+        if relative_gate_module.os.name == "nt"
+        else "posix_temp_flush_fsync_replace_parent_fsync"
+    )
     assert json.loads(path.read_text()) == {
         "gate_version": "matched_latest_v2",
         "passed": False,
         "failures": ["unknown_gate_version"],
         "failure": "unknown centroid gate_version: 'matched_latest_v2'",
         "persistence": {
-            "strategy": "atomic_temp_flush_fsync_replace_parent_fsync",
+            "strategy": expected_strategy,
             "durable_before_return": True,
         },
+        "nonfinite_paths": [],
     }
 
 
@@ -1026,6 +1554,88 @@ def test_relative_runner_persists_primary_nonfinite_failure_as_null_not_nan(tmp_
         "permutation",
         "legacy_diagnostics",
     ]
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "world_size",
+    [float("nan"), torch.tensor(float("nan"))],
+    ids=("python-float", "torch-scalar"),
+)
+def test_relative_runner_normalizes_nonfinite_world_size_and_persists_named_failure(
+    tmp_path, world_size
+):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "nonfinite-world-size.json"
+
+    with pytest.raises(AssertionError, match="world_size_one"):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=world_size,
+        )
+
+    report = json.loads(path.read_text())
+    assert report["provenance"]["world_size"] is None
+    assert "provenance.world_size" in report["nonfinite_paths"]
+    assert "world_size_one" in report["failures"]
+    assert "report_nonfinite:provenance.world_size" in report["failures"]
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
+
+
+def test_completed_relative_report_recursively_nulls_nested_nonfinite_value(
+    tmp_path, monkeypatch
+):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "nested-nonfinite.json"
+    original_evaluate = train_module.evaluate_matched_latest_gate
+
+    def inject_nested_nonfinite(audit, history_cfg):
+        report = original_evaluate(audit, history_cfg)
+        report["shadow"]["synthetic_nested"] = {
+            "values": np.asarray([1.0, float("inf")])
+        }
+        return report
+
+    monkeypatch.setattr(
+        train_module, "evaluate_matched_latest_gate", inject_nested_nonfinite
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=r"report_nonfinite:shadow\.synthetic_nested\.values\[1\]",
+    ):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+        )
+
+    report = json.loads(path.read_text())
+    path_name = "shadow.synthetic_nested.values[1]"
+    assert report["shadow"]["synthetic_nested"]["values"] == [1.0, None]
+    assert path_name in report["nonfinite_paths"]
+    assert f"report_nonfinite:{path_name}" in report["failures"]
+    assert report["passed"] is False
     json.dumps(report, allow_nan=False)
 
 
