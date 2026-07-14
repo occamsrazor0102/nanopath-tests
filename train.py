@@ -9,6 +9,7 @@
 import atexit
 import contextlib
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -75,6 +76,14 @@ def load_config():
 # train locally unless the launcher passed a preauthorized token file.
 def maybe_arm_labless_autosubmit(cfg, repo_dir):
     token_path = os.environ.get("LABLESS_AUTOSUBMIT_FILE", "")
+    raw_cap = os.environ.get("NANOPATH_RUNNER_STOP_AFTER_SAMPLES")
+    runner_cap_active = (
+        raw_cap is not None
+        and int(raw_cap) < int(cfg["train"]["max_train_samples"])
+    )
+    if runner_cap_active:
+        assert not token_path
+        return ""
     eligible = (
         bool(cfg["probe"]["enabled"])
         and int(cfg["probe"]["count"]) > 0
@@ -215,6 +224,63 @@ def update_ema(student_module, teacher_module, momentum):
         bt.copy_(bs)
 
 
+def molcap_route_enabled(molcap_cfg):
+    return bool(molcap_cfg) and molcap_cfg.get("route") == "probe_cls_hierarchical"
+
+
+def molcap_head_input_dim(molcap_cfg, embed_dim):
+    assert type(embed_dim) is int and embed_dim > 0
+    if not molcap_route_enabled(molcap_cfg):
+        return embed_dim
+    feature_blocks = tuple(molcap_cfg["feature_blocks"])
+    assert feature_blocks and all(type(block) is int and block >= 0 for block in feature_blocks)
+    assert len(set(feature_blocks)) == len(feature_blocks)
+    assert int(molcap_cfg["head_hidden_dim"]) == 512
+    input_dim = int(molcap_cfg["input_dim"])
+    assert input_dim == len(feature_blocks) * embed_dim
+    return input_dim
+
+
+def training_preflight(cfg, environment=None):
+    environment = os.environ if environment is None else environment
+    assert int(environment.get("WORLD_SIZE", "1")) == 1
+    max_train_samples = int(cfg["train"]["max_train_samples"])
+    raw_cap = environment.get("NANOPATH_RUNNER_STOP_AFTER_SAMPLES")
+    if raw_cap is None:
+        return max_train_samples, False
+    runner_stop_after_samples = int(raw_cap)
+    assert 0 < runner_stop_after_samples <= max_train_samples
+    runner_cap_active = runner_stop_after_samples < max_train_samples
+    assert not runner_cap_active or not probe_enabled(cfg)
+    assert not runner_cap_active or not environment.get("LABLESS_AUTOSUBMIT_FILE")
+    return runner_stop_after_samples, runner_cap_active
+
+
+def fold_peak_gpu_memory(prior_peak_gb, interval_peak_bytes):
+    prior_peak_gb = float(prior_peak_gb)
+    interval_peak_bytes = int(interval_peak_bytes)
+    assert math.isfinite(prior_peak_gb) and prior_peak_gb >= 0
+    assert interval_peak_bytes >= 0
+    return max(prior_peak_gb, interval_peak_bytes / float(1024**3))
+
+
+@contextlib.contextmanager
+def isolated_torch_rng(seed, device):
+    assert type(seed) is int
+    device = torch.device(device)
+    cpu_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+    try:
+        torch.random.default_generator.manual_seed(seed)
+        if cuda_states is not None:
+            torch.cuda.manual_seed_all(seed)
+        yield
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
 class Hierarchy(NamedTuple):
     slide_ids: torch.Tensor
     slide_means: torch.Tensor
@@ -274,14 +340,18 @@ def patient_targets_from_tiles(targets, present, tile_patient_ids, patient_ids):
     assert torch.equal(patient_ids[inverse], tile_patient_ids)
     counts = torch.bincount(inverse, minlength=len(patient_ids))
     assert torch.all(counts > 0)
-    grouped = targets.new_zeros((len(patient_ids), targets.shape[-1]))
-    grouped.index_add_(0, inverse, targets)
-    grouped = grouped / counts[:, None]
-    assert torch.allclose(targets, grouped[inverse], atol=1e-6, rtol=0)
-    grouped_present = present.new_zeros(len(patient_ids))
-    grouped_present.index_add_(0, inverse, present)
-    grouped_present = grouped_present / counts
-    assert torch.allclose(present, grouped_present[inverse], atol=1e-6, rtol=0)
+    row_indices = torch.arange(len(targets), dtype=torch.int64, device=targets.device)
+    representative_indices = torch.full(
+        (len(patient_ids),), len(targets), dtype=torch.int64, device=targets.device
+    )
+    representative_indices.scatter_reduce_(
+        0, inverse, row_indices, reduce="amin", include_self=True
+    )
+    assert torch.all(representative_indices < len(targets))
+    grouped = targets[representative_indices]
+    grouped_present = present[representative_indices]
+    assert torch.equal(targets, grouped[inverse])
+    assert torch.equal(present, grouped_present[inverse])
     return grouped, grouped_present
 
 
@@ -289,6 +359,299 @@ def teacher_value_student_gradient(student, teacher):
     assert student.shape == teacher.shape
     assert student.dtype == teacher.dtype and student.device == teacher.device
     return teacher.detach() + (student - student.detach())
+
+
+class RoutedMolCapResult(NamedTuple):
+    loss: torch.Tensor
+    pending_history: object
+    patient_features: torch.Tensor
+    patient_targets: torch.Tensor
+    patient_present: torch.Tensor
+    student_hierarchy: Hierarchy
+    teacher_hierarchy: Hierarchy
+
+
+def paired_routed_molcap(
+    molcap_head,
+    student_probe_features,
+    teacher_probe_features,
+    tile_slide_ids,
+    tile_patient_ids,
+    slide_to_patient,
+    tile_targets,
+    tile_present,
+    *,
+    views,
+    weight,
+    scale,
+    centroid_bank=None,
+):
+    batch_size = int(tile_slide_ids.numel())
+    assert tile_slide_ids.shape == tile_patient_ids.shape == (batch_size,)
+    assert tile_slide_ids.dtype == tile_patient_ids.dtype == torch.int64
+    assert slide_to_patient.dtype == torch.int64
+    assert (
+        student_probe_features.device
+        == teacher_probe_features.device
+        == tile_slide_ids.device
+        == tile_patient_ids.device
+        == slide_to_patient.device
+        == tile_targets.device
+        == tile_present.device
+    )
+    assert torch.equal(slide_to_patient[tile_slide_ids], tile_patient_ids)
+    student_tiles = crop_major_tile_mean(student_probe_features, views, batch_size)
+    teacher_tiles = crop_major_tile_mean(teacher_probe_features, views, batch_size)
+    student_hierarchy = hierarchical_means(student_tiles, tile_slide_ids, slide_to_patient)
+    teacher_hierarchy = hierarchical_means(teacher_tiles, tile_slide_ids, slide_to_patient)
+    assert torch.equal(student_hierarchy.slide_ids, teacher_hierarchy.slide_ids)
+    assert torch.equal(student_hierarchy.patient_ids, teacher_hierarchy.patient_ids)
+    pending_history = None
+    teacher_value = teacher_hierarchy.patient_means
+    if centroid_bank is not None:
+        pending_history = centroid_bank.propose(teacher_hierarchy)
+        assert torch.equal(pending_history.patient_ids, student_hierarchy.patient_ids)
+        teacher_value = pending_history.patient_centroids
+    patient_features = teacher_value_student_gradient(
+        student_hierarchy.patient_means, teacher_value
+    )
+    patient_targets, patient_present = patient_targets_from_tiles(
+        tile_targets,
+        tile_present,
+        tile_patient_ids,
+        student_hierarchy.patient_ids,
+    )
+    assert torch.all(patient_present == 1)
+    loss = float(weight) * float(scale) * molcap_loss(
+        molcap_head,
+        patient_features,
+        patient_targets,
+        patient_present,
+        views=1,
+    )
+    return RoutedMolCapResult(
+        loss,
+        pending_history,
+        patient_features,
+        patient_targets,
+        patient_present,
+        student_hierarchy,
+        teacher_hierarchy,
+    )
+
+
+def maybe_paired_routed_molcap(
+    student_backbone,
+    global_crops,
+    teacher_probe_features,
+    molcap_head,
+    molcap_target,
+    molcap_present,
+    molcap_slide_idx,
+    molcap_patient_idx,
+    slide_to_patient,
+    *,
+    feature_blocks,
+    seed,
+    device,
+    views,
+    weight,
+    scale,
+    centroid_bank,
+):
+    if molcap_target is None:
+        assert teacher_probe_features is None
+        assert molcap_present is molcap_slide_idx is molcap_patient_idx is None
+        return None
+    assert teacher_probe_features is not None
+    assert molcap_present is not None
+    assert molcap_slide_idx is not None and molcap_patient_idx is not None
+    assert type(seed) is int
+    with isolated_torch_rng(seed, device):
+        student_output = student_backbone(
+            global_crops, feature_blocks=tuple(feature_blocks)
+        )
+    return paired_routed_molcap(
+        molcap_head,
+        student_output["x_norm_probe_features"],
+        teacher_probe_features,
+        molcap_slide_idx,
+        molcap_patient_idx,
+        slide_to_patient,
+        molcap_target,
+        molcap_present,
+        views=views,
+        weight=weight,
+        scale=scale,
+        centroid_bank=centroid_bank,
+    )
+
+
+def molcap_step_diagnostics(
+    routed_result,
+    molcap_head,
+    *,
+    centroid_bank=None,
+    min_slide_updates=2,
+    gate_report=None,
+):
+    assert isinstance(routed_result, RoutedMolCapResult)
+    assert type(min_slide_updates) is int and min_slide_updates >= 1
+    pending_history = routed_result.pending_history
+    drift = (
+        pending_history.drift_cosines.detach().float().cpu()
+        if pending_history is not None
+        else torch.empty(0)
+    )
+    drift_quantiles = (
+        torch.quantile(drift, torch.tensor([0.1, 0.5, 0.9])).tolist()
+        if drift.numel()
+        else [None, None, None]
+    )
+    parameter_energy = sum(
+        float(parameter.detach().float().square().sum().item())
+        for parameter in molcap_head.parameters()
+    )
+    with torch.no_grad():
+        caption_predictions = molcap_head(routed_result.patient_features.detach()).float()
+    diagnostics = {
+        "molcap_unique_patients": int(routed_result.student_hierarchy.patient_ids.numel()),
+        "molcap_current_slides": int(routed_result.student_hierarchy.slide_ids.numel()),
+        "molcap_target_coverage": float(routed_result.patient_present.mean().item()),
+        "molcap_readout_norm_mean": float(
+            routed_result.patient_features.detach().float().norm(dim=-1).mean().item()
+        ),
+        "molcap_head_parameter_norm": math.sqrt(parameter_energy),
+        "molcap_centroid_caption_cosine": float(
+            F.cosine_similarity(
+                caption_predictions,
+                routed_result.patient_targets.detach().float(),
+                dim=-1,
+            ).mean().item()
+        ),
+        "molcap_history_enabled": centroid_bank is not None,
+        "molcap_history_state_step": (
+            int(centroid_bank.centroid_state_step.item()) if centroid_bank is not None else 0
+        ),
+        "molcap_historical_tile_fraction": (
+            float(pending_history.historical_tile_fraction.item())
+            if pending_history is not None
+            else 0.0
+        ),
+        "molcap_nonhistorical_tile_fraction": (
+            1.0 - float(pending_history.historical_tile_fraction.item())
+            if pending_history is not None
+            else 1.0
+        ),
+        "molcap_teacher_drift_mean": float(drift.mean().item()) if drift.numel() else 1.0,
+        "molcap_teacher_drift_q10": drift_quantiles[0],
+        "molcap_teacher_drift_q50": drift_quantiles[1],
+        "molcap_teacher_drift_q90": drift_quantiles[2],
+        "molcap_observed_slides": 0,
+        "molcap_mature_slides": 0,
+        "molcap_observed_patients": 0,
+        "molcap_mature_patients": 0,
+        "molcap_observed_slides_per_patient_mean": 0.0,
+        "molcap_observed_slides_per_patient_q0": 0.0,
+        "molcap_observed_slides_per_patient_q50": 0.0,
+        "molcap_observed_slides_per_patient_q100": 0.0,
+        "molcap_sample_weighted_mature_coverage": 0.0,
+        "molcap_update_count_q0": 0.0,
+        "molcap_update_count_q25": 0.0,
+        "molcap_update_count_q50": 0.0,
+        "molcap_update_count_q75": 0.0,
+        "molcap_update_count_q100": 0.0,
+        "molcap_feature_bank_bytes": 0,
+        "molcap_bank_bytes": 0,
+        "molcap_bank_state_digest": None,
+        "molcap_current_all_observed_geometry": None,
+        "molcap_current_mature_geometry": None,
+        "molcap_gate_geometry": (
+            None
+            if gate_report is None
+            else {
+                "all_observed": gate_report["all_observed"],
+                "mature_only": gate_report["mature_only"],
+            }
+        ),
+    }
+    if centroid_bank is not None:
+        counts = centroid_bank.slide_counts.detach().cpu()
+        presentations = centroid_bank.slide_tile_presentations.detach().cpu()
+        observed = counts > 0
+        mature = counts >= min_slide_updates
+        observed_counts = counts[observed].double()
+        quantiles = (
+            torch.quantile(observed_counts, torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], dtype=torch.float64)).tolist()
+            if observed_counts.numel()
+            else [0.0] * 5
+        )
+        total_presentations = int(presentations.sum().item())
+        mature_presentations = int(presentations[mature].sum().item())
+        mapping = centroid_bank.slide_to_patient.detach().cpu()
+        observed_slides_per_patient = torch.bincount(
+            mapping[observed], minlength=len(centroid_bank.patient_slide_counts)
+        )
+        observed_slides_per_patient = observed_slides_per_patient[
+            observed_slides_per_patient > 0
+        ].double()
+        slide_quantiles = (
+            torch.quantile(
+                observed_slides_per_patient,
+                torch.tensor([0.0, 0.5, 1.0], dtype=torch.float64),
+            ).tolist()
+            if observed_slides_per_patient.numel()
+            else [0.0, 0.0, 0.0]
+        )
+        _, observed_centroids = centroid_bank.patient_centroids(1)
+        _, mature_centroids = centroid_bank.patient_centroids(min_slide_updates)
+        diagnostics.update(
+            {
+                "molcap_observed_slides": int(observed.sum().item()),
+                "molcap_mature_slides": int(mature.sum().item()),
+                "molcap_observed_patients": int(torch.unique(mapping[observed]).numel()),
+                "molcap_mature_patients": int(torch.unique(mapping[mature]).numel()),
+                "molcap_observed_slides_per_patient_mean": (
+                    float(observed_slides_per_patient.mean().item())
+                    if observed_slides_per_patient.numel()
+                    else 0.0
+                ),
+                "molcap_observed_slides_per_patient_q0": slide_quantiles[0],
+                "molcap_observed_slides_per_patient_q50": slide_quantiles[1],
+                "molcap_observed_slides_per_patient_q100": slide_quantiles[2],
+                "molcap_sample_weighted_mature_coverage": (
+                    mature_presentations / total_presentations
+                    if total_presentations
+                    else 0.0
+                ),
+                "molcap_update_count_q0": quantiles[0],
+                "molcap_update_count_q25": quantiles[1],
+                "molcap_update_count_q50": quantiles[2],
+                "molcap_update_count_q75": quantiles[3],
+                "molcap_update_count_q100": quantiles[4],
+                "molcap_feature_bank_bytes": int(
+                    centroid_bank.slide_centroids.numel()
+                    * centroid_bank.slide_centroids.element_size()
+                ),
+                "molcap_bank_bytes": int(
+                    sum(
+                        buffer.numel() * buffer.element_size()
+                        for buffer in centroid_bank.buffers()
+                    )
+                ),
+                "molcap_bank_state_digest": centroid_bank_state_digest(centroid_bank),
+                "molcap_current_all_observed_geometry": _diagnostic_centroid_geometry(
+                    observed_centroids
+                ),
+                "molcap_current_mature_geometry": _diagnostic_centroid_geometry(
+                    mature_centroids
+                ),
+            }
+        )
+    for value in diagnostics.values():
+        if type(value) is float:
+            assert math.isfinite(value)
+    return diagnostics
 
 
 # Measure raw patient-centroid geometry deterministically on CPU in float64.
@@ -690,6 +1053,28 @@ class HierarchicalCentroidBank(nn.Module):
         self.patient_slide_counts.copy_(rebuilt_counts)
 
 
+def centroid_bank_state_digest(bank):
+    assert isinstance(bank, HierarchicalCentroidBank)
+    hasher = hashlib.sha256()
+    formats = {
+        "slide_to_patient": "<i8",
+        "slide_centroids": "<f4",
+        "slide_counts": "<i8",
+        "slide_tile_presentations": "<i8",
+        "centroid_state_step": "<i8",
+    }
+    for name, dtype in formats.items():
+        tensor = getattr(bank, name)
+        array = np.asarray(tensor.detach().cpu().contiguous().numpy(), dtype=dtype)
+        hasher.update(name.encode("ascii") + b"\0")
+        hasher.update(dtype.encode("ascii") + b"\0")
+        hasher.update(len(array.shape).to_bytes(1, byteorder="little", signed=False))
+        for dimension in array.shape:
+            hasher.update(int(dimension).to_bytes(8, byteorder="little", signed=False))
+        hasher.update(array.tobytes(order="C"))
+    return hasher.hexdigest()
+
+
 def centroid_audit(bank, min_slide_updates=2):
     assert isinstance(bank, HierarchicalCentroidBank)
     assert type(min_slide_updates) is int and min_slide_updates >= 1
@@ -740,9 +1125,221 @@ def require_centroid_gate(audit, history_cfg):
     assert min_norm > thresholds["min_centroid_norm"]
 
 
+def build_molcap_history_metadata(molcap_cfg, train_ds):
+    return {
+        "version": 1,
+        "arm": "centroid",
+        "target_sha256": train_ds.molcap_target_sha256,
+        "mapping_digest": train_ds.molcap_mapping_digest,
+        "feature_blocks": tuple(molcap_cfg["feature_blocks"]),
+        "feature_width": int(molcap_cfg["input_dim"]),
+        "momentum": float(molcap_cfg["history"]["momentum"]),
+        "hierarchy": molcap_cfg["history"]["level"],
+        "ste": molcap_cfg["gradient_source"],
+        "weight": float(molcap_cfg["weight"]),
+        "ramp_start": float(molcap_cfg["ramp_start"]),
+        "ramp_len": float(molcap_cfg["ramp_len"]),
+    }
+
+
+def sample_order_prefix_digest(sample_ids, limit=8192):
+    assert type(limit) is int and limit > 0
+    hasher = hashlib.sha256()
+    count = 0
+    for raw_value in sample_ids:
+        if count == limit:
+            break
+        value = int(raw_value)
+        assert -(1 << 63) <= value < (1 << 63)
+        hasher.update(value.to_bytes(8, byteorder="little", signed=True))
+        count += 1
+    return hasher.hexdigest(), count
+
+
+def restore_sample_order_prefix(checkpoint, *, routed):
+    if not routed:
+        return [], False
+    if checkpoint is None:
+        return [], True
+    available = checkpoint.get("molcap_sample_order_available")
+    prefix = checkpoint.get("molcap_sample_order_prefix")
+    if available is None and prefix is None:
+        return [], False
+    assert type(available) is bool
+    assert isinstance(prefix, torch.Tensor)
+    assert prefix.ndim == 1 and prefix.dtype == torch.int64 and len(prefix) <= 8192
+    values = [int(value) for value in prefix.detach().cpu().tolist()]
+    return values, available and len(values) == 8192
+
+
+def build_molcap_summary(
+    *,
+    routed_result,
+    molcap_head,
+    centroid_bank,
+    molcap_cfg,
+    train_ds,
+    config_sha256,
+    git_commit,
+    sample_order_prefix,
+    sample_order_available,
+    centroid_gate_report,
+    centroid_gate_passed,
+    molcap_grad_cosine,
+    molcap_grad_norm_ratio,
+):
+    molcap_grad_cosine = float(molcap_grad_cosine)
+    molcap_grad_norm_ratio = float(molcap_grad_norm_ratio)
+    assert math.isfinite(molcap_grad_cosine)
+    assert math.isfinite(molcap_grad_norm_ratio)
+    summary = {}
+    if routed_result is not None:
+        summary.update(
+            molcap_step_diagnostics(
+                routed_result,
+                molcap_head,
+                centroid_bank=centroid_bank,
+                min_slide_updates=int(molcap_cfg["history"]["min_slide_updates"]),
+                gate_report=centroid_gate_report,
+            )
+        )
+    if sample_order_available:
+        sample_order_digest, sample_order_count = sample_order_prefix_digest(
+            sample_order_prefix
+        )
+    else:
+        sample_order_digest, sample_order_count = None, 0
+    summary.update(
+        {
+            "molcap_mapping_digest": train_ds.molcap_mapping_digest,
+            "molcap_target_sha256": train_ds.molcap_target_sha256,
+            "molcap_config_sha256": config_sha256,
+            "molcap_source_commit": git_commit,
+            "molcap_train_patients": len(train_ds.molcap_patient_ids),
+            "molcap_train_slides": len(train_ds.molcap_slide_ids),
+            "molcap_sample_order_available": sample_order_available,
+            "molcap_sample_order_digest": sample_order_digest,
+            "molcap_sample_order_count": sample_order_count,
+            "molcap_centroid_gate_passed": centroid_gate_passed,
+            "molcap_grad_cosine": molcap_grad_cosine,
+            "molcap_grad_norm_ratio": molcap_grad_norm_ratio,
+        }
+    )
+    return summary
+
+
+def checkpoint_molcap_state(
+    payload,
+    *,
+    full,
+    checkpoint_step,
+    molcap_head,
+    centroid_bank,
+    history_metadata,
+    sample_order_prefix=None,
+    sample_order_available=None,
+):
+    payload = dict(payload)
+    if not full:
+        return payload
+    if molcap_head is not None:
+        payload["molcap_head"] = {
+            name: value.detach().cpu().clone()
+            for name, value in molcap_head.state_dict().items()
+        }
+    if centroid_bank is not None:
+        assert type(checkpoint_step) is int
+        assert int(centroid_bank.centroid_state_step.item()) == checkpoint_step
+        assert type(history_metadata) is dict
+        payload["molcap_history"] = centroid_bank.export_state(history_metadata)
+    if sample_order_available is not None:
+        assert type(sample_order_available) is bool
+        prefix = [] if sample_order_prefix is None else list(sample_order_prefix)
+        assert len(prefix) <= 8192
+        payload["molcap_sample_order_available"] = sample_order_available
+        payload["molcap_sample_order_prefix"] = torch.tensor(prefix, dtype=torch.int64)
+    return payload
+
+
+def restore_molcap_history(
+    checkpoint,
+    *,
+    routed,
+    centroid_bank,
+    history_metadata,
+    checkpoint_step,
+):
+    if not routed:
+        return
+    if centroid_bank is None:
+        assert "molcap_history" not in checkpoint
+        return
+    assert "molcap_history" in checkpoint
+    assert type(history_metadata) is dict
+    centroid_bank.restore_state(
+        checkpoint["molcap_history"], history_metadata, checkpoint_step
+    )
+    assert int(centroid_bank.centroid_state_step.item()) == checkpoint_step
+
+
+def run_centroid_ramp_gate(bank, history_cfg, report_path):
+    report_path = Path(report_path)
+    audit = None
+    try:
+        audit = centroid_audit(bank, int(history_cfg["min_slide_updates"]))
+        require_centroid_gate(audit, history_cfg)
+        report = {**audit, "passed": True}
+        report_path.write_text(json.dumps(report, allow_nan=False, indent=2) + "\n")
+        return report
+    except Exception as error:
+        report = {
+            **(audit if audit is not None else {}),
+            "passed": False,
+            "failure": f"{type(error).__name__}: {error}",
+        }
+        report_path.write_text(json.dumps(report, allow_nan=False, indent=2) + "\n")
+        raise
+
+
+def transactional_optimizer_step(
+    total_loss,
+    optimizer,
+    clipped_parameters,
+    *,
+    clip_grad,
+    centroid_bank=None,
+    pending_history=None,
+    completed_step=None,
+    post_backward=None,
+):
+    assert isinstance(total_loss, torch.Tensor) and total_loss.numel() == 1
+    assert torch.isfinite(total_loss)
+    total_loss.backward()
+    if post_backward is not None:
+        post_backward()
+    optimized = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+        if parameter.grad is not None
+    ]
+    assert all(torch.isfinite(parameter.grad).all() for parameter in optimized)
+    grad_norm = nn.utils.clip_grad_norm_(clipped_parameters, clip_grad)
+    assert torch.isfinite(grad_norm)
+    optimizer.step()
+    if pending_history is not None:
+        assert centroid_bank is not None and type(completed_step) is int
+        centroid_bank.commit(pending_history, completed_step)
+        assert int(centroid_bank.centroid_state_step.item()) == completed_step
+    else:
+        assert centroid_bank is None
+    return grad_norm
+
+
 # Orchestrates one pretraining run: setup, train+probe loop, checkpoint, summary.
 def main():
     cfg = load_config()
+    runner_stop_after_samples, runner_cap_active = training_preflight(cfg)
     repo_dir = Path(__file__).resolve().parent
     labless_autosubmit_file = maybe_arm_labless_autosubmit(cfg, repo_dir)
     train_cfg = cfg["train"]
@@ -751,6 +1348,7 @@ def main():
     # copied beside the dataset by prepare.py) holds per-factor barcode maps + cardinalities (n) / vector dims.
     fino_cfg = cfg["fino"] if (cfg.get("fino") or {}).get("enabled") else None
     molcap_cfg = cfg["molcap"] if (cfg.get("molcap") or {}).get("enabled") else None
+    molcap_routed = molcap_route_enabled(molcap_cfg)
     fino_disc = [(f, float(s)) for f, s in fino_cfg.get("discrete", [])] if fino_cfg else []
     fino_cont = [(f, float(s)) for f, s in fino_cfg.get("continuous", [])] if fino_cfg else []
     fino_meta = json.loads((Path(cfg["data"]["dataset_dir"]) / "fino_meta.json").read_text()) if fino_cfg else {"n": {}, "cont_dim": {}}
@@ -779,7 +1377,15 @@ def main():
     student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
-    molcap_head = seed_neutral_molcap_head(student_backbone.embed_dim, int(molcap_cfg["target_dim"]), device) if molcap_cfg else None
+    molcap_head = (
+        seed_neutral_molcap_head(
+            molcap_head_input_dim(molcap_cfg, student_backbone.embed_dim),
+            int(molcap_cfg["target_dim"]),
+            device,
+        )
+        if molcap_cfg
+        else None
+    )
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
@@ -819,6 +1425,7 @@ def main():
     metrics_path = output_dir / "metrics.jsonl"
     summary_path = output_dir / "summary.json"
     wandb_meta = None
+    checkpoint = None
     if resume_path is not None:
         print(f"{console_prefix()} Resume  loading checkpoint: {resume_path}", flush=True)
         # Resume restores training progress, optimizer state, and wandb identity.
@@ -867,6 +1474,7 @@ def main():
         flush=True,
     )
     git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+    config_sha256 = hashlib.sha256(Path(cfg["config_path"]).read_bytes()).hexdigest()
     git_remote = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=repo_dir, text=True, capture_output=True, check=False).stdout.strip()
     source_id = f"nanopath-source-{wandb_run.id}"
     artifact_ignore = [
@@ -909,6 +1517,31 @@ def main():
                   "source_dir": str(source_snapshot_dir), "git": {"commit": git_commit, "remote": git_remote}}
     train_ds = TCGATileDataset(cfg, is_train=True)
     val_ds = TCGATileDataset(cfg, is_train=False)
+    molcap_slide_to_patient = None
+    centroid_bank = None
+    history_metadata = None
+    if molcap_routed:
+        molcap_slide_to_patient = torch.as_tensor(
+            train_ds.molcap_slide_to_patient, dtype=torch.int64, device=device
+        )
+        if bool(molcap_cfg["history"]["enabled"]):
+            centroid_bank = HierarchicalCentroidBank(
+                molcap_slide_to_patient,
+                feature_dim=int(molcap_cfg["input_dim"]),
+                momentum=float(molcap_cfg["history"]["momentum"]),
+            ).to(device)
+            history_metadata = build_molcap_history_metadata(molcap_cfg, train_ds)
+    if checkpoint is not None:
+        restore_molcap_history(
+            checkpoint,
+            routed=molcap_routed,
+            centroid_bank=centroid_bank,
+            history_metadata=history_metadata,
+            checkpoint_step=step,
+        )
+    sample_order_prefix, sample_order_available = restore_sample_order_prefix(
+        checkpoint, routed=molcap_routed
+    )
     probe_state = prepare_probe_state(cfg, output_dir) if probe_enabled(cfg) else None
 
     # Train shuffles + drops partials; the loop never starts a batch that would exceed
@@ -920,6 +1553,12 @@ def main():
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     activation_checkpointing = bool(train_cfg["activation_checkpointing"])
+    centroid_gate_report = None
+    centroid_gate_passed = False
+    centroid_gate_path = output_dir / "molcap_centroid_ramp_gate.json"
+    last_routed_result = None
+    last_molcap_grad_cosine = 0.0
+    last_molcap_grad_norm_ratio = 0.0
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
     local_patches = (train_cfg["local_size"] // student_backbone.patch_size) ** 2
@@ -940,12 +1579,37 @@ def main():
         payload = {"model": cpu_state(student_backbone), "model_ema": cpu_state(teacher_backbone), "step": next_step, "config": cfg}
         if not full:
             return payload
-        return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head),
-                "predictor": cpu_state(student_predictor), "opt": opt.state_dict(),
-                "examples_seen": examples_seen, "visible_patch_presentations": visible_patch_presentations,
-                "train_flops": train_flops, "wandb": wandb_meta,
-                **({"protos": {k: v.cpu() for k, v in protos.items()}, "predictors": {f: cpu_state(m) for f, m in predictors.items()}} if fino_cfg else {}),
-                **({"molcap_head": cpu_state(molcap_head)} if molcap_head else {})}
+        payload.update(
+            {
+                "dino_head": cpu_state(student_dino_head),
+                "dino_head_ema": cpu_state(teacher_dino_head),
+                "predictor": cpu_state(student_predictor),
+                "opt": opt.state_dict(),
+                "examples_seen": examples_seen,
+                "visible_patch_presentations": visible_patch_presentations,
+                "train_flops": train_flops,
+                "wandb": wandb_meta,
+                **(
+                    {
+                        "protos": {k: v.cpu() for k, v in protos.items()},
+                        "predictors": {f: cpu_state(m) for f, m in predictors.items()},
+                    }
+                    if fino_cfg
+                    else {}
+                ),
+            }
+        )
+        payload = checkpoint_molcap_state(
+            payload,
+            full=True,
+            checkpoint_step=next_step,
+            molcap_head=molcap_head,
+            centroid_bank=centroid_bank,
+            history_metadata=history_metadata,
+            sample_order_prefix=sample_order_prefix,
+            sample_order_available=sample_order_available if molcap_routed else None,
+        )
+        return payload
 
     def save_latest_checkpoint(checkpoint_step):
         nonlocal last_saved_step
@@ -973,13 +1637,47 @@ def main():
     # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
     # schedule values. Used by both the train step and evaluate() (no_grad).
     def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None,
-                       molcap_target=None, molcap_present=None, molcap_scale=0.0, diagnose=False):
+                       molcap_target=None, molcap_present=None, molcap_slide_idx=None,
+                       molcap_patient_idx=None, molcap_scale=0.0, molcap_completed_step=None,
+                       diagnose=False):
+        routed_step = molcap_routed and molcap_target is not None
         with torch.no_grad():
-            t = teacher_backbone(gf)
+            if routed_step:
+                t = teacher_backbone(
+                    gf, feature_blocks=tuple(molcap_cfg["feature_blocks"])
+                )
+            else:
+                t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
             t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
+        routed_result = None
+        if routed_step:
+            assert type(molcap_completed_step) is int and molcap_completed_step >= 1
+        if molcap_routed:
+            routed_result = maybe_paired_routed_molcap(
+                student_backbone,
+                gf,
+                t.get("x_norm_probe_features"),
+                molcap_head,
+                molcap_target,
+                molcap_present,
+                molcap_slide_idx,
+                molcap_patient_idx,
+                molcap_slide_to_patient,
+                feature_blocks=tuple(molcap_cfg["feature_blocks"]),
+                seed=(
+                    int(train_cfg["seed"]) + 1_000_003 * molcap_completed_step
+                    if routed_step
+                    else None
+                ),
+                device=device,
+                views=train_cfg["global_views"],
+                weight=float(molcap_cfg["weight"]),
+                scale=molcap_scale,
+                centroid_bank=centroid_bank,
+            )
         sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
         L = train_cfg["local_views"]
         local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
@@ -1032,13 +1730,17 @@ def main():
         molcap = sg["x_norm_clstoken"].new_zeros(())
         grad_cosine = grad_norm_ratio = molcap
         if molcap_target is not None:
-            molcap = float(molcap_cfg["weight"]) * molcap_scale * molcap_loss(
-                molcap_head, sg["x_norm_patchtokens"].mean(1), molcap_target, molcap_present, train_cfg["global_views"]
-            )
+            if routed_step:
+                assert routed_result is not None
+                molcap = routed_result.loss
+            else:
+                molcap = float(molcap_cfg["weight"]) * molcap_scale * molcap_loss(
+                    molcap_head, sg["x_norm_patchtokens"].mean(1), molcap_target, molcap_present, train_cfg["global_views"]
+                )
             if diagnose and molcap_scale > 0 and molcap_present.any():
                 base = local_loss + global_loss + jepa_loss + kde + meta_loss
                 grad_cosine, grad_norm_ratio = gradient_alignment(base, molcap, student_backbone.blocks[-1].attn.qkv.weight)
-        return local_loss + global_loss, jepa_loss, kde, meta_loss, molcap, grad_cosine, grad_norm_ratio
+        return local_loss + global_loss, jepa_loss, kde, meta_loss, molcap, grad_cosine, grad_norm_ratio, routed_result
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -1059,7 +1761,17 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v, _, _, _, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                dino_l, jepa_l, kde_v, _, _, _, _, routed_result = compute_losses(
+                    gf,
+                    lf,
+                    b,
+                    masks,
+                    mask_idx,
+                    mask_w,
+                    eval_teacher_temp,
+                    eval_kde_scale,
+                )
+                assert routed_result is None
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -1114,10 +1826,11 @@ def main():
     # Counts the EMA teacher forward + DINO/JEPA heads, not just the backbone, so the
     # 1e18 leaderboard cap reflects real GPU work.
     measured_flops_per_step = None
+    peak_gpu_mem_gb = 0.0
 
-    while examples_seen + batch_size <= max_train_samples and train_flops < max_train_flops:
+    while examples_seen + batch_size <= runner_stop_after_samples and train_flops < max_train_flops:
         for batch in train_loader:
-            if examples_seen + batch_size > max_train_samples or train_flops >= max_train_flops:
+            if examples_seen + batch_size > runner_stop_after_samples or train_flops >= max_train_flops:
                 break
             batch_started_at = time.monotonic()
             data_seconds = batch_started_at - data_wait_started_at
@@ -1130,6 +1843,11 @@ def main():
             # Data identifiers stay on CPU and feed coverage metrics; image tensors move below.
             for key, batch_key in (("sample", "sample_idx"), ("slide", "slide_id"), ("patient", "patient_id")):
                 pending_ids[key].update(int(x) for x in batch[batch_key].tolist())
+            if sample_order_available and len(sample_order_prefix) < 8192:
+                remaining = 8192 - len(sample_order_prefix)
+                sample_order_prefix.extend(
+                    int(value) for value in batch["sample_idx"].tolist()[:remaining]
+                )
             global_views, local_views = [batch[key].to(device, non_blocking=True) for key in ("global_views", "local_views")]
             visible_now = batch_size * (train_cfg["global_views"] * global_patches + train_cfg["local_views"] * local_patches)
             # LR warmup uses the 1M-tile sample cap; decay/WD/teacher/freeze/KDE default to the public FLOP budget.
@@ -1154,6 +1872,12 @@ def main():
                 group["weight_decay"] = wd * group["wd_mult"]
             masks, mask_idx, mask_w = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
             kde_scale = min(1.0, max(0.0, (reg_frac - 0.1) / 0.4))
+            molcap_scale = linear_ramp(sfrac, float(molcap_cfg["ramp_start"]), float(molcap_cfg["ramp_len"])) if molcap_cfg else 0.0
+            if centroid_bank is not None and molcap_scale > 0 and not centroid_gate_passed:
+                centroid_gate_report = run_centroid_ramp_gate(
+                    centroid_bank, molcap_cfg["history"], centroid_gate_path
+                )
+                centroid_gate_passed = True
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
             flop_ctx = FlopCounterMode(display=False) if measured_flops_per_step is None else contextlib.nullcontext()
@@ -1173,24 +1897,41 @@ def main():
                     cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"]).to(device, non_blocking=True) if jepa_cond else None
                     molcap_target = batch["molcap_target"].to(device, non_blocking=True) if molcap_cfg else None
                     molcap_present = batch["molcap_present"].to(device, non_blocking=True) if molcap_cfg else None
-                    molcap_scale = linear_ramp(sfrac, float(molcap_cfg["ramp_start"]), float(molcap_cfg["ramp_len"])) if molcap_cfg else 0.0
-                    dino_loss_value, jepa_loss, kde, meta_loss, molcap, molcap_grad_cosine, molcap_grad_norm_ratio = compute_losses(
+                    molcap_slide_idx = batch["molcap_slide_idx"].to(device, non_blocking=True) if molcap_routed else None
+                    molcap_patient_idx = batch["molcap_patient_idx"].to(device, non_blocking=True) if molcap_routed else None
+                    dino_loss_value, jepa_loss, kde, meta_loss, molcap, molcap_grad_cosine, molcap_grad_norm_ratio, routed_result = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing, meta=meta, cond=cond, molcap_target=molcap_target,
-                        molcap_present=molcap_present, molcap_scale=molcap_scale,
+                        molcap_present=molcap_present, molcap_slide_idx=molcap_slide_idx,
+                        molcap_patient_idx=molcap_patient_idx, molcap_scale=molcap_scale,
+                        molcap_completed_step=completed_step,
                         diagnose=should_log and bool(molcap_cfg.get("diagnose", False)),
                     )
                     total_loss = dino_loss_value + jepa_loss + kde + meta_loss
                     if molcap_cfg: total_loss = total_loss + molcap
                 opt.zero_grad(set_to_none=True)
-                total_loss.backward()
-                if examples_seen / max_train_samples < freeze_backbone_frac:  # Phase 1: backbone frozen (patch_embed + heads + metadata still train)
-                    for n, p in student_backbone.named_parameters():
-                        if not n.startswith("patch_embed"): p.grad = None
+                post_backward = None
+                if examples_seen / max_train_samples < freeze_backbone_frac:
+                    # Phase 1: backbone frozen (patch_embed + heads + metadata still train).
+                    def post_backward():
+                        for name, parameter in student_backbone.named_parameters():
+                            if not name.startswith("patch_embed"):
+                                parameter.grad = None
                 clipped = [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()]
                 if molcap_head: clipped += list(molcap_head.parameters())
-                grad_norm = nn.utils.clip_grad_norm_(clipped, dino_cfg["clip_grad"])
-                opt.step()
+                pending_history = (
+                    routed_result.pending_history if routed_result is not None else None
+                )
+                grad_norm = transactional_optimizer_step(
+                    total_loss,
+                    opt,
+                    clipped,
+                    clip_grad=dino_cfg["clip_grad"],
+                    centroid_bank=centroid_bank if pending_history is not None else None,
+                    pending_history=pending_history,
+                    completed_step=completed_step,
+                    post_backward=post_backward,
+                )
             if measured_flops_per_step is None:
                 measured_flops_per_step = int(flop_ctx.get_total_flops())
                 print(f"{console_prefix()} measured_flops_per_step: {measured_flops_per_step:,}", flush=True)
@@ -1199,6 +1940,11 @@ def main():
                 m = cosine_schedule(0.994, 1.0, reg_frac)
                 update_ema(student_backbone, teacher_backbone, m)
                 update_ema(student_dino_head, teacher_dino_head, m)
+            if routed_result is not None:
+                last_routed_result = routed_result
+                if should_log:
+                    last_molcap_grad_cosine = float(molcap_grad_cosine)
+                    last_molcap_grad_norm_ratio = float(molcap_grad_norm_ratio)
             step_seconds = time.monotonic() - batch_started_at
             examples_seen += batch_size
             visible_patch_presentations += visible_now
@@ -1225,11 +1971,14 @@ def main():
                 last_train_flops = train_flops
                 gpu_mem_gb = torch.cuda.memory_allocated(device) / (1024**3)
                 gpu_peak_mem_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+                peak_gpu_mem_gb = fold_peak_gpu_memory(
+                    peak_gpu_mem_gb, torch.cuda.max_memory_allocated(device)
+                )
                 console_now = time.monotonic()
                 console_gap_ms = 1000.0 * (console_now - last_console_monotonic)
                 steps_since_console = max(1, completed_step - last_console_step)
                 flop_steps_remaining = math.ceil(max(0, max_train_flops - train_flops) / max(1, step_train_flops))
-                sample_steps_remaining = max(0, max_train_samples - examples_seen) // batch_size
+                sample_steps_remaining = max(0, runner_stop_after_samples - examples_seen) // batch_size
                 steps_remaining = min(flop_steps_remaining, sample_steps_remaining)
                 total_steps_estimate = completed_step + steps_remaining
                 eta_seconds = int(max(0.0, steps_remaining * console_gap_ms / 1000.0 / steps_since_console))
@@ -1265,6 +2014,25 @@ def main():
                     "gpu_peak_mem_gb": gpu_peak_mem_gb,
                     "grad_norm": float(grad_norm.detach()),
                 }
+                if routed_result is not None:
+                    train_log.update(
+                        build_molcap_summary(
+                            routed_result=routed_result,
+                            molcap_head=molcap_head,
+                            centroid_bank=centroid_bank,
+                            molcap_cfg=molcap_cfg,
+                            train_ds=train_ds,
+                            config_sha256=config_sha256,
+                            git_commit=git_commit,
+                            sample_order_prefix=sample_order_prefix,
+                            sample_order_available=sample_order_available,
+                            centroid_gate_report=centroid_gate_report,
+                            centroid_gate_passed=centroid_gate_passed,
+                            molcap_grad_cosine=molcap_grad_cosine,
+                            molcap_grad_norm_ratio=molcap_grad_norm_ratio,
+                        )
+                    )
+                    train_log["runner_stop_after_samples"] = runner_stop_after_samples
                 train_log.update(unique_counts)
                 print(
                     f"{console_prefix()} Training  "
@@ -1294,7 +2062,7 @@ def main():
             # Probe at intermediate sample milestones (probe.count > 1); the final probe
             # always runs after the loop exits, regardless of milestones.
             maybe_run_probe(completed_step)
-            if completed_step % int(train_cfg["eval_every"]) == 0 or train_flops >= max_train_flops or examples_seen + batch_size > max_train_samples:
+            if completed_step % int(train_cfg["eval_every"]) == 0 or train_flops >= max_train_flops or examples_seen + batch_size > runner_stop_after_samples:
                 val = evaluate(completed_step, teacher_temp, kde_scale)
                 val_log = {"step": completed_step, **{f"val_{k}": v for k, v in val.items()}}
                 with metrics_path.open("a") as handle:
@@ -1306,10 +2074,18 @@ def main():
                 last_time, last_examples, last_visible_patch_presentations, last_train_flops = time.time(), examples_seen, visible_patch_presentations, train_flops
             step = completed_step
             data_wait_started_at = time.monotonic()
-            if train_flops >= max_train_flops or examples_seen + batch_size > max_train_samples:
+            if train_flops >= max_train_flops or examples_seen + batch_size > runner_stop_after_samples:
                 break
     train_loop_wall_seconds = time.monotonic() - train_loop_started_at
-    stop_reason = "max_train_flops" if train_flops >= max_train_flops else "max_train_samples"
+    peak_gpu_mem_gb = fold_peak_gpu_memory(
+        peak_gpu_mem_gb, torch.cuda.max_memory_allocated(device)
+    )
+    if train_flops >= max_train_flops:
+        stop_reason = "max_train_flops"
+    elif runner_cap_active:
+        stop_reason = "runner_stop_after_samples"
+    else:
+        stop_reason = "max_train_samples"
     final_unique_counts = flush_unique_counts()
     if step > 0:
         # Final probes have their own readers; close pretraining workers before they compete for CPU/IO.
@@ -1323,6 +2099,23 @@ def main():
             save_latest_checkpoint(step)
         run_probe_at(step, examples_seen)
     log_probe_results()
+    molcap_summary = {}
+    if molcap_routed:
+        molcap_summary = build_molcap_summary(
+            routed_result=last_routed_result,
+            molcap_head=molcap_head,
+            centroid_bank=centroid_bank,
+            molcap_cfg=molcap_cfg,
+            train_ds=train_ds,
+            config_sha256=config_sha256,
+            git_commit=git_commit,
+            sample_order_prefix=sample_order_prefix,
+            sample_order_available=sample_order_available,
+            centroid_gate_report=centroid_gate_report,
+            centroid_gate_passed=centroid_gate_passed,
+            molcap_grad_cosine=last_molcap_grad_cosine,
+            molcap_grad_norm_ratio=last_molcap_grad_norm_ratio,
+        )
     # Summary is the small, stable artifact downstream scripts and humans compare across runs.
     summary = {
         "project": cfg["project"]["name"],
@@ -1334,6 +2127,7 @@ def main():
         "backbone_activated_params": backbone_activated_params,
         "batch_size": batch_size,
         "max_train_samples": max_train_samples,
+        "runner_stop_after_samples": runner_stop_after_samples,
         "max_train_flops": max_train_flops,
         "train_loop_wall_seconds": train_loop_wall_seconds,
         "stop_reason": stop_reason,
@@ -1347,6 +2141,7 @@ def main():
         # Average throughput over the train loop; wall time is diagnostic, not an eligibility cap.
         "flops_per_sec": train_flops / max(1.0, train_loop_wall_seconds),
         "visible_patches_per_sec": visible_patch_presentations / max(1.0, train_loop_wall_seconds),
+        "gpu_peak_mem_gb": peak_gpu_mem_gb,
         "warmup_fraction": dino_cfg["warmup_fraction"],
         "warmup_train_samples": warmup_train_samples,
         "lr": dino_cfg["lr"],
@@ -1357,6 +2152,7 @@ def main():
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
+        **molcap_summary,
         **({} if probe_state is None else completed_probe_summary(output_dir)),
     }
     if probe_state is not None and "final_probe_score" not in summary:

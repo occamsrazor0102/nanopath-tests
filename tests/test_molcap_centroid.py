@@ -224,6 +224,33 @@ def test_patient_targets_group_once_and_require_consistency():
     torch.testing.assert_close(grouped_present, torch.ones(2))
 
 
+def test_patient_targets_select_a_bitwise_representative_instead_of_averaging():
+    repeated = torch.tensor([-1.5255959033966064, 0.0], dtype=torch.float32)
+    targets = torch.stack([repeated] * 7 + [torch.tensor([0.0, 1.0])])
+    grouped, _ = patient_targets_from_tiles(
+        targets,
+        torch.ones(8),
+        torch.tensor([0] * 7 + [1]),
+        torch.tensor([0, 1]),
+    )
+
+    assert torch.equal(grouped[0], repeated)
+
+
+def test_patient_targets_reject_even_one_ulp_of_within_patient_disagreement():
+    first = torch.tensor([1.0, 0.0])
+    second = first.clone()
+    second[0] = torch.nextafter(first[0], torch.tensor(2.0))
+
+    with pytest.raises(AssertionError):
+        patient_targets_from_tiles(
+            torch.stack((first, second)),
+            torch.ones(2),
+            torch.tensor([0, 0]),
+            torch.tensor([0]),
+        )
+
+
 @pytest.mark.parametrize(
     ("targets", "present"),
     [

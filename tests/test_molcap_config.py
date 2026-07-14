@@ -177,6 +177,44 @@ def test_training_source_wires_optional_molcap_without_probe_changes():
         assert token in source
 
 
+def test_training_source_routes_centroid_without_changing_one_million_schedules():
+    source = Path("train.py").read_text()
+
+    for token in (
+        'assert int(environment.get("WORLD_SIZE", "1")) == 1',
+        '"NANOPATH_RUNNER_STOP_AFTER_SAMPLES"',
+        "examples_seen + batch_size <= runner_stop_after_samples",
+        "sample_steps_remaining = max(0, runner_stop_after_samples - examples_seen) // batch_size",
+        'stop_reason = "runner_stop_after_samples"',
+        "sfrac = min(1.0, examples_seen / max_train_samples)",
+        "warmup_train_samples = math.ceil(max_train_samples * dino_cfg[\"warmup_fraction\"])",
+        "probe_targets = [math.ceil(max_train_samples * (i + 1) / probe_count)",
+        'feature_blocks=tuple(molcap_cfg["feature_blocks"])',
+        'batch["molcap_slide_idx"]',
+        'batch["molcap_patient_idx"]',
+        '"molcap_history"',
+        '"molcap_centroid_ramp_gate.json"',
+        'json.dumps(report, allow_nan=False, indent=2)',
+    ):
+        assert token in source
+
+
+def test_training_source_keeps_patch_route_and_probe_payload_early_return_explicit():
+    source = Path("train.py").read_text()
+
+    assert 'molcap_cfg.get("route") == "probe_cls_hierarchical"' in source
+    assert 'sg["x_norm_patchtokens"].mean(1)' in source
+    checkpoint_source = source[
+        source.index("    def checkpoint_payload") : source.index(
+            "    def save_latest_checkpoint"
+        )
+    ]
+    assert "if not full:\n            return payload" in checkpoint_source
+    assert checkpoint_source.index("if not full:\n            return payload") < checkpoint_source.index(
+        "checkpoint_molcap_state("
+    )
+
+
 def test_development_helpers_are_excluded_from_labless_snapshot():
     patterns = Path(".gitignore").read_text().splitlines()
     assert "build_molcap_targets.py" in patterns
