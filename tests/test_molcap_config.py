@@ -145,6 +145,85 @@ def test_route_and_centroid_configs_freeze_registered_contract():
         assert config["dino"] == base["dino"]
 
 
+def test_relative_centroid_config_changes_only_registered_identity_and_gate_leaves():
+    path = Path("configs/molcap-ema-relative-s7777.yaml")
+    assert path.exists(), "the preregistered relative-centroid config is missing"
+    centroid = yaml.safe_load(Path("configs/molcap-ema-centroid-s7777.yaml").read_text())
+    relative = yaml.safe_load(path.read_text())
+
+    assert changed_leaves(centroid, relative) == {
+        "project.name",
+        "project.recipe_id",
+        "project.output_dir",
+        "molcap.history.gate_version",
+        "molcap.history.latest_momentum",
+        "molcap.history.permutation_count",
+        "molcap.history.permutation_seed_domain",
+        "molcap.history.min_trace_ratio",
+        "molcap.history.min_effective_rank_ratio",
+        "molcap.history.min_participation_ratio",
+        "molcap.history.min_alignment",
+        "molcap.history.max_permutation_p_value",
+    }
+    assert relative["project"] == {
+        **centroid["project"],
+        "name": "molcap-ema-rel-s7777",
+        "recipe_id": "dinov2-vits14-reg-jepa-mask10-molcap-ema-relative-centroid",
+        "output_dir": "/data/$USER/nanopath/molcap/molcap-ema-rel-s7777",
+    }
+
+
+def test_relative_centroid_config_freezes_matched_latest_gate_contract():
+    path = Path("configs/molcap-ema-relative-s7777.yaml")
+    assert path.exists(), "the preregistered relative-centroid config is missing"
+    centroid = yaml.safe_load(Path("configs/molcap-ema-centroid-s7777.yaml").read_text())
+    relative = yaml.safe_load(path.read_text())
+
+    for section in ("data", "model", "train", "dino", "probe", "fino"):
+        assert relative[section] == centroid[section]
+    assert {
+        key: value for key, value in relative["molcap"].items() if key != "history"
+    } == {
+        key: value for key, value in centroid["molcap"].items() if key != "history"
+    }
+
+    relative_history = relative["molcap"]["history"]
+    assert relative_history == {
+        **centroid["molcap"]["history"],
+        "gate_version": "matched_latest_v1",
+        "latest_momentum": 0.0,
+        "permutation_count": 256,
+        "permutation_seed_domain": "molcap-matched-latest-v1",
+        "min_trace_ratio": 0.05263157894736842,
+        "min_effective_rank_ratio": 0.5,
+        "min_participation_ratio": 0.5,
+        "min_alignment": 0.0,
+        "max_permutation_p_value": 0.01,
+    }
+    assert relative["train"]["seed"] == relative["data"]["split_seed"] == 7777
+    assert relative["train"]["resume"] is None
+    assert relative["train"]["batch_size"] == 128
+    assert relative["train"]["global_views"] == 2
+    assert relative["train"]["local_views"] == 8
+    assert relative["train"]["global_size"] == 224
+    assert relative["train"]["local_size"] == 112
+    assert relative["train"]["max_train_samples"] == 1_000_000
+    assert relative["molcap"]["targets"] == "/data/$USER/nanopath/molcap_text_384.npz"
+    assert relative["molcap"]["target_sha256"] == (
+        "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    )
+    assert relative["molcap"]["feature_blocks"] == [4, 6, 8, 11]
+    assert relative["molcap"]["weight"] == 0.03
+    assert relative["molcap"]["ramp_start"] == 0.5
+    assert relative["molcap"]["ramp_len"] == 0.25
+    assert relative_history["enabled"] is True
+    assert relative_history["momentum"] == 0.9
+    assert relative_history["min_slide_updates"] == 2
+    assert relative_history["min_sample_weighted_coverage"] == 0.95
+    assert relative_history["min_geometry_patients"] == 512
+    assert relative_history["min_centroid_norm"] == 1.0e-6
+
+
 def test_molcap_config_is_exact_frontier_plus_auxiliary():
     config = yaml.safe_load(Path("configs/molcap-text-s7777.yaml").read_text())
 
