@@ -2,8 +2,11 @@
 # These tests keep the state proposal pure and every rejected commit atomic.
 
 import math
+import hashlib
+import json
 import sys
 import types
+from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -11,6 +14,8 @@ import torch
 
 sys.modules.setdefault("wandb", types.ModuleType("wandb"))
 
+import molcap_relative_gate as relative_gate_module
+import train as train_module
 from train import (
     HierarchicalCentroidBank,
     centroid_audit,
@@ -24,6 +29,1004 @@ from train import (
     require_centroid_gate,
     teacher_value_student_gradient,
 )
+
+
+def test_centroid_spectral_geometry_reports_sample_covariance_trace_and_full_descending_spectrum():
+    centroids = torch.tensor(
+        [[1.0, 0.0], [3.0, 0.0], [2.0, 3.0]], dtype=torch.float32
+    )
+
+    geometry = train_module.centroid_spectral_geometry(centroids)
+
+    assert geometry["trace"] == pytest.approx(4.0, rel=0, abs=1e-12)
+    assert geometry["spectrum"] == pytest.approx([3.0, 1.0], rel=0, abs=1e-12)
+
+
+def test_centroid_spectral_geometry_matches_archived_rank_and_participation_formulas():
+    centroids = torch.tensor(
+        [[1.0, 0.0], [3.0, 0.0], [2.0, 3.0]], dtype=torch.float64
+    )
+    eigenvalues = np.asarray([3.0, 1.0])
+    probabilities = eigenvalues / eigenvalues.sum()
+
+    geometry = train_module.centroid_spectral_geometry(centroids)
+
+    expected_erank = np.exp(-(probabilities * np.log(probabilities)).sum())
+    expected_participation = eigenvalues.sum() ** 2 / np.square(eigenvalues).sum()
+    assert geometry["effective_rank"] == pytest.approx(expected_erank, rel=1e-12)
+    assert geometry["participation_ratio"] == pytest.approx(
+        expected_participation, rel=1e-12
+    )
+
+
+def test_centroid_spectral_geometry_reports_raw_mean_offdiagonal_cosine():
+    centroids = torch.tensor(
+        [[1.0, 0.0], [3.0, 0.0], [2.0, 3.0]], dtype=torch.float64
+    )
+    unit = centroids.numpy() / np.linalg.norm(centroids.numpy(), axis=1)[:, None]
+    expected = (np.square(unit.sum(axis=0)).sum() - len(unit)) / (
+        len(unit) * (len(unit) - 1)
+    )
+
+    geometry = train_module.centroid_spectral_geometry(centroids)
+
+    assert geometry["mean_offdiag_cosine"] == pytest.approx(expected, rel=1e-12)
+    assert geometry["min_norm"] == pytest.approx(1.0, rel=0, abs=1e-12)
+
+
+def test_centroid_spectral_geometry_uses_cpu_float64_and_keeps_structural_zeros():
+    centroids = torch.tensor(
+        [[1.0, 0.0, 7.0], [3.0, 0.0, 7.0], [2.0, 3.0, 7.0]],
+        dtype=torch.float32,
+    )
+
+    geometry = train_module.centroid_spectral_geometry(centroids)
+
+    assert geometry["compute_device"] == "cpu"
+    assert geometry["compute_dtype"] == "torch.float64"
+    assert geometry["spectrum"] == pytest.approx([3.0, 1.0, 0.0], abs=1e-12)
+    assert len(geometry["spectrum"]) == centroids.shape[1]
+
+
+def test_relative_centroid_geometry_reports_centered_alignment_and_linear_cka():
+    ema = torch.tensor([[1.0, 0.0], [3.0, 0.0], [2.0, 3.0]])
+    latest = torch.tensor([[2.0, 0.0], [6.0, 0.0], [4.0, 1.5]])
+    ema0 = ema.double().numpy() - ema.double().numpy().mean(axis=0)
+    latest0 = latest.double().numpy() - latest.double().numpy().mean(axis=0)
+    expected_alignment = np.vdot(ema0, latest0) / (
+        np.linalg.norm(ema0) * np.linalg.norm(latest0)
+    )
+    cross = ema0.T @ latest0
+    expected_cka = np.square(cross).sum() / np.sqrt(
+        np.square(ema0.T @ ema0).sum() * np.square(latest0.T @ latest0).sum()
+    )
+
+    geometry = train_module.relative_centroid_geometry(ema, latest)
+
+    assert geometry["alignment"] == pytest.approx(expected_alignment, rel=1e-12)
+    assert geometry["linear_cka"] == pytest.approx(expected_cka, rel=1e-12)
+
+
+def test_relative_centroid_geometry_reports_trace_rank_participation_and_raw_cosine_ratios():
+    ema = torch.tensor([[1.0, 0.0], [3.0, 0.0], [2.0, 3.0]])
+    latest = torch.tensor([[2.0, 0.0], [6.0, 0.0], [4.0, 1.5]])
+    ema_eigenvalues = np.asarray([3.0, 1.0])
+    latest_eigenvalues = np.asarray([4.0, 0.75])
+
+    def ranks(eigenvalues):
+        probabilities = eigenvalues / eigenvalues.sum()
+        return (
+            np.exp(-(probabilities * np.log(probabilities)).sum()),
+            eigenvalues.sum() ** 2 / np.square(eigenvalues).sum(),
+        )
+
+    ema_erank, ema_participation = ranks(ema_eigenvalues)
+    latest_erank, latest_participation = ranks(latest_eigenvalues)
+    ema_array, latest_array = ema.double().numpy(), latest.double().numpy()
+    ema_unit = ema_array / np.linalg.norm(ema_array, axis=1)[:, None]
+    latest_unit = latest_array / np.linalg.norm(latest_array, axis=1)[:, None]
+    ema_cosine = (np.square(ema_unit.sum(axis=0)).sum() - 3) / 6
+    latest_cosine = (np.square(latest_unit.sum(axis=0)).sum() - 3) / 6
+
+    geometry = train_module.relative_centroid_geometry(ema, latest)
+
+    assert geometry["trace_ratio"] == pytest.approx(4.0 / 4.75, rel=1e-12)
+    assert geometry["effective_rank_ratio"] == pytest.approx(
+        ema_erank / latest_erank, rel=1e-12
+    )
+    assert geometry["participation_ratio"] == pytest.approx(
+        ema_participation / latest_participation, rel=1e-12
+    )
+    assert geometry["mean_offdiag_cosine_delta"] == pytest.approx(
+        ema_cosine - latest_cosine, rel=1e-12
+    )
+    assert geometry["ema"]["spectrum"] == pytest.approx([3.0, 1.0])
+    assert geometry["latest"]["spectrum"] == pytest.approx([4.0, 0.75])
+
+
+def test_matched_latest_permutation_seed_uses_unsigned_big_endian_digest_prefix():
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+
+    provenance = train_module.matched_latest_permutation_seed(
+        target_sha256, mapping_digest
+    )
+
+    assert provenance == {
+        "digest": "c72be56fb4b30bce20dc37fe1314f536ee376705dbdb5401594cc62df21c7361",
+        "seed": 14351816905481980878,
+        "seed_bytes": 8,
+        "byte_order": "big",
+        "unsigned": True,
+        "domain": "molcap-matched-latest-v1",
+    }
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(provenance["seed"])
+    assert generator.initial_seed() == 14351816905481980878
+
+
+def test_matched_latest_permutations_use_exact_sequential_cpu_randperm_draws():
+    ema = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]],
+        dtype=torch.float64,
+    )
+    latest = torch.tensor(
+        [[2.0, 0.0], [0.0, 1.0], [-2.0, 0.0], [0.0, -1.0]],
+        dtype=torch.float64,
+    )
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+
+    permutation = train_module.matched_latest_permutation_audit(
+        ema, latest, target_sha256, mapping_digest, permutation_count=256
+    )
+
+    assert permutation["alignments"][:5] == pytest.approx(
+        [
+            0.0,
+            0.9486832980505138,
+            -0.4743416490252569,
+            0.4743416490252569,
+            -0.15811388300841897,
+        ],
+        rel=1e-15,
+        abs=1e-15,
+    )
+    assert len(permutation["alignments"]) == 256
+    assert permutation["identity_draw_count"] == 13
+    assert hashlib.sha256(
+        np.asarray(permutation["alignments"], dtype="<f8").tobytes()
+    ).hexdigest() == "51a2a36b3e63c62e2c7fa029f3b30a820fc3daf56983873efa22dac4c02fde24"
+
+
+def test_matched_latest_permutation_p_value_is_exact_one_sided_add_one_value():
+    ema = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]],
+        dtype=torch.float64,
+    )
+    latest = torch.tensor(
+        [[2.0, 0.0], [0.0, 1.0], [-2.0, 0.0], [0.0, -1.0]],
+        dtype=torch.float64,
+    )
+
+    permutation = train_module.matched_latest_permutation_audit(
+        ema,
+        latest,
+        "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577",
+        "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922",
+        permutation_count=256,
+    )
+
+    assert permutation["observed_alignment"] == pytest.approx(
+        3 / math.sqrt(10), rel=1e-15
+    )
+    assert permutation["exceedance_count"] == 13
+    assert permutation["p_value"] == pytest.approx(14 / 257, rel=0, abs=0)
+    assert permutation["p_value_formula"] == (
+        "(1 + count(permuted_alignment >= observed_alignment)) / 257"
+    )
+
+
+def relative_gate_config():
+    return {
+        "gate_version": "matched_latest_v1",
+        "min_slide_updates": 2,
+        "min_sample_weighted_coverage": 0.95,
+        "min_geometry_patients": 512,
+        "min_effective_rank": 32.0,
+        "min_participation_ratio": 0.5,
+        "max_mean_offdiag_cosine": 0.95,
+        "min_centroid_norm": 1.0e-6,
+        "permutation_count": 256,
+        "permutation_seed_domain": "molcap-matched-latest-v1",
+        "min_trace_ratio": 0.05263157894736842,
+        "min_effective_rank_ratio": 0.5,
+        "min_alignment": 0.0,
+        "max_permutation_p_value": 0.01,
+    }
+
+
+def passing_relative_gate_audit():
+    return {
+        "provenance": {
+            "target_sha256_match": True,
+            "mapping_digest_match": True,
+            "world_size": 1,
+        },
+        "state": {
+            "min_slide_updates": 2,
+            "ema_finite": True,
+            "latest_finite": True,
+            "reported_scalars_finite": True,
+            "matches": {
+                "slide_mapping_equal": True,
+                "slide_counts_equal": True,
+                "tile_presentation_counts_equal": True,
+                "state_step_equal": True,
+                "observed_slides_equal": True,
+                "mature_slides_equal": True,
+                "patient_ids_equal": True,
+                "matrix_shapes_equal": True,
+            },
+        },
+        "population": {
+            "ema_mature_coverage": 0.95,
+            "latest_mature_coverage": 0.95,
+            "matched_patient_count": 512,
+        },
+        "ema": {
+            "trace": math.nextafter(0.0, math.inf),
+            "min_norm": math.nextafter(1.0e-6, math.inf),
+            "effective_rank": 1.0,
+            "participation_ratio": 1.0,
+            "mean_offdiag_cosine": 1.0,
+        },
+        "latest": {
+            "trace": math.nextafter(0.0, math.inf),
+            "min_norm": math.nextafter(1.0e-6, math.inf),
+            "effective_rank": 1000.0,
+            "participation_ratio": 1000.0,
+            "mean_offdiag_cosine": -1.0,
+        },
+        "relative": {
+            "trace_ratio": 0.05263157894736842,
+            "effective_rank_ratio": 0.5,
+            "participation_ratio": 0.5,
+            "alignment": math.nextafter(0.0, math.inf),
+            "linear_cka": 0.0,
+            "mean_offdiag_cosine_delta": 2.0,
+        },
+        "permutation": {
+            "count": 256,
+            "exceedance_count": 1,
+            "p_value": 2 / 257,
+        },
+        "unavailable": [],
+    }
+
+
+def test_matched_latest_gate_uses_exact_boundaries_and_names_every_failed_condition():
+    passing = train_module.evaluate_matched_latest_gate(
+        passing_relative_gate_audit(), relative_gate_config()
+    )
+    assert passing["passed"] is True
+    assert passing["failures"] == []
+    assert passing["thresholds"] == {
+        "min_slide_updates": 2,
+        "min_sample_weighted_coverage": 0.95,
+        "min_geometry_patients": 512,
+        "min_centroid_norm": 1.0e-6,
+        "min_trace_ratio": 0.05263157894736842,
+        "min_effective_rank_ratio": 0.5,
+        "min_participation_ratio": 0.5,
+        "min_alignment_exclusive": 0.0,
+        "permutation_count": 256,
+        "max_permutation_p_value": 0.01,
+    }
+
+    audit = deepcopy(passing_relative_gate_audit())
+    audit["provenance"].update(
+        target_sha256_match=False, mapping_digest_match=False, world_size=2
+    )
+    audit["state"].update(
+        min_slide_updates=3,
+        ema_finite=False,
+        latest_finite=False,
+        reported_scalars_finite=False,
+    )
+    audit["state"]["matches"] = {
+        name: False for name in audit["state"]["matches"]
+    }
+    audit["population"].update(
+        ema_mature_coverage=math.nextafter(0.95, -math.inf),
+        latest_mature_coverage=math.nextafter(0.95, -math.inf),
+        matched_patient_count=511,
+    )
+    audit["ema"].update(trace=0.0, min_norm=1.0e-6)
+    audit["latest"].update(trace=0.0, min_norm=1.0e-6)
+    audit["relative"].update(
+        trace_ratio=math.nextafter(0.05263157894736842, -math.inf),
+        effective_rank_ratio=math.nextafter(0.5, -math.inf),
+        participation_ratio=math.nextafter(0.5, -math.inf),
+        alignment=0.0,
+    )
+    audit["permutation"].update(exceedance_count=2, p_value=3 / 257)
+
+    failed = train_module.evaluate_matched_latest_gate(audit, relative_gate_config())
+
+    assert failed["passed"] is False
+    assert failed["failures"] == [
+        "target_sha256_match",
+        "mapping_digest_match",
+        "world_size_one",
+        "min_slide_updates_exact",
+        "ema_state_finite",
+        "latest_state_finite",
+        "slide_mapping_equal",
+        "slide_counts_equal",
+        "tile_presentation_counts_equal",
+        "state_step_equal",
+        "observed_slides_equal",
+        "mature_slides_equal",
+        "patient_ids_equal",
+        "matrix_shapes_equal",
+        "ema_min_sample_weighted_coverage",
+        "latest_min_sample_weighted_coverage",
+        "min_geometry_patients",
+        "ema_min_centroid_norm_strict",
+        "latest_min_centroid_norm_strict",
+        "ema_trace_positive",
+        "latest_trace_positive",
+        "all_reported_scalars_finite",
+        "min_trace_ratio",
+        "min_effective_rank_ratio",
+        "min_participation_ratio",
+        "min_alignment_strict",
+        "max_permutation_p_value",
+    ]
+
+
+def oracle_matched_banks():
+    mapping = torch.arange(4, dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.0)
+    with torch.no_grad():
+        ema.slide_centroids.copy_(
+            torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]])
+        )
+        latest.slide_centroids.copy_(
+            torch.tensor([[2.0, 0.0], [0.0, 1.0], [-2.0, 0.0], [0.0, -1.0]])
+        )
+        for bank in (ema, latest):
+            bank.slide_counts.fill_(2)
+            bank.slide_tile_presentations.copy_(torch.tensor([3, 4, 5, 6]))
+            bank.centroid_state_step.fill_(2)
+    return ema, latest
+
+
+def test_matched_latest_audit_uses_canonical_population_and_complete_geometry():
+    ema, latest = oracle_matched_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    history_metadata = {
+        "target_sha256": target_sha256,
+        "mapping_digest": mapping_digest,
+    }
+    shadow_metadata = {
+        **history_metadata,
+        "gate_version": "matched_latest_v1",
+        "arm": "latest_observation_shadow",
+    }
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=history_metadata,
+        shadow_metadata=shadow_metadata,
+        world_size=1,
+    )
+
+    assert audit["gate_version"] == "matched_latest_v1"
+    assert audit["state"]["matches"] == {
+        "slide_mapping_equal": True,
+        "slide_counts_equal": True,
+        "tile_presentation_counts_equal": True,
+        "state_step_equal": True,
+        "observed_slides_equal": True,
+        "mature_slides_equal": True,
+        "patient_ids_equal": True,
+        "matrix_shapes_equal": True,
+    }
+    assert audit["population"]["matched_patient_count"] == 4
+    assert audit["population"]["ema_patient_ids"]["count"] == 4
+    assert audit["population"]["ema_patient_ids"] == audit["population"][
+        "latest_patient_ids"
+    ]
+    assert audit["population"]["ema_matrix_shape"] == [4, 2]
+    assert audit["population"]["latest_matrix_shape"] == [4, 2]
+    assert audit["ema"]["spectrum"] == pytest.approx([2 / 3, 2 / 3])
+    assert audit["latest"]["spectrum"] == pytest.approx([8 / 3, 2 / 3])
+    assert audit["relative"]["trace_ratio"] == pytest.approx(0.4)
+    assert audit["relative"]["effective_rank_ratio"] == pytest.approx(
+        1.2125732532083184
+    )
+    assert audit["relative"]["participation_ratio"] == pytest.approx(1.36)
+    assert audit["relative"]["alignment"] == pytest.approx(3 / math.sqrt(10))
+    assert audit["relative"]["linear_cka"] == pytest.approx(5 / math.sqrt(34))
+    assert audit["relative"]["mean_offdiag_cosine_delta"] == pytest.approx(0.0)
+    assert len(audit["permutation"]["alignments"]) == 256
+    assert audit["permutation"]["p_value"] == pytest.approx(14 / 257)
+    assert audit["shadow"] == {
+        "audit_time_present": True,
+        "checkpoint_payload_present": True,
+        "checkpoint_tensor_payload_bytes": 104,
+        "state_step": 2,
+        "bank_state_digest": train_module.centroid_bank_state_digest(latest),
+        "post_pass_action": "discard_after_durable_pass_report",
+        "boundary_proposal": {
+            "present": False,
+            "committed_match": None,
+            "state_step": 2,
+            "first_copy_excluded": True,
+            "count": 0,
+            "mean": None,
+            "q10": None,
+            "q50": None,
+            "q90": None,
+        },
+    }
+    assert audit["unavailable"] == []
+
+
+def test_matched_latest_audit_validates_and_records_shadow_boundary_proposal():
+    ema, latest = oracle_matched_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    proposal = train_module.CentroidProposal(
+        base_state_step=1,
+        slide_ids=torch.arange(4, dtype=torch.int64),
+        next_slide_centroids=latest.slide_centroids.detach().clone(),
+        slide_tile_counts=torch.ones(4, dtype=torch.int64),
+        patient_ids=torch.arange(4, dtype=torch.int64),
+        patient_centroids=latest.slide_centroids.detach().clone(),
+        drift_cosines=torch.tensor([0.1, 0.2, 0.3, 0.4]),
+        historical_tile_fraction=torch.tensor(1.0),
+    )
+
+    valid = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+        boundary_shadow_proposal=proposal,
+    )
+    invalid = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+        boundary_shadow_proposal=object(),
+    )
+    invalid_report = train_module.evaluate_matched_latest_gate(
+        invalid, relative_gate_config()
+    )
+
+    assert valid["shadow"]["boundary_proposal"] == {
+        "present": True,
+        "committed_match": True,
+        "state_step": 2,
+        "first_copy_excluded": True,
+        "count": 4,
+        "mean": pytest.approx(0.25),
+        "q10": pytest.approx(0.13),
+        "q50": pytest.approx(0.25),
+        "q90": pytest.approx(0.37),
+    }
+    assert invalid["shadow"]["boundary_proposal"]["present"] is True
+    assert invalid["shadow"]["boundary_proposal"]["committed_match"] is False
+    assert "boundary_shadow_proposal_committed" in invalid_report["failures"]
+
+
+def test_matched_latest_audit_keeps_exact_draw_and_maturity_semantics_when_config_is_invalid():
+    ema, latest = oracle_matched_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    invalid = {**relative_gate_config(), "min_slide_updates": 3, "permutation_count": 7}
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        invalid,
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+    report = train_module.evaluate_matched_latest_gate(audit, invalid)
+
+    assert audit["state"]["min_slide_updates"] == 2
+    assert audit["population_sizes"]["mature_min_slide_updates"] == 2
+    assert audit["permutation"]["count"] == 256
+    assert len(audit["permutation"]["alignments"]) == 256
+    assert report["failures"][:2] == [
+        "config_min_slide_updates_exact",
+        "config_permutation_count_exact",
+    ]
+
+
+def test_observed_matrix_audit_remains_complete_when_mature_state_mismatch_fails_gate():
+    ema, latest = oracle_matched_banks()
+    with torch.no_grad():
+        latest.slide_counts[0] = 1
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+    report = train_module.evaluate_matched_latest_gate(
+        audit, relative_gate_config()
+    )
+
+    assert audit["state"]["matches"]["mature_slides_equal"] is False
+    assert audit["state"]["matches"]["patient_ids_equal"] is True
+    assert audit["state"]["matches"]["matrix_shapes_equal"] is True
+    assert len(audit["ema"]["spectrum"]) == 2
+    assert len(audit["latest"]["spectrum"]) == 2
+    assert len(audit["permutation"]["alignments"]) == 256
+    assert audit["unavailable"] == []
+    assert report["passed"] is False
+    assert "slide_counts_equal" in report["failures"]
+    assert "mature_slides_equal" in report["failures"]
+
+
+def test_matched_latest_audit_uses_strict_json_nulls_when_shapes_preclude_relative_math():
+    ema, _ = oracle_matched_banks()
+    mapping = torch.arange(4, dtype=torch.int64)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=3, momentum=0.0)
+    with torch.no_grad():
+        latest.slide_centroids.copy_(
+            torch.tensor(
+                [
+                    [2.0, 0.0, 1.0],
+                    [0.0, 1.0, 1.0],
+                    [-2.0, 0.0, 1.0],
+                    [0.0, -1.0, 1.0],
+                ]
+            )
+        )
+        latest.slide_counts.fill_(2)
+        latest.slide_tile_presentations.copy_(torch.tensor([3, 4, 5, 6]))
+        latest.centroid_state_step.fill_(2)
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+
+    assert audit["state"]["matches"]["matrix_shapes_equal"] is False
+    assert len(audit["ema"]["spectrum"]) == 2
+    assert len(audit["latest"]["spectrum"]) == 3
+    assert all(value is None for value in audit["relative"].values())
+    assert audit["permutation"]["alignments"] is None
+    assert audit["permutation"]["p_value"] is None
+    assert audit["unavailable"] == ["relative_geometry", "permutation"]
+    json_text = json.dumps(audit, allow_nan=False)
+    assert "NaN" not in json_text and "Infinity" not in json_text
+
+
+@pytest.mark.parametrize(
+    ("latest_values", "reason"),
+    [
+        (
+            [[0.0, 0.0], [0.0, 1.0], [-2.0, 0.0], [0.0, -1.0]],
+            "zero_norm",
+        ),
+        (
+            [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+            "zero_trace",
+        ),
+        (
+            [[float("nan"), 0.0], [0.0, 1.0], [-2.0, 0.0], [0.0, -1.0]],
+            "nonfinite",
+        ),
+    ],
+)
+def test_matched_latest_audit_names_hard_math_unavailability_without_nonfinite_json(
+    latest_values, reason
+):
+    ema, latest = oracle_matched_banks()
+    with torch.no_grad():
+        latest.slide_centroids.copy_(torch.tensor(latest_values))
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+
+    assert audit["latest"] == {
+        "compute_device": "cpu",
+        "compute_dtype": "torch.float64",
+        "trace": None,
+        "spectrum": None,
+        "effective_rank": None,
+        "participation_ratio": None,
+        "mean_offdiag_cosine": None,
+        "min_norm": None,
+    }
+    assert all(value is None for value in audit["relative"].values())
+    assert audit["permutation"]["alignments"] is None
+    assert audit["unavailable"] == [
+        f"latest_geometry:{reason}",
+        "relative_geometry",
+        "permutation",
+    ]
+    json.dumps(audit, allow_nan=False)
+
+
+def test_matched_latest_gate_names_unavailable_null_metrics_without_short_circuiting():
+    audit = passing_relative_gate_audit()
+    audit["state"]["matches"]["matrix_shapes_equal"] = False
+    audit["relative"] = {name: None for name in audit["relative"]}
+    audit["permutation"].update(
+        identity_draw_count=None,
+        exceedance_count=None,
+        p_value=None,
+        alignments=None,
+    )
+    audit["unavailable"] = ["relative_geometry", "permutation"]
+
+    report = train_module.evaluate_matched_latest_gate(
+        audit, relative_gate_config()
+    )
+
+    assert report["passed"] is False
+    assert report["failures"] == [
+        "matrix_shapes_equal",
+        "min_trace_ratio",
+        "min_effective_rank_ratio",
+        "min_participation_ratio",
+        "min_alignment_strict",
+        "max_permutation_p_value",
+        "audit_available:relative_geometry",
+        "audit_available:permutation",
+    ]
+    json.dumps(report, allow_nan=False)
+
+
+def large_matched_gate_banks(*, latest_sign=1.0):
+    mapping = torch.arange(512, dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.0)
+    index = torch.arange(1, 513, dtype=torch.float32)
+    values = torch.stack((index, index.remainder(17) + 1.0), dim=1)
+    with torch.no_grad():
+        ema.slide_centroids.copy_(values)
+        latest.slide_centroids.copy_(values * latest_sign)
+        for bank in (ema, latest):
+            bank.slide_counts.fill_(2)
+            bank.slide_tile_presentations.fill_(3)
+            bank.centroid_state_step.fill_(2)
+    return ema, latest
+
+
+def test_relative_runner_rejects_negative_alignment_even_when_cka_is_one_with_complete_json(
+    tmp_path,
+):
+    ema, latest = large_matched_gate_banks(latest_sign=-1.0)
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "relative-failure.json"
+
+    with pytest.raises(AssertionError, match="min_alignment_strict"):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+        )
+
+    report = json.loads(path.read_text())
+    assert report["gate_version"] == "matched_latest_v1"
+    assert report["passed"] is False
+    assert report["failures"] == [
+        "min_alignment_strict",
+        "max_permutation_p_value",
+    ]
+    assert report["relative"]["alignment"] == pytest.approx(-1.0)
+    assert report["relative"]["linear_cka"] == pytest.approx(1.0)
+    assert len(report["ema"]["spectrum"]) == 2
+    assert len(report["latest"]["spectrum"]) == 2
+    assert len(report["permutation"]["alignments"]) == 256
+    json.dumps(report, allow_nan=False)
+
+
+def test_relative_runner_durably_passes_with_absolute_geometry_only_diagnostic(
+    tmp_path, monkeypatch
+):
+    ema, latest = large_matched_gate_banks(latest_sign=1.0)
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "relative-pass.json"
+    events = []
+    original_fsync, original_replace = train_module.os.fsync, train_module.os.replace
+    original_directory_fsync = relative_gate_module._fsync_parent_directory
+
+    def observed_fsync(fd):
+        events.append("fsync")
+        return original_fsync(fd)
+
+    def observed_replace(source, destination):
+        events.append("replace")
+        return original_replace(source, destination)
+
+    def observed_directory_fsync(directory):
+        events.append("directory_fsync")
+        return original_directory_fsync(directory)
+
+    monkeypatch.setattr(train_module.os, "fsync", observed_fsync)
+    monkeypatch.setattr(train_module.os, "replace", observed_replace)
+    monkeypatch.setattr(
+        relative_gate_module, "_fsync_parent_directory", observed_directory_fsync
+    )
+
+    report = train_module.run_centroid_ramp_gate(
+        ema,
+        relative_gate_config(),
+        path,
+        latest_bank=latest,
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+    )
+
+    assert report["passed"] is True and report["failures"] == []
+    assert report["ema"]["effective_rank"] < 32.0
+    assert report["ema"]["participation_ratio"] < 16.0
+    assert report["ema"]["mean_offdiag_cosine"] > 0.95
+    assert report["relative"]["alignment"] == pytest.approx(1.0)
+    assert report["permutation"]["p_value"] <= 0.01
+    assert report["persistence"] == {
+        "strategy": "atomic_temp_flush_fsync_replace_parent_fsync",
+        "durable_before_return": True,
+    }
+    assert events == ["fsync", "replace", "directory_fsync"]
+    assert json.loads(path.read_text()) == report
+
+
+def test_parent_directory_fsync_opens_syncs_and_closes_posix_directory(
+    tmp_path, monkeypatch
+):
+    events = []
+    directory_fd = 9173
+
+    monkeypatch.setattr(
+        relative_gate_module.os,
+        "open",
+        lambda path, flags: events.append(("open", path, flags)) or directory_fd,
+    )
+    monkeypatch.setattr(
+        relative_gate_module.os,
+        "fsync",
+        lambda fd: events.append(("fsync", fd)),
+    )
+    monkeypatch.setattr(
+        relative_gate_module.os,
+        "close",
+        lambda fd: events.append(("close", fd)),
+    )
+
+    assert relative_gate_module._fsync_parent_directory(
+        tmp_path, platform_name="posix"
+    ) is True
+    assert events[0][0:2] == ("open", tmp_path)
+    assert events[1:] == [("fsync", directory_fd), ("close", directory_fd)]
+
+
+def test_centroid_gate_unknown_explicit_version_fails_closed_with_strict_report(tmp_path):
+    ema, latest = large_matched_gate_banks()
+    config = relative_gate_config()
+    config["gate_version"] = "matched_latest_v2"
+    path = tmp_path / "unknown-version.json"
+
+    with pytest.raises(AssertionError, match="unknown centroid gate_version"):
+        train_module.run_centroid_ramp_gate(
+            ema, config, path, latest_bank=latest
+        )
+
+    assert json.loads(path.read_text()) == {
+        "gate_version": "matched_latest_v2",
+        "passed": False,
+        "failures": ["unknown_gate_version"],
+        "failure": "unknown centroid gate_version: 'matched_latest_v2'",
+        "persistence": {
+            "strategy": "atomic_temp_flush_fsync_replace_parent_fsync",
+            "durable_before_return": True,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("gate_version", "reported"),
+    [("", ""), (float("nan"), "nan")],
+)
+def test_empty_or_nonfinite_explicit_gate_version_fails_closed_with_strict_report(
+    tmp_path, gate_version, reported
+):
+    ema, latest = large_matched_gate_banks()
+    config = {**relative_gate_config(), "gate_version": gate_version}
+    path = tmp_path / f"invalid-version-{reported or 'empty'}.json"
+
+    with pytest.raises(AssertionError, match="unknown centroid gate_version"):
+        train_module.run_centroid_ramp_gate(ema, config, path, latest_bank=latest)
+
+    report = json.loads(path.read_text())
+    assert report["gate_version"] == reported
+    assert report["failures"] == ["unknown_gate_version"]
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
+
+
+def test_missing_and_null_gate_versions_preserve_identical_legacy_report_bytes(tmp_path):
+    ema, _ = large_matched_gate_banks()
+    config = gate_config()
+    config.update(
+        min_slide_updates=2,
+        min_effective_rank=1.0,
+        min_participation_ratio=1.0,
+        max_mean_offdiag_cosine=0.999,
+    )
+    missing_path, null_path = tmp_path / "missing.json", tmp_path / "null.json"
+
+    missing = train_module.run_centroid_ramp_gate(ema, config, missing_path)
+    explicit_null = train_module.run_centroid_ramp_gate(
+        ema, {**config, "gate_version": None}, null_path
+    )
+
+    assert missing == explicit_null
+    assert missing_path.read_bytes() == null_path.read_bytes()
+    assert "gate_version" not in missing
+    assert "failures" not in missing
+
+
+def test_relative_runner_names_missing_shadow_and_persists_null_unavailable_report(
+    tmp_path,
+):
+    ema, _ = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "missing-shadow.json"
+
+    with pytest.raises(AssertionError, match="latest_shadow_present"):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=None,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+        )
+
+    report = json.loads(path.read_text())
+    assert report["passed"] is False
+    assert "latest_shadow_present" in report["failures"]
+    assert report["shadow"] == {
+        "audit_time_present": False,
+        "checkpoint_payload_present": False,
+        "checkpoint_tensor_payload_bytes": 0,
+        "state_step": None,
+        "bank_state_digest": None,
+        "post_pass_action": "none",
+        "boundary_proposal": {
+            "present": False,
+            "committed_match": None,
+            "state_step": None,
+            "first_copy_excluded": True,
+            "count": None,
+            "mean": None,
+            "q10": None,
+            "q50": None,
+            "q90": None,
+        },
+    }
+    assert report["latest"]["spectrum"] is None
+    assert all(value is None for value in report["relative"].values())
+    assert report["permutation"]["alignments"] is None
+    assert report["unavailable"] == [
+        "latest_shadow",
+        "latest_geometry:missing_shadow",
+        "relative_geometry",
+        "permutation",
+    ]
+    json.dumps(report, allow_nan=False)
+
+
+def test_relative_runner_persists_primary_nonfinite_failure_as_null_not_nan(tmp_path):
+    ema, latest = large_matched_gate_banks()
+    with torch.no_grad():
+        ema.slide_centroids[0, 0] = float("nan")
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "primary-nonfinite.json"
+
+    with pytest.raises(AssertionError, match="ema_state_finite"):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+        )
+
+    report = json.loads(path.read_text())
+    assert report["ema"]["spectrum"] is None
+    assert report["relative"]["alignment"] is None
+    assert report["permutation"]["alignments"] is None
+    assert report["unavailable"] == [
+        "ema_geometry:nonfinite",
+        "relative_geometry",
+        "permutation",
+        "legacy_diagnostics",
+    ]
+    json.dumps(report, allow_nan=False)
 
 
 def snapshot_buffers(module):

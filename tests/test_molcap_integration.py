@@ -943,6 +943,82 @@ def test_shadow_serializes_only_in_preboundary_full_checkpoint_and_discards_afte
     assert discard_latest_observation_shadow(None, gate_passed=True) is None
 
 
+def test_relative_full_checkpoint_records_live_and_post_discard_shadow_provenance():
+    head = MolCapHead(32, 6)
+    mapping = torch.tensor([0, 1], dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=32, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=32, momentum=0.0)
+    history_metadata = centroid_metadata()
+    shadow_metadata = build_latest_shadow_metadata(
+        history_metadata, relative_history_config()
+    )
+    digest = centroid_bank_state_digest(latest)
+
+    preboundary = checkpoint_molcap_state(
+        {"step": 0},
+        full=True,
+        checkpoint_step=0,
+        molcap_head=head,
+        centroid_bank=ema,
+        history_metadata=history_metadata,
+        centroid_shadow_bank=latest,
+        shadow_metadata=shadow_metadata,
+        centroid_gate_report=None,
+    )
+    assert preboundary["molcap_centroid_gate_version"] == "matched_latest_v1"
+    assert preboundary["molcap_latest_shadow_present"] is True
+    assert preboundary["molcap_latest_shadow_checkpoint_payload_bytes"] == 296
+    assert preboundary["molcap_latest_shadow_retained_state_bytes"] == 296
+    assert preboundary["molcap_latest_shadow_state_step"] == 0
+    assert preboundary["molcap_latest_shadow_bank_state_digest"] == digest
+    assert preboundary["molcap_latest_shadow_state_source"] == (
+        "live_preboundary_payload"
+    )
+    assert preboundary["molcap_latest_shadow_post_pass_discarded"] is False
+    assert "gate_version" not in preboundary["molcap_history"]["metadata"]
+
+    gate_report = {
+        "gate_version": "matched_latest_v1",
+        "passed": True,
+        "shadow": {
+            "checkpoint_tensor_payload_bytes": 296,
+            "state_step": 0,
+            "bank_state_digest": digest,
+        },
+    }
+    postboundary = checkpoint_molcap_state(
+        {"step": 0},
+        full=True,
+        checkpoint_step=0,
+        molcap_head=head,
+        centroid_bank=ema,
+        history_metadata=history_metadata,
+        centroid_shadow_bank=None,
+        shadow_metadata=shadow_metadata,
+        centroid_gate_report=gate_report,
+    )
+    assert "molcap_latest_shadow" not in postboundary
+    assert postboundary["molcap_latest_shadow_present"] is False
+    assert postboundary["molcap_latest_shadow_checkpoint_payload_bytes"] == 0
+    assert postboundary["molcap_latest_shadow_retained_state_bytes"] == 296
+    assert postboundary["molcap_latest_shadow_state_step"] == 0
+    assert postboundary["molcap_latest_shadow_bank_state_digest"] == digest
+    assert postboundary["molcap_latest_shadow_state_source"] == (
+        "gate_report_retained_after_discard"
+    )
+    assert postboundary["molcap_latest_shadow_post_pass_discarded"] is True
+
+    archived = checkpoint_molcap_state(
+        {"step": 0},
+        full=True,
+        checkpoint_step=0,
+        molcap_head=head,
+        centroid_bank=ema,
+        history_metadata=history_metadata,
+    )
+    assert not any("shadow" in key or "gate_version" in key for key in archived)
+
+
 def test_checkpoint_probe_returns_before_head_history_export_or_bank_mutation():
     head = MolCapHead(32, 6)
     bank = HierarchicalCentroidBank(torch.tensor([0, 1]), feature_dim=32, momentum=0.9)
@@ -1451,6 +1527,78 @@ def test_molcap_summary_contains_pairing_provenance_digest_and_latest_bank_state
     assert summary["molcap_grad_norm_ratio_last"] == 1.5
     assert summary["molcap_grad_norm_ratio_mean"] == 1.5
     json.dumps(summary, allow_nan=False)
+
+
+def test_relative_summary_retains_shadow_state_provenance_after_postpass_discard():
+    mapping = torch.tensor([0, 1], dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=32, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=32, momentum=0.0)
+    dataset = SimpleNamespace(
+        molcap_mapping_digest="b" * 64,
+        molcap_target_sha256="a" * 64,
+        molcap_patient_ids=("P0", "P1"),
+        molcap_slide_ids=("S0", "S1"),
+    )
+    config = routed_molcap_config(history_enabled=True)
+    config["history"] = relative_history_config()
+    diagnostics = new_molcap_gradient_diagnostics()
+    common = dict(
+        routed_result=None,
+        molcap_head=None,
+        centroid_bank=ema,
+        molcap_cfg=config,
+        train_ds=dataset,
+        config_sha256="c" * 64,
+        git_commit="d" * 40,
+        sample_order_prefix=[],
+        sample_order_available=True,
+        centroid_gate_passed=False,
+        molcap_grad_diagnostics=diagnostics,
+    )
+
+    preboundary = build_molcap_summary(
+        **common,
+        centroid_shadow_bank=latest,
+        centroid_gate_report=None,
+    )
+    digest = centroid_bank_state_digest(latest)
+    assert preboundary["molcap_centroid_gate_version"] == "matched_latest_v1"
+    assert preboundary["molcap_latest_shadow_present"] is True
+    assert preboundary["molcap_latest_shadow_checkpoint_payload_bytes"] == 296
+    assert preboundary["molcap_latest_shadow_retained_state_bytes"] == 296
+    assert preboundary["molcap_latest_shadow_state_step"] == 0
+    assert preboundary["molcap_latest_shadow_bank_state_digest"] == digest
+    assert preboundary["molcap_latest_shadow_post_pass_discarded"] is False
+
+    gate_report = {
+        "gate_version": "matched_latest_v1",
+        "passed": True,
+        "shadow": {
+            "checkpoint_tensor_payload_bytes": 296,
+            "state_step": 0,
+            "bank_state_digest": digest,
+        },
+    }
+    postboundary = build_molcap_summary(
+        **{**common, "centroid_gate_passed": True},
+        centroid_shadow_bank=None,
+        centroid_gate_report=gate_report,
+    )
+    assert postboundary["molcap_latest_shadow_present"] is False
+    assert postboundary["molcap_latest_shadow_checkpoint_payload_bytes"] == 0
+    assert postboundary["molcap_latest_shadow_retained_state_bytes"] == 296
+    assert postboundary["molcap_latest_shadow_state_step"] == 0
+    assert postboundary["molcap_latest_shadow_bank_state_digest"] == digest
+    assert postboundary["molcap_latest_shadow_state_source"] == (
+        "gate_report_retained_after_discard"
+    )
+    assert postboundary["molcap_latest_shadow_post_pass_discarded"] is True
+
+    archived = build_molcap_summary(
+        **{**common, "molcap_cfg": routed_molcap_config(history_enabled=True)},
+        centroid_gate_report=None,
+    )
+    assert not any("shadow" in key or "gate_version" in key for key in archived)
 
 
 def test_molcap_gradient_diagnostic_summary_distinguishes_no_observation_and_aggregates():

@@ -33,6 +33,16 @@ from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
 from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, gradient_alignment, linear_ramp, load_dinov2_pretrained, molcap_loss, seed_neutral_molcap_head
+from molcap_relative_gate import (
+    _centroid_checkpoint_tensor_bytes,
+    _write_matched_latest_gate_report,
+    centroid_spectral_geometry,
+    evaluate_matched_latest_gate,
+    matched_latest_centroid_audit as _matched_latest_centroid_audit,
+    matched_latest_permutation_audit,
+    matched_latest_permutation_seed,
+    relative_centroid_geometry,
+)
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -1300,6 +1310,18 @@ def centroid_audit(bank, min_slide_updates=2, *, boundary_proposal=None):
     }
 
 
+def matched_latest_centroid_audit(*args, **kwargs):
+    return _matched_latest_centroid_audit(
+        *args,
+        **kwargs,
+        legacy_audit=lambda bank, min_slide_updates, boundary_proposal: centroid_audit(
+            bank,
+            min_slide_updates,
+            boundary_proposal=boundary_proposal,
+        ),
+    )
+
+
 def require_centroid_gate(audit, history_cfg):
     hard = audit["all_observed"]
     coverage = audit["sample_weighted_mature_coverage"]
@@ -1492,6 +1514,7 @@ def build_molcap_summary(
     centroid_gate_report,
     centroid_gate_passed,
     molcap_grad_diagnostics,
+    centroid_shadow_bank=None,
 ):
     summary = {}
     if routed_result is not None:
@@ -1525,7 +1548,44 @@ def build_molcap_summary(
             **molcap_gradient_diagnostic_summary(molcap_grad_diagnostics),
         }
     )
+    summary.update(
+        _relative_shadow_provenance(
+            centroid_shadow_bank,
+            {"gate_version": molcap_cfg["history"].get("gate_version")},
+            centroid_gate_report,
+        )
+    )
     return summary
+
+
+def _relative_shadow_provenance(centroid_shadow_bank, shadow_metadata, gate_report):
+    if not isinstance(shadow_metadata, dict) or shadow_metadata.get("gate_version") != "matched_latest_v1":
+        return {}
+    if centroid_shadow_bank is None and gate_report is None:
+        return {}
+    if centroid_shadow_bank is not None:
+        retained_bytes = _centroid_checkpoint_tensor_bytes(centroid_shadow_bank)
+        retained_step = int(centroid_shadow_bank.centroid_state_step.item())
+        retained_digest = centroid_bank_state_digest(centroid_shadow_bank)
+        source = "live_preboundary_payload"
+    else:
+        assert isinstance(gate_report, dict)
+        assert gate_report["gate_version"] == "matched_latest_v1"
+        retained_bytes = int(gate_report["shadow"]["checkpoint_tensor_payload_bytes"])
+        retained_step = int(gate_report["shadow"]["state_step"])
+        retained_digest = gate_report["shadow"]["bank_state_digest"]
+        source = "gate_report_retained_after_discard"
+    present = centroid_shadow_bank is not None
+    return {
+        "molcap_centroid_gate_version": "matched_latest_v1",
+        "molcap_latest_shadow_present": present,
+        "molcap_latest_shadow_checkpoint_payload_bytes": retained_bytes if present else 0,
+        "molcap_latest_shadow_retained_state_bytes": retained_bytes,
+        "molcap_latest_shadow_state_step": retained_step,
+        "molcap_latest_shadow_bank_state_digest": retained_digest,
+        "molcap_latest_shadow_state_source": source,
+        "molcap_latest_shadow_post_pass_discarded": not present,
+    }
 
 
 def checkpoint_molcap_state(
@@ -1538,6 +1598,7 @@ def checkpoint_molcap_state(
     history_metadata,
     centroid_shadow_bank=None,
     shadow_metadata=None,
+    centroid_gate_report=None,
     sample_order_prefix=None,
     sample_order_available=None,
 ):
@@ -1563,6 +1624,11 @@ def checkpoint_molcap_state(
         payload["molcap_latest_shadow"] = centroid_shadow_bank.export_state(
             shadow_metadata
         )
+    payload.update(
+        _relative_shadow_provenance(
+            centroid_shadow_bank, shadow_metadata, centroid_gate_report
+        )
+    )
     if sample_order_available is not None:
         assert type(sample_order_available) is bool
         prefix = [] if sample_order_prefix is None else list(sample_order_prefix)
@@ -1594,9 +1660,68 @@ def restore_molcap_history(
 
 
 def run_centroid_ramp_gate(
-    bank, history_cfg, report_path, *, boundary_proposal=None
+    bank,
+    history_cfg,
+    report_path,
+    *,
+    boundary_proposal=None,
+    latest_bank=None,
+    target_sha256=None,
+    mapping_digest=None,
+    history_metadata=None,
+    shadow_metadata=None,
+    world_size=None,
+    boundary_shadow_proposal=None,
 ):
     report_path = Path(report_path)
+    gate_version_is_legacy = (
+        "gate_version" not in history_cfg or history_cfg["gate_version"] is None
+    )
+    if not gate_version_is_legacy:
+        gate_version = history_cfg["gate_version"]
+        if type(gate_version) is not str or gate_version != "matched_latest_v1":
+            failure = f"unknown centroid gate_version: {gate_version!r}"
+            report = {
+                "gate_version": (
+                    gate_version if type(gate_version) is str else repr(gate_version)
+                ),
+                "passed": False,
+                "failures": ["unknown_gate_version"],
+                "failure": failure,
+                "persistence": {
+                    "strategy": "atomic_temp_flush_fsync_replace_parent_fsync",
+                    "durable_before_return": True,
+                },
+            }
+            _write_matched_latest_gate_report(report, report_path)
+            raise AssertionError(failure)
+        audit = matched_latest_centroid_audit(
+            bank,
+            latest_bank,
+            history_cfg,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=history_metadata,
+            shadow_metadata=shadow_metadata,
+            world_size=(
+                int(os.environ.get("WORLD_SIZE", "1"))
+                if world_size is None
+                else world_size
+            ),
+            boundary_proposal=boundary_proposal,
+            boundary_shadow_proposal=boundary_shadow_proposal,
+        )
+        report = evaluate_matched_latest_gate(audit, history_cfg)
+        report["persistence"] = {
+            "strategy": "atomic_temp_flush_fsync_replace_parent_fsync",
+            "durable_before_return": True,
+        }
+        _write_matched_latest_gate_report(report, report_path)
+        if not report["passed"]:
+            raise AssertionError(
+                "matched_latest_v1 gate failures: " + ", ".join(report["failures"])
+            )
+        return report
     audit = None
     try:
         audit = centroid_audit(
@@ -1958,6 +2083,7 @@ def main():
             history_metadata=history_metadata,
             centroid_shadow_bank=centroid_shadow_bank,
             shadow_metadata=shadow_metadata,
+            centroid_gate_report=centroid_gate_report,
             sample_order_prefix=sample_order_prefix,
             sample_order_available=sample_order_available if molcap_routed else None,
         )
@@ -2234,6 +2360,12 @@ def main():
                     molcap_cfg["history"],
                     centroid_gate_path,
                     boundary_proposal=centroid_gate_boundary_proposal,
+                    latest_bank=centroid_shadow_bank,
+                    target_sha256=train_ds.molcap_target_sha256,
+                    mapping_digest=train_ds.molcap_mapping_digest,
+                    history_metadata=history_metadata,
+                    shadow_metadata=shadow_metadata,
+                    boundary_shadow_proposal=centroid_gate_boundary_shadow_proposal,
                 )
                 centroid_gate_passed = True
                 centroid_shadow_bank = discard_latest_observation_shadow(
@@ -2410,6 +2542,7 @@ def main():
                             centroid_gate_report=centroid_gate_report,
                             centroid_gate_passed=centroid_gate_passed,
                             molcap_grad_diagnostics=molcap_grad_diagnostics,
+                            centroid_shadow_bank=centroid_shadow_bank,
                         )
                     )
                     train_log["runner_stop_after_samples"] = runner_stop_after_samples
@@ -2494,6 +2627,7 @@ def main():
             centroid_gate_report=centroid_gate_report,
             centroid_gate_passed=centroid_gate_passed,
             molcap_grad_diagnostics=molcap_grad_diagnostics,
+            centroid_shadow_bank=centroid_shadow_bank,
         )
     # Summary is the small, stable artifact downstream scripts and humans compare across runs.
     summary = {

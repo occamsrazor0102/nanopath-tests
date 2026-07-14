@@ -309,6 +309,26 @@ def test_training_source_routes_centroid_without_changing_one_million_schedules(
         assert token in source
 
 
+def test_training_source_passes_matched_shadow_provenance_before_post_report_discard():
+    source = Path("train.py").read_text()
+    start = source.index("            if centroid_bank is not None and molcap_scale > 0")
+    end = source.index("            # Wrap forward + backward", start)
+    boundary = source[start:end]
+
+    for token in (
+        "latest_bank=centroid_shadow_bank",
+        "target_sha256=train_ds.molcap_target_sha256",
+        "mapping_digest=train_ds.molcap_mapping_digest",
+        "history_metadata=history_metadata",
+        "shadow_metadata=shadow_metadata",
+        "boundary_shadow_proposal=centroid_gate_boundary_shadow_proposal",
+    ):
+        assert token in boundary
+    assert boundary.index("run_centroid_ramp_gate(") < boundary.index(
+        "discard_latest_observation_shadow("
+    )
+
+
 def test_training_source_keeps_patch_route_and_probe_payload_early_return_explicit():
     source = Path("train.py").read_text()
 
