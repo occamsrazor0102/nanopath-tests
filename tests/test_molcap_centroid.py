@@ -74,6 +74,73 @@ def test_deterministic_grouped_sum_rejects_missing_groups():
         )
 
 
+def test_trusted_dense_grouped_sum_gathers_unique_groups_in_order_with_autograd(
+    monkeypatch,
+):
+    def unexpected_device_value_operation(*args, **kwargs):
+        raise AssertionError("trusted unique groups must not inspect device values")
+
+    monkeypatch.setattr(torch, "isfinite", unexpected_device_value_operation)
+    monkeypatch.setattr(torch, "all", unexpected_device_value_operation)
+    monkeypatch.setattr(torch, "segment_reduce", unexpected_device_value_operation)
+    values = torch.tensor(
+        [[7.0, 11.0], [1.0, 2.0], [13.0, 17.0], [5.0, 8.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    groups = torch.tensor([2, 0, 3, 1], dtype=torch.int64)
+
+    actual = deterministic_grouped_sum(
+        values, groups, group_count=4, trusted_dense=True
+    )
+
+    expected = torch.tensor(
+        [[1.0, 2.0], [5.0, 8.0], [7.0, 11.0], [13.0, 17.0]],
+        dtype=torch.float32,
+    )
+    assert torch.equal(actual, expected)
+    weights = torch.tensor([[2.0, 3.0], [5.0, 7.0], [11.0, 13.0], [17.0, 19.0]])
+    (actual * weights).sum().backward()
+    assert torch.equal(values.grad, weights[groups])
+
+
+def test_trusted_dense_grouped_sum_collisions_are_deterministic_with_autograd(
+    monkeypatch,
+):
+    def unexpected_device_value_operation(*args, **kwargs):
+        raise AssertionError("trusted dense groups must not inspect device values")
+
+    monkeypatch.setattr(torch, "isfinite", unexpected_device_value_operation)
+    monkeypatch.setattr(torch, "all", unexpected_device_value_operation)
+    values = torch.tensor(
+        [[7.0, 11.0], [1.0, 2.0], [5.0, 8.0], [3.0, 4.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    groups = torch.tensor([1, 0, 1, 0], dtype=torch.int64)
+    deterministic_before = torch.are_deterministic_algorithms_enabled()
+    warn_only_before = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        actual = deterministic_grouped_sum(
+            values, groups, group_count=2, trusted_dense=True
+        )
+        repeated = deterministic_grouped_sum(
+            values.detach(), groups, group_count=2, trusted_dense=True
+        )
+    finally:
+        torch.use_deterministic_algorithms(
+            deterministic_before, warn_only=warn_only_before
+        )
+
+    expected = torch.tensor([[4.0, 6.0], [12.0, 19.0]], dtype=torch.float32)
+    assert torch.equal(actual, expected)
+    assert torch.equal(repeated, expected)
+    weights = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
+    (actual * weights).sum().backward()
+    assert torch.equal(values.grad, weights[groups])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_production_shaped_cuda_centroid_commits_are_deterministic_and_match_cpu_oracle():
     device = torch.device("cuda")

@@ -296,17 +296,25 @@ def crop_major_tile_mean(features, views, batch_size):
     return features.reshape(views, batch_size, -1).float().mean(0)
 
 
-def deterministic_grouped_sum(values, group_ids, group_count):
+def deterministic_grouped_sum(values, group_ids, group_count, *, trusted_dense=False):
     assert values.ndim == 2 and values.shape[0] > 0
-    assert values.dtype == torch.float32 and torch.isfinite(values).all()
+    assert values.dtype == torch.float32
     assert group_ids.shape == (len(values),)
     assert group_ids.dtype == torch.int64 and group_ids.device == values.device
     assert type(group_count) is int and group_count > 0
-    assert torch.all(group_ids >= 0) and torch.all(group_ids < group_count)
-    lengths = torch.bincount(group_ids, minlength=group_count)
-    assert lengths.shape == (group_count,) and torch.all(lengths > 0)
+    assert type(trusted_dense) is bool
+    if not trusted_dense:
+        assert torch.isfinite(values).all()
+        assert torch.all(group_ids >= 0) and torch.all(group_ids < group_count)
     order = torch.argsort(group_ids, stable=True)
-    grouped = torch.segment_reduce(values[order], "sum", lengths=lengths, axis=0)
+    if trusted_dense and group_count == len(values):
+        grouped = values[order]
+    else:
+        lengths = torch.bincount(group_ids, minlength=group_count)
+        assert lengths.shape == (group_count,)
+        if not trusted_dense:
+            assert torch.all(lengths > 0)
+        grouped = torch.segment_reduce(values[order], "sum", lengths=lengths, axis=0)
     assert grouped.shape == (group_count, values.shape[-1])
     assert grouped.dtype == values.dtype and grouped.device == values.device
     return grouped
@@ -324,13 +332,13 @@ def hierarchical_means(features, slide_ids, slide_to_patient):
     unique_slides, tile_inverse = torch.unique(slide_ids, sorted=True, return_inverse=True)
     tile_counts = torch.bincount(tile_inverse, minlength=len(unique_slides))
     slide_sums = deterministic_grouped_sum(
-        features.float(), tile_inverse, len(unique_slides)
+        features.float(), tile_inverse, len(unique_slides), trusted_dense=True
     )
     slide_means = slide_sums / tile_counts[:, None]
     slide_patients = slide_to_patient[unique_slides]
     unique_patients, slide_inverse = torch.unique(slide_patients, sorted=True, return_inverse=True)
     patient_sums = deterministic_grouped_sum(
-        slide_means, slide_inverse, len(unique_patients)
+        slide_means, slide_inverse, len(unique_patients), trusted_dense=True
     )
     patient_counts = torch.bincount(slide_inverse, minlength=len(unique_patients))
     return Hierarchy(
@@ -872,7 +880,7 @@ class HierarchicalCentroidBank(nn.Module):
         assert teacher.patient_means.dtype == self.slide_centroids.dtype
         assert teacher.patient_means.device == self.slide_centroids.device
         current_sums = deterministic_grouped_sum(
-            teacher.slide_means, inverse, len(patient_ids)
+            teacher.slide_means, inverse, len(patient_ids), trusted_dense=True
         )
         current_counts = torch.bincount(inverse, minlength=len(patient_ids))
         assert torch.allclose(
@@ -888,7 +896,7 @@ class HierarchicalCentroidBank(nn.Module):
         )
         deltas = next_values - torch.where(seen[:, None], old, torch.zeros_like(old))
         sums = self.patient_sums[patient_ids] + deterministic_grouped_sum(
-            deltas, inverse, len(patient_ids)
+            deltas, inverse, len(patient_ids), trusted_dense=True
         )
         counts = self.patient_slide_counts[patient_ids] + torch.bincount(
             inverse[~seen], minlength=len(patient_ids)
@@ -961,6 +969,7 @@ class HierarchicalCentroidBank(nn.Module):
             - torch.where(seen[:, None], old, torch.zeros_like(old)),
             inverse,
             len(patient_ids),
+            trusted_dense=True,
         )
         expected_counts = self.patient_slide_counts[patient_ids] + patient_increments
         assert torch.all(expected_counts > 0)
