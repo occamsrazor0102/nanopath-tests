@@ -587,6 +587,124 @@ def test_latest_shadow_has_no_forward_gradient_rng_or_real_ema_state_effect():
     )
     assert not torch.equal(shadowed_ema.slide_centroids, latest.slide_centroids)
 
+    plain_head.zero_grad(set_to_none=True)
+    shadow_head.zero_grad(set_to_none=True)
+    plain_after_divergence = torch.tensor(
+        [[3.0, 5.0, 7.0, 11.0], [13.0, 17.0, 19.0, 23.0]] * 2,
+        requires_grad=True,
+    )
+    shadow_after_divergence = (
+        plain_after_divergence.detach().clone().requires_grad_(True)
+    )
+    teacher_after_divergence = torch.tensor(
+        [[-2.0, 3.0, -5.0, 7.0], [11.0, -13.0, 17.0, -19.0]] * 2,
+        requires_grad=True,
+    )
+    cpu_rng = torch.random.get_rng_state().clone()
+    cuda_rng = (
+        [state.clone() for state in torch.cuda.get_rng_state_all()]
+        if torch.cuda.is_available()
+        else []
+    )
+
+    plain_result = paired_routed_molcap(
+        plain_head,
+        plain_after_divergence,
+        teacher_after_divergence,
+        slide_ids,
+        patient_ids,
+        mapping,
+        targets,
+        present,
+        views=2,
+        weight=0.03,
+        scale=1.0,
+        centroid_bank=plain_ema,
+    )
+    shadow_result = paired_routed_molcap(
+        shadow_head,
+        shadow_after_divergence,
+        teacher_after_divergence,
+        slide_ids,
+        patient_ids,
+        mapping,
+        targets,
+        present,
+        views=2,
+        weight=0.03,
+        scale=1.0,
+        centroid_bank=shadowed_ema,
+        centroid_shadow_bank=latest,
+    )
+
+    assert torch.equal(torch.random.get_rng_state(), cpu_rng)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(torch.cuda.get_rng_state_all(), cuda_rng)
+    )
+    assert torch.equal(
+        plain_result.pending_history.patient_centroids,
+        shadow_result.pending_history.patient_centroids,
+    )
+    assert not torch.equal(
+        shadow_result.pending_history.patient_centroids,
+        shadow_result.pending_shadow_history.patient_centroids,
+    )
+    assert torch.equal(plain_result.patient_features, shadow_result.patient_features)
+    assert torch.equal(
+        shadow_result.patient_features.detach(),
+        shadow_result.pending_history.patient_centroids,
+    )
+    assert not torch.equal(
+        shadow_result.patient_features.detach(),
+        shadow_result.pending_shadow_history.patient_centroids,
+    )
+    assert torch.equal(plain_result.loss, shadow_result.loss)
+
+    plain_result.loss.backward()
+    shadow_result.loss.backward()
+    assert torch.equal(
+        plain_after_divergence.grad, shadow_after_divergence.grad
+    )
+    for plain_parameter, shadow_parameter in zip(
+        plain_head.parameters(), shadow_head.parameters()
+    ):
+        assert torch.equal(plain_parameter.grad, shadow_parameter.grad)
+    assert teacher_after_divergence.grad is None
+
+    plain_ema.commit(plain_result.pending_history, step=3)
+    commit_matched_centroid_updates(
+        shadowed_ema,
+        shadow_result.pending_history,
+        latest,
+        shadow_result.pending_shadow_history,
+        step=3,
+    )
+    assert centroid_bank_state_digest(plain_ema) == centroid_bank_state_digest(
+        shadowed_ema
+    )
+
+
+def test_paired_route_rejects_latest_observation_bank_in_primary_role():
+    mapping = torch.tensor([0], dtype=torch.int64)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.0)
+
+    with pytest.raises(AssertionError):
+        paired_routed_molcap(
+            MolCapHead(2, 2),
+            torch.tensor([[1.0, 2.0]], requires_grad=True),
+            torch.tensor([[2.0, 1.0]]),
+            mapping,
+            mapping,
+            mapping,
+            torch.tensor([[1.0, 0.0]]),
+            torch.ones(1),
+            views=1,
+            weight=0.03,
+            scale=1.0,
+            centroid_bank=latest,
+        )
+
 
 def test_validation_style_routed_call_skips_auxiliary_forward_and_preserves_bank():
     class FailIfForwarded(torch.nn.Module):

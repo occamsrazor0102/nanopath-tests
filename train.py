@@ -444,6 +444,7 @@ def paired_routed_molcap(
     pending_shadow_history = None
     teacher_value = teacher_hierarchy.patient_means
     if centroid_bank is not None:
+        require_primary_centroid_bank(centroid_bank)
         if centroid_shadow_bank is None:
             pending_history = centroid_bank.propose(teacher_hierarchy)
         else:
@@ -1131,6 +1132,12 @@ def _assert_matched_centroid_banks(ema_bank, latest_bank):
         ema_bank.patient_slide_counts, latest_bank.patient_slide_counts
     )
     assert torch.equal(ema_bank.centroid_state_step, latest_bank.centroid_state_step)
+
+
+def require_primary_centroid_bank(bank):
+    assert isinstance(bank, HierarchicalCentroidBank)
+    assert bank.momentum == 0.9
+    return bank
 
 
 def _assert_matched_centroid_proposals(ema_proposal, latest_proposal):
@@ -1855,11 +1862,13 @@ def main():
             train_ds.molcap_slide_to_patient, dtype=torch.int64, device=device
         )
         if bool(molcap_cfg["history"]["enabled"]):
-            centroid_bank = HierarchicalCentroidBank(
-                molcap_slide_to_patient,
-                feature_dim=int(molcap_cfg["input_dim"]),
-                momentum=float(molcap_cfg["history"]["momentum"]),
-            ).to(device)
+            centroid_bank = require_primary_centroid_bank(
+                HierarchicalCentroidBank(
+                    molcap_slide_to_patient,
+                    feature_dim=int(molcap_cfg["input_dim"]),
+                    momentum=float(molcap_cfg["history"]["momentum"]),
+                ).to(device)
+            )
             history_metadata = build_molcap_history_metadata(molcap_cfg, train_ds)
             centroid_shadow_bank = create_latest_observation_shadow(
                 molcap_cfg["history"],
