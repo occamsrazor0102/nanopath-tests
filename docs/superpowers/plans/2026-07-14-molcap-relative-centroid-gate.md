@@ -88,8 +88,9 @@ submit every completed full run.
   `213a747` checkpoints and require exact replay.
 - [ ] Require exact EMA history digest, sample digest, target, mapping, and
   source evidence.
-- [ ] Audit the calibration shadow checkpoint. If maturity is below `0.95`,
-  run only the frozen 40,960-sample preview.
+- [ ] Audit both B200 and H100 calibration shadow checkpoints and require both
+  relative gates to pass. For each hardware independently, if maturity is
+  below `0.95`, run exactly one frozen 40,960-sample preview on that hardware.
 - [ ] Require relative-gate pass and centroid-minus-route peak memory at most
   `0.5 GiB` before a full launch.
 - [ ] Calculate B200 and H100 timing projections without changing the recipe.

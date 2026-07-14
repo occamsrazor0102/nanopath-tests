@@ -108,6 +108,12 @@ SHA256(bytes.fromhex(target_sha256)
        || b"molcap-matched-latest-v1")
 ```
 
+Call `torch.randperm(n, generator=generator, device="cpu")` sequentially
+exactly 256 times under pinned PyTorch `2.8.0`; seed the generator once before
+the first call and never reseed it. Retain a sampled identity permutation,
+retain duplicate permutations, and count each retained draw independently.
+Do not insert the identity permutation manually.
+
 For every permutation, compute the same coordinate-matched centered
 alignment. The one-sided permutation value is:
 
@@ -179,9 +185,12 @@ calibrations:
 - exact replay under the staged dataset layout, thereby certifying that local
   staging changes only data latency;
 - paired peak-memory delta no greater than `0.5 GiB`;
-- a control-relative gate preview from the calibration checkpoint. If 32,768
-  samples do not reach `0.95` maturity, run one preregistered 40,960-sample
-  preview; do not change the gate.
+- an independent control-relative gate preview from both the B200 and H100
+  relative-centroid calibration checkpoints. Both previews must pass. If one
+  32,768-sample checkpoint does not reach `0.95` maturity, run exactly one
+  40,960-sample preview on that same hardware; do not extend the other
+  hardware unless its own maturity is also below `0.95`, and do not change the
+  gate.
 
 Archived checkpoint references:
 
