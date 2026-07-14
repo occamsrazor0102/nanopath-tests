@@ -1,9 +1,37 @@
+import subprocess
 from pathlib import Path
 
 import yaml
 
 
 MISSING = object()
+
+
+def git_bytes(revision, path):
+    return subprocess.check_output(["git", "show", f"{revision}:{path}"])
+
+
+def test_locked_probe_and_benchmarking_match_preexperiment_commit():
+    revision = "01c1cdf8017a0481636a28ab58a0ddc67d6e0a06"
+    paths = ["probe.py"] + subprocess.check_output(
+        ["git", "ls-tree", "-r", "--name-only", revision, "--", "benchmarking/"],
+        text=True,
+    ).splitlines()
+    for path in paths:
+        # Windows autocrlf may smudge LF blobs to CRLF; no other raw-byte drift is allowed,
+        # and the clean-filtered object ID below still locks the submitted content exactly.
+        if Path(path).read_bytes() != git_bytes(revision, path):
+            eol = subprocess.check_output(
+                ["git", "ls-files", "--eol", "--", path], text=True
+            ).split()
+            assert eol[:2] == ["i/lf", "w/crlf"]
+        baseline_oid = subprocess.check_output(
+            ["git", "rev-parse", f"{revision}:{path}"], text=True
+        ).strip()
+        worktree_oid = subprocess.check_output(
+            ["git", "hash-object", f"--path={path}", "--", path], text=True
+        ).strip()
+        assert worktree_oid == baseline_oid
 
 
 def changed_leaves(left, right, prefix=""):
