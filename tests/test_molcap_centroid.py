@@ -558,6 +558,41 @@ def test_patient_centroids_and_audit_separate_all_observed_from_mature_only():
     assert audit["mature_only"] == centroid_geometry(mature)
     assert audit["all_observed"]["patient_count"] == 3
     assert audit["mature_only"]["patient_count"] == 2
+    assert audit["population_sizes"] == {
+        "mature_min_slide_updates": 2,
+        "observed_slides": 4,
+        "mature_slides": 2,
+        "observed_patients": 3,
+        "mature_patients": 2,
+    }
+    assert audit["slide_update_count_distribution"] == {
+        "population": "observed_slides",
+        "count": 4,
+        "mean": 1.5,
+        "q0": 1.0,
+        "q25": 1.0,
+        "q50": 1.5,
+        "q75": 2.0,
+        "q100": 2.0,
+    }
+    assert audit["observed_slides_per_patient_distribution"] == {
+        "population": "observed_patients",
+        "count": 3,
+        "mean": pytest.approx(4 / 3),
+        "q0": 1.0,
+        "q25": 1.0,
+        "q50": 1.0,
+        "q75": 1.5,
+        "q100": 2.0,
+    }
+    assert audit["boundary_teacher_centroid_drift"] == {
+        "first_copy_excluded": True,
+        "count": 0,
+        "mean": None,
+        "q10": None,
+        "q50": None,
+        "q90": None,
+    }
 
 
 def test_sample_weighted_mature_coverage_uses_tile_presentations():

@@ -195,6 +195,9 @@ def test_training_source_routes_centroid_without_changing_one_million_schedules(
         '"molcap_history"',
         '"molcap_centroid_ramp_gate.json"',
         'json.dumps(report, allow_nan=False, indent=2)',
+        "centroid_gate_boundary_proposal",
+        "if pending_history is not None and molcap_scale == 0.0:",
+        "boundary_proposal=centroid_gate_boundary_proposal",
     ):
         assert token in source
 

@@ -22,6 +22,7 @@ from train import (
     centroid_bank_state_digest,
     checkpoint_molcap_state,
     fold_peak_gpu_memory,
+    hierarchical_means,
     isolated_torch_rng,
     maybe_arm_labless_autosubmit,
     molcap_head_input_dim,
@@ -677,12 +678,41 @@ def populated_gate_bank():
     return bank
 
 
+def populated_gate_bank_with_committed_boundary_proposal():
+    bank = populated_gate_bank()
+    boundary_teacher = hierarchical_means(
+        torch.tensor([[0.8, 0.2], [0.2, 0.8]]),
+        torch.tensor([0, 1]),
+        bank.slide_to_patient,
+    )
+    proposal = bank.propose(boundary_teacher)
+    bank.commit(proposal, step=3)
+    return bank, proposal
+
+
 def test_centroid_ramp_gate_persists_strict_pass_and_failure_evidence(tmp_path):
     cfg = routed_molcap_config(history_enabled=True)["history"]
     passed_path = tmp_path / "passed.json"
     report = run_centroid_ramp_gate(populated_gate_bank(), cfg, passed_path)
     assert report["passed"] is True
     assert json.loads(passed_path.read_text())["passed"] is True
+    assert report["population_sizes"] == {
+        "mature_min_slide_updates": 2,
+        "observed_slides": 2,
+        "mature_slides": 2,
+        "observed_patients": 2,
+        "mature_patients": 2,
+    }
+    assert report["slide_update_count_distribution"]["q50"] == 2.0
+    assert report["observed_slides_per_patient_distribution"]["q50"] == 1.0
+    assert report["boundary_teacher_centroid_drift"] == {
+        "first_copy_excluded": True,
+        "count": 0,
+        "mean": None,
+        "q10": None,
+        "q50": None,
+        "q90": None,
+    }
     json.dumps(report, allow_nan=False)
 
     failed_path = tmp_path / "failed.json"
@@ -703,6 +733,89 @@ def test_centroid_ramp_gate_persists_strict_pass_and_failure_evidence(tmp_path):
     nonfinite = json.loads(nonfinite_path.read_text())
     assert nonfinite["passed"] is False
     json.dumps(nonfinite, allow_nan=False)
+
+
+def test_centroid_ramp_gate_records_last_committed_boundary_drift_without_mutation(tmp_path):
+    cfg = routed_molcap_config(history_enabled=True)["history"]
+    bank, proposal = populated_gate_bank_with_committed_boundary_proposal()
+    before = {name: value.clone() for name, value in bank.named_buffers()}
+
+    report = run_centroid_ramp_gate(
+        bank,
+        cfg,
+        tmp_path / "boundary.json",
+        boundary_proposal=proposal,
+    )
+
+    expected = proposal.drift_cosines.detach().cpu().double()
+    expected_quantiles = torch.quantile(
+        expected, torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)
+    ).tolist()
+    drift = report["boundary_teacher_centroid_drift"]
+    assert drift["first_copy_excluded"] is True
+    assert drift["count"] == len(expected) == 2
+    assert drift["mean"] == pytest.approx(float(expected.mean()))
+    assert [drift["q10"], drift["q50"], drift["q90"]] == pytest.approx(
+        expected_quantiles
+    )
+    assert json.loads((tmp_path / "boundary.json").read_text()) == report
+    json.dumps(report, allow_nan=False)
+    for name, value in bank.named_buffers():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_centroid_ramp_gate_rejects_uncommitted_boundary_proposal_strictly(tmp_path):
+    cfg = routed_molcap_config(history_enabled=True)["history"]
+    bank = populated_gate_bank()
+    proposal = bank.propose(
+        hierarchical_means(
+            torch.tensor([[0.8, 0.2], [0.2, 0.8]]),
+            torch.tensor([0, 1]),
+            bank.slide_to_patient,
+        )
+    )
+    before = {name: value.clone() for name, value in bank.named_buffers()}
+    path = tmp_path / "uncommitted.json"
+
+    with pytest.raises(AssertionError):
+        run_centroid_ramp_gate(
+            bank, cfg, path, boundary_proposal=proposal
+        )
+
+    failure = json.loads(path.read_text())
+    assert failure["passed"] is False
+    json.dumps(failure, allow_nan=False)
+    for name, value in bank.named_buffers():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_centroid_ramp_gate_requires_bitwise_committed_boundary_centroids(tmp_path):
+    cfg = routed_molcap_config(history_enabled=True)["history"]
+    bank = populated_gate_bank()
+    proposal = bank.propose(
+        hierarchical_means(
+            torch.eye(2), torch.tensor([0, 1]), bank.slide_to_patient
+        )
+    )
+    bank.commit(proposal, step=3)
+    altered_centroids = proposal.next_slide_centroids.clone()
+    altered_centroids[0, 1] = -0.0
+    altered = proposal._replace(next_slide_centroids=altered_centroids)
+    assert torch.equal(
+        bank.slide_centroids[altered.slide_ids], altered.next_slide_centroids
+    )
+    assert (
+        bank.slide_centroids[altered.slide_ids].cpu().numpy().tobytes()
+        != altered.next_slide_centroids.cpu().numpy().tobytes()
+    )
+
+    with pytest.raises(AssertionError):
+        run_centroid_ramp_gate(
+            bank,
+            cfg,
+            tmp_path / "byte-mismatch.json",
+            boundary_proposal=altered,
+        )
 
 
 def one_slide_proposal():

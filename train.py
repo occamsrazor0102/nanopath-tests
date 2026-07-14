@@ -1075,17 +1075,109 @@ def centroid_bank_state_digest(bank):
     return hasher.hexdigest()
 
 
-def centroid_audit(bank, min_slide_updates=2):
+def _fixed_distribution(values, quantiles):
+    assert isinstance(values, torch.Tensor) and values.ndim == 1
+    values = values.detach().to(device="cpu", dtype=torch.float64)
+    assert torch.isfinite(values).all()
+    summary = {
+        "count": int(values.numel()),
+        "mean": float(values.mean().item()) if values.numel() else None,
+    }
+    if values.numel():
+        levels = torch.tensor(
+            [level for _, level in quantiles], dtype=torch.float64
+        )
+        quantile_values = torch.quantile(values, levels).tolist()
+    else:
+        quantile_values = [None] * len(quantiles)
+    summary.update(
+        {label: value for (label, _), value in zip(quantiles, quantile_values)}
+    )
+    return summary
+
+
+def _boundary_teacher_drift(bank, boundary_proposal):
+    drift = torch.empty(0, dtype=torch.float64)
+    if boundary_proposal is not None:
+        assert isinstance(boundary_proposal, CentroidProposal)
+        assert boundary_proposal.base_state_step + 1 == int(
+            bank.centroid_state_step.item()
+        )
+        committed = bank.slide_centroids[boundary_proposal.slide_ids]
+        proposed = boundary_proposal.next_slide_centroids
+        assert committed.shape == proposed.shape and committed.dtype == proposed.dtype
+        assert (
+            committed.detach().cpu().contiguous().numpy().tobytes()
+            == proposed.detach().cpu().contiguous().numpy().tobytes()
+        )
+        drift = boundary_proposal.drift_cosines
+    return {
+        "first_copy_excluded": True,
+        **_fixed_distribution(
+            drift,
+            (("q10", 0.1), ("q50", 0.5), ("q90", 0.9)),
+        ),
+    }
+
+
+def centroid_audit(bank, min_slide_updates=2, *, boundary_proposal=None):
     assert isinstance(bank, HierarchicalCentroidBank)
     assert type(min_slide_updates) is int and min_slide_updates >= 1
-    _, observed = bank.patient_centroids(1)
-    _, mature = bank.patient_centroids(min_slide_updates)
+    observed_patient_ids, observed = bank.patient_centroids(1)
+    mature_patient_ids, mature = bank.patient_centroids(min_slide_updates)
+    slide_counts = bank.slide_counts.detach().cpu()
+    mapping = bank.slide_to_patient.detach().cpu()
+    observed_slides = slide_counts > 0
+    mature_slides = slide_counts >= min_slide_updates
+    observed_slides_per_patient = torch.bincount(
+        mapping[observed_slides], minlength=len(bank.patient_slide_counts)
+    )
+    observed_slides_per_patient = observed_slides_per_patient[
+        observed_slides_per_patient > 0
+    ]
+    assert len(observed_patient_ids) == len(observed_slides_per_patient)
     return {
         "sample_weighted_mature_coverage": bank.sample_weighted_mature_coverage(
             min_slide_updates
         ),
         "all_observed": centroid_geometry(observed),
         "mature_only": _diagnostic_centroid_geometry(mature),
+        "population_sizes": {
+            "mature_min_slide_updates": min_slide_updates,
+            "observed_slides": int(observed_slides.sum().item()),
+            "mature_slides": int(mature_slides.sum().item()),
+            "observed_patients": int(len(observed_patient_ids)),
+            "mature_patients": int(len(mature_patient_ids)),
+        },
+        "slide_update_count_distribution": {
+            "population": "observed_slides",
+            **_fixed_distribution(
+                slide_counts[observed_slides],
+                (
+                    ("q0", 0.0),
+                    ("q25", 0.25),
+                    ("q50", 0.5),
+                    ("q75", 0.75),
+                    ("q100", 1.0),
+                ),
+            ),
+        },
+        "observed_slides_per_patient_distribution": {
+            "population": "observed_patients",
+            **_fixed_distribution(
+                observed_slides_per_patient,
+                (
+                    ("q0", 0.0),
+                    ("q25", 0.25),
+                    ("q50", 0.5),
+                    ("q75", 0.75),
+                    ("q100", 1.0),
+                ),
+            ),
+        },
+        "boundary_teacher_centroid_drift": _boundary_teacher_drift(
+            bank, boundary_proposal
+        ),
     }
 
 
@@ -1282,11 +1374,17 @@ def restore_molcap_history(
     assert int(centroid_bank.centroid_state_step.item()) == checkpoint_step
 
 
-def run_centroid_ramp_gate(bank, history_cfg, report_path):
+def run_centroid_ramp_gate(
+    bank, history_cfg, report_path, *, boundary_proposal=None
+):
     report_path = Path(report_path)
     audit = None
     try:
-        audit = centroid_audit(bank, int(history_cfg["min_slide_updates"]))
+        audit = centroid_audit(
+            bank,
+            int(history_cfg["min_slide_updates"]),
+            boundary_proposal=boundary_proposal,
+        )
         require_centroid_gate(audit, history_cfg)
         report = {**audit, "passed": True}
         report_path.write_text(json.dumps(report, allow_nan=False, indent=2) + "\n")
@@ -1557,6 +1655,7 @@ def main():
     centroid_gate_passed = False
     centroid_gate_path = output_dir / "molcap_centroid_ramp_gate.json"
     last_routed_result = None
+    centroid_gate_boundary_proposal = None
     last_molcap_grad_cosine = 0.0
     last_molcap_grad_norm_ratio = 0.0
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
@@ -1875,7 +1974,10 @@ def main():
             molcap_scale = linear_ramp(sfrac, float(molcap_cfg["ramp_start"]), float(molcap_cfg["ramp_len"])) if molcap_cfg else 0.0
             if centroid_bank is not None and molcap_scale > 0 and not centroid_gate_passed:
                 centroid_gate_report = run_centroid_ramp_gate(
-                    centroid_bank, molcap_cfg["history"], centroid_gate_path
+                    centroid_bank,
+                    molcap_cfg["history"],
+                    centroid_gate_path,
+                    boundary_proposal=centroid_gate_boundary_proposal,
                 )
                 centroid_gate_passed = True
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
@@ -1932,6 +2034,9 @@ def main():
                     completed_step=completed_step,
                     post_backward=post_backward,
                 )
+                if pending_history is not None and molcap_scale == 0.0:
+                    assert int(centroid_bank.centroid_state_step.item()) == completed_step
+                    centroid_gate_boundary_proposal = pending_history
             if measured_flops_per_step is None:
                 measured_flops_per_step = int(flop_ctx.get_total_flops())
                 print(f"{console_prefix()} measured_flops_per_step: {measured_flops_per_step:,}", flush=True)
