@@ -1314,6 +1314,7 @@ def matched_latest_centroid_audit(*args, **kwargs):
     return _matched_latest_centroid_audit(
         *args,
         **kwargs,
+        expected_proposal_type=CentroidProposal,
         legacy_audit=lambda bank, min_slide_updates, boundary_proposal: centroid_audit(
             bank,
             min_slide_updates,
@@ -1691,6 +1692,13 @@ def run_centroid_ramp_gate(
             }
             _write_matched_latest_gate_report(report, report_path)
             raise AssertionError(failure)
+        resolved_world_size = world_size
+        if resolved_world_size is None:
+            environment_world_size = os.environ.get("WORLD_SIZE", "1")
+            try:
+                resolved_world_size = int(environment_world_size)
+            except (TypeError, ValueError, OverflowError):
+                resolved_world_size = environment_world_size
         audit = matched_latest_centroid_audit(
             bank,
             latest_bank,
@@ -1699,11 +1707,7 @@ def run_centroid_ramp_gate(
             mapping_digest=mapping_digest,
             history_metadata=history_metadata,
             shadow_metadata=shadow_metadata,
-            world_size=(
-                int(os.environ.get("WORLD_SIZE", "1"))
-                if world_size is None
-                else world_size
-            ),
+            world_size=resolved_world_size,
             boundary_proposal=boundary_proposal,
             boundary_shadow_proposal=boundary_shadow_proposal,
         )

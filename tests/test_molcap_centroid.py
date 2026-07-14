@@ -159,6 +159,36 @@ def test_linear_cka_stays_finite_for_extreme_finite_subnormal_centroids():
     assert geometry["linear_cka"] == pytest.approx(1.0, rel=1e-12, abs=1e-12)
 
 
+def test_repeated_nonrepresentable_float64_rows_have_exact_zero_centered_geometry():
+    value = torch.tensor(
+        [0.1, 0.2, 0.4], dtype=torch.float32
+    ).double().mean()
+    repeated = torch.full((512, 3), value.item(), dtype=torch.float64)
+
+    geometry = train_module.centroid_spectral_geometry(repeated)
+
+    assert geometry["trace"] == 0.0
+    assert geometry["spectrum"] == [0.0, 0.0, 0.0]
+    assert geometry["effective_rank"] is None
+    assert geometry["participation_ratio"] is None
+    assert geometry["min_norm"] == pytest.approx(
+        math.sqrt(3.0) * value.item(), rel=1e-15, abs=0.0
+    )
+
+
+def test_centered_geometry_is_exactly_translation_stable_for_nonconstant_rows():
+    translation = torch.tensor(
+        [0.1, 0.2, 0.4], dtype=torch.float32
+    ).double().mean()
+    base = torch.tensor([[-2.0], [1.0], [3.0]], dtype=torch.float64)
+
+    base_geometry = train_module.centroid_spectral_geometry(base)
+    translated_geometry = train_module.centroid_spectral_geometry(base + translation)
+
+    for name in ("trace", "spectrum", "effective_rank", "participation_ratio"):
+        assert translated_geometry[name] == base_geometry[name], name
+
+
 def test_matched_latest_permutation_seed_uses_unsigned_big_endian_digest_prefix():
     target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
     mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
@@ -483,6 +513,8 @@ def test_matched_latest_audit_uses_canonical_population_and_complete_geometry():
         "post_pass_action": "discard_after_durable_pass_report",
         "boundary_proposal": {
             "present": False,
+            "type_exact": None,
+            "transaction_valid": None,
             "committed_match": None,
             "state_step": 2,
             "first_copy_excluded": True,
@@ -540,6 +572,8 @@ def test_matched_latest_audit_validates_and_records_shadow_boundary_proposal():
 
     assert valid["shadow"]["boundary_proposal"] == {
         "present": True,
+        "type_exact": True,
+        "transaction_valid": True,
         "committed_match": True,
         "state_step": 2,
         "first_copy_excluded": True,
@@ -952,6 +986,285 @@ def committed_boundary_proposal(bank):
         drift_cosines=torch.ones(len(slide_ids), dtype=bank.slide_centroids.dtype),
         historical_tile_fraction=torch.tensor(1.0),
     )
+
+
+def duck_boundary_proposal(proposal):
+    return types.SimpleNamespace(
+        base_state_step=proposal.base_state_step,
+        slide_ids=proposal.slide_ids,
+        next_slide_centroids=proposal.next_slide_centroids,
+        drift_cosines=proposal.drift_cosines,
+    )
+
+
+def mutate_boundary_transaction(proposal, field):
+    if field == "base_state_step":
+        return proposal._replace(base_state_step=np.int64(proposal.base_state_step))
+    if field == "slide_ids":
+        return proposal._replace(slide_ids=proposal.slide_ids.to(torch.float32))
+    if field == "next_slide_centroids":
+        values = proposal.next_slide_centroids.clone()
+        values[0, 0] = float("nan")
+        return proposal._replace(next_slide_centroids=values)
+    if field == "slide_tile_counts":
+        counts = proposal.slide_tile_counts.clone()
+        counts[0] = 0
+        return proposal._replace(slide_tile_counts=counts)
+    if field == "patient_ids":
+        patient_ids = proposal.patient_ids.clone()
+        patient_ids[-1] = patient_ids[-2]
+        return proposal._replace(patient_ids=patient_ids)
+    if field == "patient_centroids":
+        centroids = proposal.patient_centroids.clone()
+        centroids[0, 0] = float("nan")
+        return proposal._replace(patient_centroids=centroids)
+    if field == "drift_cosines":
+        return proposal._replace(
+            drift_cosines=torch.full_like(proposal.drift_cosines, 1.5)
+        )
+    if field == "historical_tile_fraction":
+        return proposal._replace(historical_tile_fraction=torch.tensor(1.5))
+    raise AssertionError(field)
+
+
+def mismatch_paired_boundary_transaction(proposal, field):
+    if field == "base_state_step":
+        return proposal._replace(base_state_step=proposal.base_state_step + 1)
+    if field == "slide_ids":
+        return proposal._replace(
+            slide_ids=proposal.slide_ids[:-1],
+            next_slide_centroids=proposal.next_slide_centroids[:-1],
+            slide_tile_counts=proposal.slide_tile_counts[:-1],
+            patient_ids=proposal.patient_ids[:-1],
+            patient_centroids=proposal.patient_centroids[:-1],
+            drift_cosines=proposal.drift_cosines[:-1],
+        )
+    if field == "slide_tile_counts":
+        counts = proposal.slide_tile_counts.clone()
+        counts[0] = 2
+        return proposal._replace(slide_tile_counts=counts)
+    if field == "patient_ids":
+        patient_ids = proposal.patient_ids.clone()
+        patient_ids[-1] = patient_ids[-2]
+        return proposal._replace(patient_ids=patient_ids)
+    if field == "historical_tile_fraction":
+        return proposal._replace(historical_tile_fraction=torch.tensor(0.5))
+    raise AssertionError(field)
+
+
+@pytest.mark.parametrize("malformed_side", ["ema", "shadow"])
+def test_relative_runner_persists_exact_proposal_type_failures(
+    tmp_path, malformed_side
+):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    proposals = {
+        "ema": committed_boundary_proposal(ema),
+        "shadow": committed_boundary_proposal(latest),
+    }
+    proposals[malformed_side] = duck_boundary_proposal(proposals[malformed_side])
+    expected_failure = f"boundary_{malformed_side}_proposal_type_exact"
+    path = tmp_path / f"proposal-type-{malformed_side}.json"
+
+    with pytest.raises(AssertionError, match=expected_failure):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+            boundary_proposal=proposals["ema"],
+            boundary_shadow_proposal=proposals["shadow"],
+        )
+
+    report = json.loads(path.read_text())
+    provenance = report["state"]["boundary_proposals"][malformed_side]
+    assert provenance["present"] is True
+    assert provenance["type_exact"] is False
+    assert provenance["transaction_valid"] is False
+    assert provenance["committed_match"] is False
+    assert expected_failure in report["failures"]
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize("malformed_side", ["ema", "shadow"])
+def test_relative_runner_persists_sparse_exact_proposal_field_failures(
+    tmp_path, malformed_side
+):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    proposals = {
+        "ema": committed_boundary_proposal(ema),
+        "shadow": committed_boundary_proposal(latest),
+    }
+    proposals[malformed_side] = proposals[malformed_side]._replace(
+        slide_ids=proposals[malformed_side].slide_ids.to_sparse()
+    )
+    expected_failure = f"boundary_{malformed_side}_proposal_transaction_valid"
+    path = tmp_path / f"proposal-sparse-{malformed_side}.json"
+
+    with pytest.raises(AssertionError, match=expected_failure):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+            boundary_proposal=proposals["ema"],
+            boundary_shadow_proposal=proposals["shadow"],
+        )
+
+    report = json.loads(path.read_text())
+    provenance = report["state"]["boundary_proposals"][malformed_side]
+    assert provenance["type_exact"] is True
+    assert provenance["transaction_valid"] is False
+    assert provenance["committed_match"] is False
+    assert expected_failure in report["failures"]
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "base_state_step",
+        "slide_ids",
+        "next_slide_centroids",
+        "slide_tile_counts",
+        "patient_ids",
+        "patient_centroids",
+        "drift_cosines",
+        "historical_tile_fraction",
+    ],
+)
+def test_boundary_proposal_authenticity_validates_every_transaction_field(field):
+    ema, latest = oracle_matched_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    ema_proposal = committed_boundary_proposal(ema)
+    shadow_proposal = mutate_boundary_transaction(
+        committed_boundary_proposal(latest), field
+    )
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+        boundary_proposal=ema_proposal,
+        boundary_shadow_proposal=shadow_proposal,
+    )
+    report = train_module.evaluate_matched_latest_gate(audit, relative_gate_config())
+
+    provenance = audit["state"]["boundary_proposals"]["shadow"]
+    assert provenance["type_exact"] is True
+    assert provenance["transaction_valid"] is False
+    assert provenance["committed_match"] is False
+    assert "boundary_shadow_proposal_transaction_valid" in report["failures"]
+
+
+def test_boundary_proposal_authenticity_allows_float32_cosine_roundoff_at_one():
+    ema, latest = oracle_matched_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    def with_cosine_roundoff(proposal):
+        return proposal._replace(
+            drift_cosines=torch.full_like(proposal.drift_cosines, 1.0 + 3.0e-7)
+        )
+
+    audit = train_module.matched_latest_centroid_audit(
+        ema,
+        latest,
+        relative_gate_config(),
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=1,
+        boundary_proposal=with_cosine_roundoff(committed_boundary_proposal(ema)),
+        boundary_shadow_proposal=with_cosine_roundoff(
+            committed_boundary_proposal(latest)
+        ),
+    )
+
+    proposals = audit["state"]["boundary_proposals"]
+    assert proposals["ema"]["transaction_valid"] is True
+    assert proposals["shadow"]["transaction_valid"] is True
+    assert proposals["ema"]["committed_match"] is True
+    assert proposals["shadow"]["committed_match"] is True
+    assert proposals["paired"]["applicable"] is True
+    assert all(proposals["paired"]["matches"].values())
+
+
+@pytest.mark.parametrize(
+    ("field", "match_name"),
+    [
+        ("base_state_step", "base_state_step_equal"),
+        ("slide_ids", "slide_ids_equal"),
+        ("slide_tile_counts", "slide_tile_counts_equal"),
+        ("patient_ids", "patient_ids_equal"),
+        (
+            "historical_tile_fraction",
+            "historical_tile_fraction_equal",
+        ),
+    ],
+)
+def test_relative_runner_persists_paired_boundary_transaction_mismatches(
+    tmp_path, field, match_name
+):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    ema_proposal = committed_boundary_proposal(ema)
+    shadow_proposal = mismatch_paired_boundary_transaction(
+        committed_boundary_proposal(latest), field
+    )
+    expected_failure = f"boundary_proposal_{match_name}"
+    path = tmp_path / f"proposal-pair-{field}.json"
+
+    with pytest.raises(AssertionError):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=1,
+            boundary_proposal=ema_proposal,
+            boundary_shadow_proposal=shadow_proposal,
+        )
+
+    report = json.loads(path.read_text())
+    paired = report["state"]["boundary_proposals"]["paired"]
+    assert paired["applicable"] is True
+    assert paired["matches"][match_name] is False
+    assert expected_failure in report["failures"]
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
 
 
 @pytest.mark.parametrize(
@@ -1500,6 +1813,8 @@ def test_relative_runner_names_missing_shadow_and_persists_null_unavailable_repo
         "post_pass_action": "none",
         "boundary_proposal": {
             "present": False,
+            "type_exact": None,
+            "transaction_valid": None,
             "committed_match": None,
             "state_step": None,
             "first_copy_excluded": True,
@@ -1587,10 +1902,170 @@ def test_relative_runner_normalizes_nonfinite_world_size_and_persists_named_fail
     report = json.loads(path.read_text())
     assert report["provenance"]["world_size"] is None
     assert "provenance.world_size" in report["nonfinite_paths"]
+    assert "provenance.world_size:nonfinite" in report["unavailable"]
     assert "world_size_one" in report["failures"]
+    assert (
+        "audit_available:provenance.world_size:nonfinite" in report["failures"]
+    )
     assert "report_nonfinite:provenance.world_size" in report["failures"]
     assert report["passed"] is False
     json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "expected_unavailable", "expected_nonfinite_paths"),
+    [
+        (
+            torch.tensor([1.0, float("nan")]),
+            (
+                "provenance.world_size:non_scalar",
+                "provenance.world_size:nonfinite",
+            ),
+            ("provenance.world_size[1]",),
+        ),
+        (
+            np.asarray([1, 2], dtype=np.int64),
+            ("provenance.world_size:non_scalar",),
+            (),
+        ),
+        (
+            np.float64(1.0),
+            ("provenance.world_size:expected_integer",),
+            (),
+        ),
+    ],
+    ids=("torch-vector-nonfinite", "numpy-vector", "numpy-float-scalar"),
+)
+def test_relative_runner_normalizes_invalid_typed_world_size_before_boolean_checks(
+    tmp_path, world_size, expected_unavailable, expected_nonfinite_paths
+):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "invalid-typed-world-size.json"
+
+    with pytest.raises(AssertionError, match="world_size_one"):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=world_size,
+        )
+
+    report = json.loads(path.read_text())
+    assert report["provenance"]["world_size"] is None
+    assert all(reason in report["unavailable"] for reason in expected_unavailable)
+    assert report["nonfinite_paths"] == list(expected_nonfinite_paths)
+    assert "world_size_one" in report["failures"]
+    assert all(
+        f"audit_available:{reason}" in report["failures"]
+        for reason in expected_unavailable
+    )
+    assert all(
+        f"report_nonfinite:{path_name}" in report["failures"]
+        for path_name in expected_nonfinite_paths
+    )
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
+
+
+def test_relative_runner_persists_invalid_world_size_environment(tmp_path, monkeypatch):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "invalid-environment-world-size.json"
+    monkeypatch.setenv("WORLD_SIZE", "not-an-int")
+
+    with pytest.raises(AssertionError, match="world_size_one"):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+        )
+
+    report = json.loads(path.read_text())
+    reason = "provenance.world_size:expected_integer"
+    assert report["provenance"]["world_size"] is None
+    assert reason in report["unavailable"]
+    assert "world_size_one" in report["failures"]
+    assert f"audit_available:{reason}" in report["failures"]
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
+
+
+def test_relative_runner_persists_unreadable_scalar_integer_world_size(tmp_path):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+    path = tmp_path / "unreadable-world-size.json"
+
+    with pytest.raises(AssertionError, match="world_size_one"):
+        train_module.run_centroid_ramp_gate(
+            ema,
+            relative_gate_config(),
+            path,
+            latest_bank=latest,
+            target_sha256=target_sha256,
+            mapping_digest=mapping_digest,
+            history_metadata=metadata,
+            shadow_metadata=metadata,
+            world_size=torch.empty((), dtype=torch.int64, device="meta"),
+        )
+
+    report = json.loads(path.read_text())
+    reason = "provenance.world_size:unreadable"
+    assert report["provenance"]["world_size"] is None
+    assert reason in report["unavailable"]
+    assert "world_size_one" in report["failures"]
+    assert f"audit_available:{reason}" in report["failures"]
+    assert report["passed"] is False
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        1,
+        torch.tensor(1, dtype=torch.int64),
+        np.int64(1),
+        np.asarray(1, dtype=np.int64),
+    ],
+    ids=("python-int", "torch-scalar-int", "numpy-int", "numpy-zero-d-int"),
+)
+def test_relative_runner_accepts_typed_scalar_integer_world_size(tmp_path, world_size):
+    ema, latest = large_matched_gate_banks()
+    target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
+    mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
+    metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
+
+    report = train_module.run_centroid_ramp_gate(
+        ema,
+        relative_gate_config(),
+        tmp_path / "valid-typed-world-size.json",
+        latest_bank=latest,
+        target_sha256=target_sha256,
+        mapping_digest=mapping_digest,
+        history_metadata=metadata,
+        shadow_metadata=metadata,
+        world_size=world_size,
+    )
+
+    assert type(report["provenance"]["world_size"]) is int
+    assert report["provenance"]["world_size"] == 1
+    assert report["passed"] is True
 
 
 def test_completed_relative_report_recursively_nulls_nested_nonfinite_value(

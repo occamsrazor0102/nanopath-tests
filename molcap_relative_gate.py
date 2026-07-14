@@ -11,6 +11,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+
+def _translation_stable_center(values):
+    delta = values - values[0:1]
+    return delta - delta.mean(dim=0, keepdim=True)
+
+
 def _centroid_spectral_geometry_with_availability(patient_centroids):
     assert isinstance(patient_centroids, torch.Tensor)
     x = patient_centroids.detach().to(device="cpu", dtype=torch.float64)
@@ -20,7 +26,7 @@ def _centroid_spectral_geometry_with_availability(patient_centroids):
     if not bool(torch.isfinite(x).all()):
         return null, ["geometry:nonfinite"]
     norms = x.norm(dim=1)
-    centered = x - x.mean(dim=0, keepdim=True)
+    centered = _translation_stable_center(x)
     covariance = centered.T @ centered / (x.shape[0] - 1)
     spectrum = torch.linalg.eigvalsh(covariance).clamp_min(0).flip(0)
     total = spectrum.sum()
@@ -83,8 +89,8 @@ def _relative_centroid_geometry_with_availability(
     latest = latest_centroids.detach().to(device="cpu", dtype=torch.float64)
     assert ema.shape == latest.shape and ema.ndim == 2 and ema.shape[0] >= 2
     assert torch.isfinite(ema).all() and torch.isfinite(latest).all()
-    ema0 = ema - ema.mean(dim=0, keepdim=True)
-    latest0 = latest - latest.mean(dim=0, keepdim=True)
+    ema0 = _translation_stable_center(ema)
+    latest0 = _translation_stable_center(latest)
     ema_norm, latest_norm = ema0.norm(), latest0.norm()
     ema_geometry = (
         centroid_spectral_geometry(ema) if ema_geometry is None else ema_geometry
@@ -218,8 +224,8 @@ def matched_latest_permutation_audit(
     ema = ema_centroids.detach().to(device="cpu", dtype=torch.float64)
     latest = latest_centroids.detach().to(device="cpu", dtype=torch.float64)
     assert ema.shape == latest.shape and ema.ndim == 2 and ema.shape[0] >= 2
-    ema0 = ema - ema.mean(dim=0, keepdim=True)
-    latest0 = latest - latest.mean(dim=0, keepdim=True)
+    ema0 = _translation_stable_center(ema)
+    latest0 = _translation_stable_center(latest)
     denominator = ema0.norm() * latest0.norm()
     assert torch.isfinite(ema0).all() and torch.isfinite(latest0).all()
     assert denominator > 0
@@ -305,17 +311,24 @@ def _boundary_teacher_drift(bank, boundary_proposal):
     }
 
 
-def _boundary_proposal_provenance(bank, boundary_proposal):
+def _boundary_proposal_provenance(
+    bank, boundary_proposal, expected_proposal_type
+):
     state_step = int(bank.centroid_state_step.item())
     if boundary_proposal is None:
         return {
             "present": False,
+            "type_exact": None,
+            "transaction_valid": None,
             "committed_match": None,
             "state_step": state_step,
             **_boundary_teacher_drift(bank, None),
         }
+    type_exact = type(boundary_proposal) is expected_proposal_type
     invalid = {
         "present": True,
+        "type_exact": type_exact,
+        "transaction_valid": False,
         "committed_match": False,
         "state_step": state_step,
         "first_copy_excluded": True,
@@ -325,34 +338,131 @@ def _boundary_proposal_provenance(bank, boundary_proposal):
         "q50": None,
         "q90": None,
     }
+    if not type_exact:
+        return invalid
     try:
+        assert type(boundary_proposal.base_state_step) is int
+        assert boundary_proposal.base_state_step + 1 == state_step
         slide_ids = boundary_proposal.slide_ids
         proposed = boundary_proposal.next_slide_centroids
+        slide_tile_counts = boundary_proposal.slide_tile_counts
+        patient_ids = boundary_proposal.patient_ids
+        patient_centroids = boundary_proposal.patient_centroids
         drift = boundary_proposal.drift_cosines
+        historical_tile_fraction = boundary_proposal.historical_tile_fraction
+        device = bank.slide_centroids.device
         assert isinstance(slide_ids, torch.Tensor)
         assert slide_ids.ndim == 1 and slide_ids.numel() > 0
-        assert slide_ids.dtype == torch.int64
-        assert torch.all(slide_ids >= 0) and torch.all(
-            slide_ids < len(bank.slide_centroids)
+        assert slide_ids.dtype == torch.int64 and slide_ids.device == device
+        assert bool(torch.all(slide_ids >= 0)) and bool(
+            torch.all(slide_ids < len(bank.slide_centroids))
         )
-        assert len(slide_ids) == 1 or torch.all(slide_ids[1:] > slide_ids[:-1])
+        assert len(slide_ids) == 1 or bool(
+            torch.all(slide_ids[1:] > slide_ids[:-1])
+        )
         assert isinstance(proposed, torch.Tensor)
-        assert isinstance(drift, torch.Tensor) and torch.isfinite(drift).all()
+        assert proposed.shape == (
+            len(slide_ids),
+            bank.slide_centroids.shape[-1],
+        )
+        assert proposed.dtype == bank.slide_centroids.dtype
+        assert proposed.device == device and not proposed.requires_grad
+        assert bool(torch.isfinite(proposed).all())
+        assert isinstance(slide_tile_counts, torch.Tensor)
+        assert slide_tile_counts.shape == slide_ids.shape
+        assert slide_tile_counts.dtype == torch.int64
+        assert slide_tile_counts.device == device
+        assert bool(torch.all(slide_tile_counts > 0))
+        assert bool(torch.all(bank.slide_counts[slide_ids] > 0))
+        assert bool(
+            torch.all(
+                bank.slide_tile_presentations[slide_ids]
+                >= slide_tile_counts
+            )
+        )
+        expected_patient_ids = torch.unique(
+            bank.slide_to_patient[slide_ids], sorted=True
+        )
+        assert isinstance(patient_ids, torch.Tensor)
+        assert patient_ids.shape == expected_patient_ids.shape
+        assert patient_ids.dtype == torch.int64 and patient_ids.device == device
+        assert torch.equal(patient_ids, expected_patient_ids)
+        assert isinstance(patient_centroids, torch.Tensor)
+        assert patient_centroids.shape == (
+            len(patient_ids),
+            bank.slide_centroids.shape[-1],
+        )
+        assert patient_centroids.dtype == bank.slide_centroids.dtype
+        assert patient_centroids.device == device
+        assert not patient_centroids.requires_grad
+        assert bool(torch.isfinite(patient_centroids).all())
+        observed_patient_ids, observed_patient_centroids = bank.patient_centroids(1)
+        patient_positions = torch.searchsorted(
+            observed_patient_ids, patient_ids.detach().cpu()
+        )
+        assert bool(torch.all(patient_positions < len(observed_patient_ids)))
+        assert torch.equal(
+            observed_patient_ids[patient_positions], patient_ids.detach().cpu()
+        )
+        expected_patient_centroids = observed_patient_centroids[
+            patient_positions
+        ].to(device=device, dtype=bank.slide_centroids.dtype)
+        assert torch.allclose(
+            patient_centroids,
+            expected_patient_centroids,
+            atol=1.0e-6,
+            rtol=0.0,
+        )
+        seen_before = bank.slide_counts[slide_ids] > 1
+        assert isinstance(drift, torch.Tensor)
+        assert drift.shape == (int(seen_before.sum().item()),)
+        assert drift.dtype == bank.slide_centroids.dtype and drift.device == device
+        assert not drift.requires_grad and bool(torch.isfinite(drift).all())
+        cosine_tolerance = 1.0e-6
+        assert bool(torch.all(drift >= -1.0 - cosine_tolerance))
+        assert bool(torch.all(drift <= 1.0 + cosine_tolerance))
+        assert isinstance(historical_tile_fraction, torch.Tensor)
+        assert historical_tile_fraction.shape == torch.Size([])
+        assert historical_tile_fraction.dtype == bank.slide_centroids.dtype
+        assert historical_tile_fraction.device == device
+        assert not historical_tile_fraction.requires_grad
+        assert bool(torch.isfinite(historical_tile_fraction))
+        assert bool(historical_tile_fraction >= 0.0)
+        assert bool(historical_tile_fraction <= 1.0)
+        expected_fraction = (
+            slide_tile_counts[seen_before].sum().float()
+            / slide_tile_counts.sum().float()
+        )
+        assert torch.allclose(
+            historical_tile_fraction,
+            expected_fraction,
+            atol=1.0e-6,
+            rtol=0.0,
+        )
         summary = _boundary_teacher_drift(bank, boundary_proposal)
     except (AssertionError, AttributeError, IndexError, RuntimeError, TypeError, ValueError):
         return invalid
     return {
         "present": True,
+        "type_exact": True,
+        "transaction_valid": True,
         "committed_match": True,
         "state_step": state_step,
         **summary,
     }
 
 
-def _missing_boundary_proposal_provenance(boundary_proposal):
+def _missing_boundary_proposal_provenance(
+    boundary_proposal, expected_proposal_type
+):
+    present = boundary_proposal is not None
     return {
-        "present": boundary_proposal is not None,
-        "committed_match": False if boundary_proposal is not None else None,
+        "present": present,
+        "type_exact": (
+            type(boundary_proposal) is expected_proposal_type if present else None
+        ),
+        "transaction_valid": False if present else None,
+        "committed_match": False if present else None,
         "state_step": None,
         "first_copy_excluded": True,
         "count": None,
@@ -361,6 +471,59 @@ def _missing_boundary_proposal_provenance(boundary_proposal):
         "q50": None,
         "q90": None,
     }
+
+
+def _boundary_proposal_pairing(
+    ema_proposal, shadow_proposal, expected_proposal_type
+):
+    names = (
+        "base_state_step_equal",
+        "slide_ids_equal",
+        "slide_tile_counts_equal",
+        "patient_ids_equal",
+        "historical_tile_fraction_equal",
+    )
+    applicable = (
+        type(ema_proposal) is expected_proposal_type
+        and type(shadow_proposal) is expected_proposal_type
+    )
+    if not applicable:
+        return {
+            "applicable": False,
+            "matches": {name: None for name in names},
+        }
+
+    def tensors_equal(left, right):
+        if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+            return False
+        try:
+            return bool(torch.equal(left, right))
+        except (NotImplementedError, RuntimeError, TypeError, ValueError):
+            return False
+
+    matches = {
+        "base_state_step_equal": (
+            type(ema_proposal.base_state_step) is int
+            and type(shadow_proposal.base_state_step) is int
+            and ema_proposal.base_state_step == shadow_proposal.base_state_step
+        ),
+        "slide_ids_equal": tensors_equal(
+            ema_proposal.slide_ids, shadow_proposal.slide_ids
+        ),
+        "slide_tile_counts_equal": tensors_equal(
+            ema_proposal.slide_tile_counts,
+            shadow_proposal.slide_tile_counts,
+        ),
+        "patient_ids_equal": tensors_equal(
+            ema_proposal.patient_ids, shadow_proposal.patient_ids
+        ),
+        "historical_tile_fraction_equal": tensors_equal(
+            ema_proposal.historical_tile_fraction,
+            shadow_proposal.historical_tile_fraction,
+        ),
+    }
+    assert all(type(value) is bool for value in matches.values())
+    return {"applicable": True, "matches": matches}
 
 
 def _centroid_bank_state_digest(bank):
@@ -412,6 +575,76 @@ def _reported_scalars_finite(value):
     if type(value) in (list, tuple):
         return all(_reported_scalars_finite(item) for item in value)
     return True
+
+
+def _collect_nonfinite_paths(value, path, paths):
+    if isinstance(value, torch.Tensor):
+        try:
+            value = value.detach().to(device="cpu").tolist()
+        except (RuntimeError, TypeError, ValueError):
+            return
+    elif isinstance(value, np.ndarray):
+        try:
+            value = value.tolist()
+        except (TypeError, ValueError):
+            return
+    if isinstance(value, np.floating):
+        value = float(value)
+    if type(value) is float and not math.isfinite(value):
+        paths.append(path)
+        return
+    if isinstance(value, complex):
+        if not (math.isfinite(value.real) and math.isfinite(value.imag)):
+            paths.append(path)
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _collect_nonfinite_paths(item, f"{path}[{index}]", paths)
+
+
+def _normalize_world_size(world_size):
+    path = "provenance.world_size"
+    nonfinite_paths = []
+    _collect_nonfinite_paths(world_size, path, nonfinite_paths)
+    reason = None
+    normalized = None
+    if type(world_size) is int:
+        normalized = world_size
+    elif isinstance(world_size, np.integer) and not isinstance(world_size, np.bool_):
+        normalized = int(world_size)
+    elif isinstance(world_size, torch.Tensor):
+        if world_size.ndim != 0:
+            reason = "non_scalar"
+        else:
+            try:
+                torch.iinfo(world_size.dtype)
+            except TypeError:
+                reason = "expected_integer"
+            else:
+                try:
+                    normalized = int(
+                        world_size.detach().to(device="cpu").item()
+                    )
+                except (NotImplementedError, RuntimeError, TypeError, ValueError):
+                    reason = "unreadable"
+    elif isinstance(world_size, np.ndarray):
+        if world_size.ndim != 0:
+            reason = "non_scalar"
+        elif np.issubdtype(world_size.dtype, np.integer) and not np.issubdtype(
+            world_size.dtype, np.bool_
+        ):
+            normalized = int(world_size.item())
+        else:
+            reason = "expected_integer"
+    else:
+        reason = "expected_integer"
+    unavailable = [] if reason is None else [f"{path}:{reason}"]
+    if nonfinite_paths:
+        normalized = None
+        if reason == "expected_integer":
+            unavailable = []
+        unavailable.append(f"{path}:nonfinite")
+    return normalized, unavailable, nonfinite_paths
 
 
 def _null_centroid_spectral_geometry():
@@ -549,17 +782,27 @@ def _missing_latest_centroid_audit(
     history_metadata,
     shadow_metadata,
     world_size,
+    world_size_unavailable,
+    world_size_nonfinite_paths,
     boundary_proposal,
     boundary_shadow_proposal,
+    expected_proposal_type,
     legacy_audit,
 ):
     min_slide_updates = 2
     ema_ids, ema_matrix = ema_bank.patient_centroids(1)
     ema_mature_ids, ema_mature = ema_bank.patient_centroids(min_slide_updates)
     ema_geometry, ema_unavailable = _nullable_centroid_spectral_geometry(ema_matrix)
-    ema_boundary = _boundary_proposal_provenance(ema_bank, boundary_proposal)
+    ema_boundary = _boundary_proposal_provenance(
+        ema_bank, boundary_proposal, expected_proposal_type
+    )
     shadow_boundary = _missing_boundary_proposal_provenance(
-        boundary_shadow_proposal
+        boundary_shadow_proposal, expected_proposal_type
+    )
+    proposal_pairing = _boundary_proposal_pairing(
+        boundary_proposal,
+        boundary_shadow_proposal,
+        expected_proposal_type,
     )
     safe_boundary_proposal = (
         boundary_proposal if ema_boundary["committed_match"] is True else None
@@ -597,6 +840,11 @@ def _missing_latest_centroid_audit(
     return {
         **legacy,
         "gate_version": "matched_latest_v1",
+        **(
+            {"nonfinite_paths": world_size_nonfinite_paths}
+            if world_size_nonfinite_paths
+            else {}
+        ),
         "provenance": {
             "target_sha256": target_sha256,
             "mapping_digest": mapping_digest,
@@ -631,6 +879,7 @@ def _missing_latest_centroid_audit(
                 == shadow_boundary["present"],
                 "ema": ema_boundary,
                 "shadow": shadow_boundary,
+                "paired": proposal_pairing,
             },
             "ema": {
                 "momentum": ema_bank.momentum,
@@ -672,6 +921,7 @@ def _missing_latest_centroid_audit(
             "boundary_proposal": shadow_boundary,
         },
         "unavailable": [
+            *world_size_unavailable,
             "latest_shadow",
             *_prefix_geometry_unavailable("ema", ema_unavailable),
             "latest_geometry:missing_shadow",
@@ -695,9 +945,15 @@ def matched_latest_centroid_audit(
     legacy_audit,
     boundary_proposal=None,
     boundary_shadow_proposal=None,
+    expected_proposal_type=None,
 ):
     assert hasattr(ema_bank, "patient_centroids")
     assert ema_bank.momentum == 0.9
+    (
+        world_size,
+        world_size_unavailable,
+        world_size_nonfinite_paths,
+    ) = _normalize_world_size(world_size)
     if latest_bank is None:
         return _missing_latest_centroid_audit(
             ema_bank,
@@ -707,8 +963,11 @@ def matched_latest_centroid_audit(
             history_metadata=history_metadata,
             shadow_metadata=shadow_metadata,
             world_size=world_size,
+            world_size_unavailable=world_size_unavailable,
+            world_size_nonfinite_paths=world_size_nonfinite_paths,
             boundary_proposal=boundary_proposal,
             boundary_shadow_proposal=boundary_shadow_proposal,
+            expected_proposal_type=expected_proposal_type,
             legacy_audit=legacy_audit,
         )
     assert hasattr(latest_bank, "patient_centroids")
@@ -751,6 +1010,7 @@ def matched_latest_centroid_audit(
         latest_matrix
     )
     unavailable = [
+        *world_size_unavailable,
         *_prefix_geometry_unavailable("ema", ema_unavailable),
         *_prefix_geometry_unavailable("latest", latest_unavailable),
     ]
@@ -775,8 +1035,8 @@ def matched_latest_centroid_audit(
             if name not in ("ema", "latest")
         }
         unavailable.extend(relative_unavailable)
-        ema_centered = ema_matrix - ema_matrix.mean(dim=0, keepdim=True)
-        latest_centered = latest_matrix - latest_matrix.mean(dim=0, keepdim=True)
+        ema_centered = _translation_stable_center(ema_matrix)
+        latest_centered = _translation_stable_center(latest_matrix)
         if bool(ema_centered.norm() > 0 and latest_centered.norm() > 0):
             permutation = matched_latest_permutation_audit(
                 ema_matrix,
@@ -835,10 +1095,15 @@ def matched_latest_centroid_audit(
         "world_size": world_size,
     }
     ema_boundary_provenance = _boundary_proposal_provenance(
-        ema_bank, boundary_proposal
+        ema_bank, boundary_proposal, expected_proposal_type
     )
     shadow_boundary_provenance = _boundary_proposal_provenance(
-        latest_bank, boundary_shadow_proposal
+        latest_bank, boundary_shadow_proposal, expected_proposal_type
+    )
+    proposal_pairing = _boundary_proposal_pairing(
+        boundary_proposal,
+        boundary_shadow_proposal,
+        expected_proposal_type,
     )
     safe_boundary_proposal = (
         boundary_proposal
@@ -884,6 +1149,7 @@ def matched_latest_centroid_audit(
             == shadow_boundary_provenance["present"],
             "ema": ema_boundary_provenance,
             "shadow": shadow_boundary_provenance,
+            "paired": proposal_pairing,
         },
         "ema": {
             "momentum": ema_bank.momentum,
@@ -905,6 +1171,11 @@ def matched_latest_centroid_audit(
     return {
         **legacy,
         "gate_version": "matched_latest_v1",
+        **(
+            {"nonfinite_paths": world_size_nonfinite_paths}
+            if world_size_nonfinite_paths
+            else {}
+        ),
         "provenance": provenance,
         "state": state,
         "population": population,
@@ -985,6 +1256,20 @@ def evaluate_matched_latest_gate(audit, history_cfg):
     shadow_boundary = (
         None if boundary_proposals is None else boundary_proposals["shadow"]
     )
+    proposal_pairing = (
+        None if boundary_proposals is None else boundary_proposals.get("paired")
+    )
+    proposal_pair_checks = (
+        ()
+        if proposal_pairing is None
+        else tuple(
+            (
+                f"boundary_proposal_{name}",
+                proposal_pairing["applicable"] is not True or value is True,
+            )
+            for name, value in proposal_pairing["matches"].items()
+        )
+    )
     checks = (
         ("target_sha256_match", provenance["target_sha256_match"]),
         ("mapping_digest_match", provenance["mapping_digest_match"]),
@@ -997,10 +1282,34 @@ def evaluate_matched_latest_gate(audit, history_cfg):
             boundary_proposals is None or boundary_proposals["presence_equal"],
         ),
         (
+            "boundary_ema_proposal_type_exact",
+            ema_boundary is None
+            or not ema_boundary["present"]
+            or ema_boundary["type_exact"] is True,
+        ),
+        (
+            "boundary_ema_proposal_transaction_valid",
+            ema_boundary is None
+            or not ema_boundary["present"]
+            or ema_boundary["transaction_valid"] is True,
+        ),
+        (
             "boundary_ema_proposal_committed",
             ema_boundary is None
             or not ema_boundary["present"]
             or ema_boundary["committed_match"] is True,
+        ),
+        (
+            "boundary_shadow_proposal_type_exact",
+            shadow_boundary is None
+            or not shadow_boundary["present"]
+            or shadow_boundary["type_exact"] is True,
+        ),
+        (
+            "boundary_shadow_proposal_transaction_valid",
+            shadow_boundary is None
+            or not shadow_boundary["present"]
+            or shadow_boundary["transaction_valid"] is True,
         ),
         (
             "boundary_shadow_proposal_committed",
@@ -1008,7 +1317,12 @@ def evaluate_matched_latest_gate(audit, history_cfg):
             or not shadow_boundary["present"]
             or shadow_boundary["committed_match"] is True,
         ),
-        ("world_size_one", provenance["world_size"] == 1),
+        *proposal_pair_checks,
+        (
+            "world_size_one",
+            type(provenance["world_size"]) is int
+            and provenance["world_size"] == 1,
+        ),
         ("min_slide_updates_exact", state["min_slide_updates"] == 2),
         ("ema_state_finite", state["ema_finite"]),
         ("latest_state_finite", state["latest_finite"]),
@@ -1037,7 +1351,12 @@ def evaluate_matched_latest_gate(audit, history_cfg):
         ("permutation_count_exact", permutation["count"] == 256),
         ("max_permutation_p_value", at_most(permutation["p_value"], 0.01)),
     )
-    failures.extend(name for name, passed in checks if not passed)
+    checks = tuple(
+        (name, passed if type(passed) is bool else False)
+        for name, passed in checks
+    )
+    assert all(type(passed) is bool for _, passed in checks)
+    failures.extend(name for name, passed in checks if passed is not True)
     failures.extend(
         f"audit_available:{name}"
         for name in audit["unavailable"]
