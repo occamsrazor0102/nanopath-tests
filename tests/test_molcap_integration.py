@@ -17,10 +17,14 @@ from dataloader import TCGATileDataset
 from model import DinoV2ViT, MolCapHead, gradient_alignment, molcap_loss, seed_neutral_molcap_head
 from train import (
     HierarchicalCentroidBank,
+    build_latest_shadow_metadata,
     build_molcap_history_metadata,
     build_molcap_summary,
     centroid_bank_state_digest,
     checkpoint_molcap_state,
+    commit_matched_centroid_updates,
+    create_latest_observation_shadow,
+    discard_latest_observation_shadow,
     fold_peak_gpu_memory,
     hierarchical_means,
     isolated_torch_rng,
@@ -32,7 +36,9 @@ from train import (
     new_molcap_gradient_diagnostics,
     maybe_paired_routed_molcap,
     paired_routed_molcap,
+    propose_matched_centroid_updates,
     record_molcap_gradient_diagnostic,
+    require_fresh_matched_latest_run,
     restore_molcap_history,
     restore_sample_order_prefix,
     run_centroid_ramp_gate,
@@ -305,6 +311,12 @@ def centroid_metadata(history_enabled=True):
     return build_molcap_history_metadata(cfg, dataset)
 
 
+def relative_history_config():
+    history = dict(routed_molcap_config(history_enabled=True)["history"])
+    history.update(gate_version="matched_latest_v1", latest_momentum=0.0)
+    return history
+
+
 def test_probe_route_head_initialization_is_seed_neutral_at_1536_input():
     torch.manual_seed(7777)
     expected = torch.rand(4)
@@ -465,6 +477,117 @@ def test_nonzero_paired_route_mechanics_reach_student_and_head_without_teacher_o
     assert all(parameter.grad is None for parameter in teacher.parameters())
 
 
+def test_latest_shadow_has_no_forward_gradient_rng_or_real_ema_state_effect():
+    torch.manual_seed(83)
+    plain_head = MolCapHead(4, 3)
+    shadow_head = deepcopy(plain_head)
+    plain_student = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0]] * 2,
+        requires_grad=True,
+    )
+    shadow_student = plain_student.detach().clone().requires_grad_(True)
+    teacher = torch.tensor(
+        [[4.0, 3.0, 2.0, 1.0], [8.0, 6.0, 4.0, 2.0]] * 2,
+        requires_grad=True,
+    )
+    slide_ids = patient_ids = torch.tensor([0, 1], dtype=torch.int64)
+    mapping = torch.tensor([0, 1], dtype=torch.int64)
+    targets = torch.nn.functional.normalize(
+        torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]]), dim=-1
+    )
+    present = torch.ones(2)
+    plain_ema = HierarchicalCentroidBank(mapping, feature_dim=4, momentum=0.9)
+    shadowed_ema = HierarchicalCentroidBank(mapping, feature_dim=4, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=4, momentum=0.0)
+    cpu_rng = torch.random.get_rng_state().clone()
+    cuda_rng = (
+        [state.clone() for state in torch.cuda.get_rng_state_all()]
+        if torch.cuda.is_available()
+        else []
+    )
+
+    plain = paired_routed_molcap(
+        plain_head,
+        plain_student,
+        teacher,
+        slide_ids,
+        patient_ids,
+        mapping,
+        targets,
+        present,
+        views=2,
+        weight=0.03,
+        scale=1.0,
+        centroid_bank=plain_ema,
+    )
+    shadowed = paired_routed_molcap(
+        shadow_head,
+        shadow_student,
+        teacher,
+        slide_ids,
+        patient_ids,
+        mapping,
+        targets,
+        present,
+        views=2,
+        weight=0.03,
+        scale=1.0,
+        centroid_bank=shadowed_ema,
+        centroid_shadow_bank=latest,
+    )
+
+    assert torch.equal(torch.random.get_rng_state(), cpu_rng)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(torch.cuda.get_rng_state_all(), cuda_rng)
+    )
+    assert shadowed.pending_shadow_history is not None
+    assert not shadowed.pending_shadow_history.next_slide_centroids.requires_grad
+    assert torch.equal(plain.patient_features, shadowed.patient_features)
+    assert torch.equal(plain.loss, shadowed.loss)
+    plain.loss.backward()
+    shadowed.loss.backward()
+    assert torch.equal(plain_student.grad, shadow_student.grad)
+    for plain_parameter, shadow_parameter in zip(
+        plain_head.parameters(), shadow_head.parameters()
+    ):
+        assert torch.equal(plain_parameter.grad, shadow_parameter.grad)
+    assert teacher.grad is None
+
+    plain_ema.commit(plain.pending_history, step=1)
+    commit_matched_centroid_updates(
+        shadowed_ema,
+        shadowed.pending_history,
+        latest,
+        shadowed.pending_shadow_history,
+        step=1,
+    )
+    assert centroid_bank_state_digest(plain_ema) == centroid_bank_state_digest(
+        shadowed_ema
+    )
+    second_teacher = hierarchical_means(
+        torch.tensor([[40.0, 30.0, 20.0, 10.0], [80.0, 60.0, 40.0, 20.0]]),
+        slide_ids,
+        mapping,
+    )
+    plain_second = plain_ema.propose(second_teacher)
+    shadowed_second, latest_second = propose_matched_centroid_updates(
+        shadowed_ema, latest, second_teacher
+    )
+    plain_ema.commit(plain_second, step=2)
+    commit_matched_centroid_updates(
+        shadowed_ema,
+        shadowed_second,
+        latest,
+        latest_second,
+        step=2,
+    )
+    assert centroid_bank_state_digest(plain_ema) == centroid_bank_state_digest(
+        shadowed_ema
+    )
+    assert not torch.equal(shadowed_ema.slide_centroids, latest.slide_centroids)
+
+
 def test_validation_style_routed_call_skips_auxiliary_forward_and_preserves_bank():
     class FailIfForwarded(torch.nn.Module):
         def __init__(self):
@@ -613,6 +736,95 @@ def test_history_metadata_is_exact_and_uses_dataset_provenance():
     }
 
 
+def test_matched_latest_lifecycle_is_config_explicit_and_fresh_only():
+    mapping = torch.tensor([0, 1], dtype=torch.int64)
+    relative = relative_history_config()
+    cpu_rng = torch.random.get_rng_state().clone()
+    cuda_rng = (
+        [state.clone() for state in torch.cuda.get_rng_state_all()]
+        if torch.cuda.is_available()
+        else []
+    )
+    shadow = create_latest_observation_shadow(relative, mapping, feature_dim=32)
+
+    assert isinstance(shadow, HierarchicalCentroidBank)
+    assert shadow.momentum == 0.0
+    assert torch.equal(torch.random.get_rng_state(), cpu_rng)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(torch.cuda.get_rng_state_all(), cuda_rng)
+    )
+    assert create_latest_observation_shadow(
+        routed_molcap_config(history_enabled=True)["history"],
+        mapping,
+        feature_dim=32,
+    ) is None
+    assert create_latest_observation_shadow(
+        routed_molcap_config(history_enabled=False)["history"],
+        mapping,
+        feature_dim=32,
+    ) is None
+    require_fresh_matched_latest_run(relative, resume=None)
+    with pytest.raises(ValueError, match="fresh"):
+        require_fresh_matched_latest_run(relative, resume="latest.pt")
+    require_fresh_matched_latest_run(
+        routed_molcap_config(history_enabled=True)["history"],
+        resume="latest.pt",
+    )
+
+
+def test_shadow_serializes_only_in_preboundary_full_checkpoint_and_discards_after_pass():
+    head = MolCapHead(32, 6)
+    mapping = torch.tensor([0, 1], dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=32, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=32, momentum=0.0)
+    history_metadata = centroid_metadata()
+    shadow_metadata = build_latest_shadow_metadata(
+        history_metadata, relative_history_config()
+    )
+
+    probe_payload = checkpoint_molcap_state(
+        {"model": {}},
+        full=False,
+        checkpoint_step=0,
+        molcap_head=head,
+        centroid_bank=ema,
+        history_metadata=history_metadata,
+        centroid_shadow_bank=latest,
+        shadow_metadata=shadow_metadata,
+    )
+    assert set(probe_payload) == {"model"}
+
+    full_payload = checkpoint_molcap_state(
+        {"step": 0},
+        full=True,
+        checkpoint_step=0,
+        molcap_head=head,
+        centroid_bank=ema,
+        history_metadata=history_metadata,
+        centroid_shadow_bank=latest,
+        shadow_metadata=shadow_metadata,
+    )
+    assert full_payload["molcap_latest_shadow"]["metadata"] == shadow_metadata
+    assert int(full_payload["molcap_latest_shadow"]["centroid_state_step"]) == 0
+
+    assert discard_latest_observation_shadow(latest, gate_passed=False) is latest
+    latest = discard_latest_observation_shadow(latest, gate_passed=True)
+    assert latest is None
+    after_gate_payload = checkpoint_molcap_state(
+        {"step": 0},
+        full=True,
+        checkpoint_step=0,
+        molcap_head=head,
+        centroid_bank=ema,
+        history_metadata=history_metadata,
+        centroid_shadow_bank=latest,
+        shadow_metadata=shadow_metadata,
+    )
+    assert "molcap_latest_shadow" not in after_gate_payload
+    assert discard_latest_observation_shadow(None, gate_passed=True) is None
+
+
 def test_checkpoint_probe_returns_before_head_history_export_or_bank_mutation():
     head = MolCapHead(32, 6)
     bank = HierarchicalCentroidBank(torch.tensor([0, 1]), feature_dim=32, momentum=0.9)
@@ -655,6 +867,7 @@ def test_full_checkpoint_history_is_step_exact_and_resume_rejects_routed_arm_mis
         "molcap_sample_order_prefix",
         "molcap_sample_order_available",
     }
+    assert "molcap_latest_shadow" not in payload
     assert int(payload["molcap_history"]["centroid_state_step"]) == payload["step"] == 0
 
     restored = HierarchicalCentroidBank(torch.tensor([0, 1]), feature_dim=32, momentum=0.9)
@@ -858,6 +1071,68 @@ def test_transactional_optimizer_commits_only_after_finite_successful_step():
     )
     assert torch.isfinite(grad_norm)
     assert int(bank.centroid_state_step) == 1
+
+
+def test_transactional_optimizer_commits_matched_shadow_only_after_successful_step():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    mapping = torch.tensor([0], dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=1, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=1, momentum=0.0)
+    hierarchy = hierarchical_means(torch.tensor([[2.0]]), mapping, mapping)
+    ema_proposal, latest_proposal = (
+        ema.propose(hierarchy),
+        latest.propose(hierarchy),
+    )
+
+    transactional_optimizer_step(
+        parameter.square(),
+        optimizer,
+        [parameter],
+        clip_grad=1.0,
+        centroid_bank=ema,
+        pending_history=ema_proposal,
+        centroid_shadow_bank=latest,
+        pending_shadow_history=latest_proposal,
+        completed_step=1,
+    )
+
+    assert int(ema.centroid_state_step) == int(latest.centroid_state_step) == 1
+    assert torch.equal(ema.slide_counts, latest.slide_counts)
+    assert torch.equal(ema.slide_tile_presentations, latest.slide_tile_presentations)
+
+
+def test_transactional_optimizer_failure_leaves_both_matched_banks_uncommitted():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+
+    class RaisingSGD(torch.optim.SGD):
+        def step(self, closure=None):
+            raise RuntimeError("optimizer failure")
+
+    optimizer = RaisingSGD([parameter], lr=0.1)
+    mapping = torch.tensor([0], dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=1, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=1, momentum=0.0)
+    hierarchy = hierarchical_means(torch.tensor([[2.0]]), mapping, mapping)
+    ema_proposal, latest_proposal = propose_matched_centroid_updates(
+        ema, latest, hierarchy
+    )
+
+    with pytest.raises(RuntimeError, match="optimizer failure"):
+        transactional_optimizer_step(
+            parameter.square(),
+            optimizer,
+            [parameter],
+            clip_grad=1.0,
+            centroid_bank=ema,
+            pending_history=ema_proposal,
+            centroid_shadow_bank=latest,
+            pending_shadow_history=latest_proposal,
+            completed_step=1,
+        )
+
+    assert int(ema.centroid_state_step) == int(latest.centroid_state_step) == 0
+    assert ema.slide_counts.sum() == latest.slide_counts.sum() == 0
 
 
 @pytest.mark.parametrize("failure", ["loss", "gradient", "optimizer"])

@@ -396,6 +396,7 @@ def teacher_value_student_gradient(student, teacher):
 class RoutedMolCapResult(NamedTuple):
     loss: torch.Tensor
     pending_history: object
+    pending_shadow_history: object
     patient_features: torch.Tensor
     patient_targets: torch.Tensor
     patient_present: torch.Tensor
@@ -417,6 +418,7 @@ def paired_routed_molcap(
     weight,
     scale,
     centroid_bank=None,
+    centroid_shadow_bank=None,
 ):
     batch_size = int(tile_slide_ids.numel())
     assert tile_slide_ids.shape == tile_patient_ids.shape == (batch_size,)
@@ -439,11 +441,19 @@ def paired_routed_molcap(
     assert torch.equal(student_hierarchy.slide_ids, teacher_hierarchy.slide_ids)
     assert torch.equal(student_hierarchy.patient_ids, teacher_hierarchy.patient_ids)
     pending_history = None
+    pending_shadow_history = None
     teacher_value = teacher_hierarchy.patient_means
     if centroid_bank is not None:
-        pending_history = centroid_bank.propose(teacher_hierarchy)
+        if centroid_shadow_bank is None:
+            pending_history = centroid_bank.propose(teacher_hierarchy)
+        else:
+            pending_history, pending_shadow_history = propose_matched_centroid_updates(
+                centroid_bank, centroid_shadow_bank, teacher_hierarchy
+            )
         assert torch.equal(pending_history.patient_ids, student_hierarchy.patient_ids)
         teacher_value = pending_history.patient_centroids
+    else:
+        assert centroid_shadow_bank is None
     patient_features = teacher_value_student_gradient(
         student_hierarchy.patient_means, teacher_value
     )
@@ -464,6 +474,7 @@ def paired_routed_molcap(
     return RoutedMolCapResult(
         loss,
         pending_history,
+        pending_shadow_history,
         patient_features,
         patient_targets,
         patient_present,
@@ -490,6 +501,7 @@ def maybe_paired_routed_molcap(
     weight,
     scale,
     centroid_bank,
+    centroid_shadow_bank=None,
 ):
     if molcap_target is None:
         assert teacher_probe_features is None
@@ -516,6 +528,7 @@ def maybe_paired_routed_molcap(
         weight=weight,
         scale=scale,
         centroid_bank=centroid_bank,
+        centroid_shadow_bank=centroid_shadow_bank,
     )
 
 
@@ -771,13 +784,19 @@ class CentroidProposal(NamedTuple):
     historical_tile_fraction: torch.Tensor
 
 
+class ValidatedCentroidCommit(NamedTuple):
+    patient_ids: torch.Tensor
+    expected_sums: torch.Tensor
+    expected_counts: torch.Tensor
+
+
 class HierarchicalCentroidBank(nn.Module):
     def __init__(self, slide_to_patient, feature_dim, momentum):
         super().__init__()
         assert slide_to_patient.ndim == 1 and slide_to_patient.numel() > 0
         assert slide_to_patient.dtype == torch.int64 and torch.all(slide_to_patient >= 0)
         assert isinstance(feature_dim, int) and feature_dim > 0
-        assert float(momentum) == 0.9
+        assert float(momentum) in (0.0, 0.9)
         mapping = slide_to_patient.detach().clone()
         patient_count = int(mapping.max().item()) + 1
         assert torch.equal(torch.unique(mapping), torch.arange(patient_count, device=mapping.device))
@@ -895,11 +914,14 @@ class HierarchicalCentroidBank(nn.Module):
         old = self.slide_centroids[slide_ids]
         seen = self.slide_counts[slide_ids] > 0
         teacher_means = teacher.slide_means.detach()
-        next_values = torch.where(
-            seen[:, None],
-            self.momentum * old + (1.0 - self.momentum) * teacher_means,
-            teacher_means,
-        )
+        if self.momentum == 0.0:
+            next_values = teacher_means
+        else:
+            next_values = torch.where(
+                seen[:, None],
+                self.momentum * old + (1.0 - self.momentum) * teacher_means,
+                teacher_means,
+            )
         deltas = next_values - torch.where(seen[:, None], old, torch.zeros_like(old))
         sums = self.patient_sums[patient_ids] + deterministic_grouped_sum(
             deltas, inverse, len(patient_ids), trusted_dense=True
@@ -924,8 +946,8 @@ class HierarchicalCentroidBank(nn.Module):
         )
 
     @torch.no_grad()
-    def commit(self, proposal, step):
-        # Validate the whole proposal before the first write, making rejection atomic.
+    def validate_proposal(self, proposal, step):
+        # Validate the whole proposal without mutating committed state.
         assert isinstance(proposal, CentroidProposal)
         state_step = int(self.centroid_state_step.item())
         assert type(proposal.base_state_step) is int and proposal.base_state_step == state_step
@@ -1001,13 +1023,24 @@ class HierarchicalCentroidBank(nn.Module):
         assert not proposal.historical_tile_fraction.requires_grad
         assert torch.isfinite(proposal.historical_tile_fraction)
         assert torch.allclose(proposal.historical_tile_fraction, expected_fraction, atol=1e-6, rtol=0)
-        old = old.clone()
+        return ValidatedCentroidCommit(patient_ids, expected_sums, expected_counts)
+
+    @torch.no_grad()
+    def _apply_validated_proposal(self, proposal, step, validated):
+        assert isinstance(validated, ValidatedCentroidCommit)
+        slide_ids = proposal.slide_ids
         self.slide_centroids[slide_ids] = proposal.next_slide_centroids
         self.slide_counts[slide_ids] += 1
         self.slide_tile_presentations[slide_ids] += proposal.slide_tile_counts
-        self.patient_sums[patient_ids] = expected_sums
-        self.patient_slide_counts[patient_ids] = expected_counts
+        self.patient_sums[validated.patient_ids] = validated.expected_sums
+        self.patient_slide_counts[validated.patient_ids] = validated.expected_counts
         self.centroid_state_step.fill_(step)
+
+    @torch.no_grad()
+    def commit(self, proposal, step):
+        # Legacy single-bank commits remain atomic on validation failure.
+        validated = self.validate_proposal(proposal, step)
+        self._apply_validated_proposal(proposal, step, validated)
 
     @torch.no_grad()
     def export_state(self, metadata):
@@ -1081,6 +1114,55 @@ class HierarchicalCentroidBank(nn.Module):
             getattr(self, name).copy_(staged[name])
         self.patient_sums.copy_(rebuilt_sums)
         self.patient_slide_counts.copy_(rebuilt_counts)
+
+
+def _assert_matched_centroid_banks(ema_bank, latest_bank):
+    assert isinstance(ema_bank, HierarchicalCentroidBank)
+    assert isinstance(latest_bank, HierarchicalCentroidBank)
+    assert ema_bank.momentum == 0.9 and latest_bank.momentum == 0.0
+    assert ema_bank.slide_centroids.shape == latest_bank.slide_centroids.shape
+    assert ema_bank.slide_centroids.device == latest_bank.slide_centroids.device
+    assert torch.equal(ema_bank.slide_to_patient, latest_bank.slide_to_patient)
+    assert torch.equal(ema_bank.slide_counts, latest_bank.slide_counts)
+    assert torch.equal(
+        ema_bank.slide_tile_presentations, latest_bank.slide_tile_presentations
+    )
+    assert torch.equal(
+        ema_bank.patient_slide_counts, latest_bank.patient_slide_counts
+    )
+    assert torch.equal(ema_bank.centroid_state_step, latest_bank.centroid_state_step)
+
+
+def _assert_matched_centroid_proposals(ema_proposal, latest_proposal):
+    assert isinstance(ema_proposal, CentroidProposal)
+    assert isinstance(latest_proposal, CentroidProposal)
+    assert ema_proposal.base_state_step == latest_proposal.base_state_step
+    assert torch.equal(ema_proposal.slide_ids, latest_proposal.slide_ids)
+    assert torch.equal(
+        ema_proposal.slide_tile_counts, latest_proposal.slide_tile_counts
+    )
+    assert torch.equal(ema_proposal.patient_ids, latest_proposal.patient_ids)
+
+
+def propose_matched_centroid_updates(ema_bank, latest_bank, teacher_hierarchy):
+    _assert_matched_centroid_banks(ema_bank, latest_bank)
+    ema_proposal = ema_bank.propose(teacher_hierarchy)
+    latest_proposal = latest_bank.propose(teacher_hierarchy)
+    _assert_matched_centroid_proposals(ema_proposal, latest_proposal)
+    return ema_proposal, latest_proposal
+
+
+@torch.no_grad()
+def commit_matched_centroid_updates(
+    ema_bank, ema_proposal, latest_bank, latest_proposal, *, step
+):
+    _assert_matched_centroid_banks(ema_bank, latest_bank)
+    _assert_matched_centroid_proposals(ema_proposal, latest_proposal)
+    ema_validated = ema_bank.validate_proposal(ema_proposal, step)
+    latest_validated = latest_bank.validate_proposal(latest_proposal, step)
+    ema_bank._apply_validated_proposal(ema_proposal, step, ema_validated)
+    latest_bank._apply_validated_proposal(latest_proposal, step, latest_validated)
+    _assert_matched_centroid_banks(ema_bank, latest_bank)
 
 
 def centroid_bank_state_digest(bank):
@@ -1264,6 +1346,46 @@ def build_molcap_history_metadata(molcap_cfg, train_ds):
     }
 
 
+def matched_latest_shadow_enabled(history_cfg):
+    assert type(history_cfg) is dict
+    return history_cfg.get("gate_version") == "matched_latest_v1"
+
+
+def require_fresh_matched_latest_run(history_cfg, resume):
+    if matched_latest_shadow_enabled(history_cfg) and resume is not None:
+        raise ValueError("matched_latest_v1 is a fresh-only experiment; train.resume must be null")
+
+
+def create_latest_observation_shadow(history_cfg, slide_to_patient, feature_dim):
+    if not matched_latest_shadow_enabled(history_cfg):
+        return None
+    assert history_cfg["enabled"] is True
+    assert float(history_cfg["latest_momentum"]) == 0.0
+    return HierarchicalCentroidBank(
+        slide_to_patient, feature_dim=feature_dim, momentum=0.0
+    )
+
+
+def build_latest_shadow_metadata(history_metadata, history_cfg):
+    assert type(history_metadata) is dict
+    assert matched_latest_shadow_enabled(history_cfg)
+    assert float(history_cfg["latest_momentum"]) == 0.0
+    return {
+        **history_metadata,
+        "arm": "latest_observation_shadow",
+        "momentum": 0.0,
+        "gate_version": "matched_latest_v1",
+    }
+
+
+def discard_latest_observation_shadow(shadow_bank, *, gate_passed):
+    assert type(gate_passed) is bool
+    if shadow_bank is not None:
+        assert isinstance(shadow_bank, HierarchicalCentroidBank)
+        assert shadow_bank.momentum == 0.0
+    return None if gate_passed else shadow_bank
+
+
 def sample_order_prefix_digest(sample_ids, limit=8192):
     assert type(limit) is int and limit > 0
     hasher = hashlib.sha256()
@@ -1407,6 +1529,8 @@ def checkpoint_molcap_state(
     molcap_head,
     centroid_bank,
     history_metadata,
+    centroid_shadow_bank=None,
+    shadow_metadata=None,
     sample_order_prefix=None,
     sample_order_available=None,
 ):
@@ -1423,6 +1547,15 @@ def checkpoint_molcap_state(
         assert int(centroid_bank.centroid_state_step.item()) == checkpoint_step
         assert type(history_metadata) is dict
         payload["molcap_history"] = centroid_bank.export_state(history_metadata)
+    if centroid_shadow_bank is not None:
+        assert centroid_bank is not None
+        assert type(checkpoint_step) is int
+        assert int(centroid_shadow_bank.centroid_state_step.item()) == checkpoint_step
+        assert type(shadow_metadata) is dict
+        _assert_matched_centroid_banks(centroid_bank, centroid_shadow_bank)
+        payload["molcap_latest_shadow"] = centroid_shadow_bank.export_state(
+            shadow_metadata
+        )
     if sample_order_available is not None:
         assert type(sample_order_available) is bool
         prefix = [] if sample_order_prefix is None else list(sample_order_prefix)
@@ -1486,6 +1619,8 @@ def transactional_optimizer_step(
     clip_grad,
     centroid_bank=None,
     pending_history=None,
+    centroid_shadow_bank=None,
+    pending_shadow_history=None,
     completed_step=None,
     post_backward=None,
 ):
@@ -1506,10 +1641,22 @@ def transactional_optimizer_step(
     optimizer.step()
     if pending_history is not None:
         assert centroid_bank is not None and type(completed_step) is int
-        centroid_bank.commit(pending_history, completed_step)
+        if pending_shadow_history is None:
+            assert centroid_shadow_bank is None
+            centroid_bank.commit(pending_history, completed_step)
+        else:
+            assert centroid_shadow_bank is not None
+            commit_matched_centroid_updates(
+                centroid_bank,
+                pending_history,
+                centroid_shadow_bank,
+                pending_shadow_history,
+                step=completed_step,
+            )
         assert int(centroid_bank.centroid_state_step.item()) == completed_step
     else:
-        assert centroid_bank is None
+        assert centroid_bank is centroid_shadow_bank is None
+        assert pending_shadow_history is None
     return grad_norm
 
 
@@ -1526,6 +1673,10 @@ def main():
     fino_cfg = cfg["fino"] if (cfg.get("fino") or {}).get("enabled") else None
     molcap_cfg = cfg["molcap"] if (cfg.get("molcap") or {}).get("enabled") else None
     molcap_routed = molcap_route_enabled(molcap_cfg)
+    if molcap_routed:
+        require_fresh_matched_latest_run(
+            molcap_cfg["history"], train_cfg.get("resume")
+        )
     fino_disc = [(f, float(s)) for f, s in fino_cfg.get("discrete", [])] if fino_cfg else []
     fino_cont = [(f, float(s)) for f, s in fino_cfg.get("continuous", [])] if fino_cfg else []
     fino_meta = json.loads((Path(cfg["data"]["dataset_dir"]) / "fino_meta.json").read_text()) if fino_cfg else {"n": {}, "cont_dim": {}}
@@ -1696,7 +1847,9 @@ def main():
     val_ds = TCGATileDataset(cfg, is_train=False)
     molcap_slide_to_patient = None
     centroid_bank = None
+    centroid_shadow_bank = None
     history_metadata = None
+    shadow_metadata = None
     if molcap_routed:
         molcap_slide_to_patient = torch.as_tensor(
             train_ds.molcap_slide_to_patient, dtype=torch.int64, device=device
@@ -1708,6 +1861,16 @@ def main():
                 momentum=float(molcap_cfg["history"]["momentum"]),
             ).to(device)
             history_metadata = build_molcap_history_metadata(molcap_cfg, train_ds)
+            centroid_shadow_bank = create_latest_observation_shadow(
+                molcap_cfg["history"],
+                molcap_slide_to_patient,
+                feature_dim=int(molcap_cfg["input_dim"]),
+            )
+            if centroid_shadow_bank is not None:
+                centroid_shadow_bank = centroid_shadow_bank.to(device)
+                shadow_metadata = build_latest_shadow_metadata(
+                    history_metadata, molcap_cfg["history"]
+                )
     if checkpoint is not None:
         restore_molcap_history(
             checkpoint,
@@ -1735,6 +1898,7 @@ def main():
     centroid_gate_path = output_dir / "molcap_centroid_ramp_gate.json"
     last_routed_result = None
     centroid_gate_boundary_proposal = None
+    centroid_gate_boundary_shadow_proposal = None
     molcap_grad_diagnostics = new_molcap_gradient_diagnostics()
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
@@ -1783,6 +1947,8 @@ def main():
             molcap_head=molcap_head,
             centroid_bank=centroid_bank,
             history_metadata=history_metadata,
+            centroid_shadow_bank=centroid_shadow_bank,
+            shadow_metadata=shadow_metadata,
             sample_order_prefix=sample_order_prefix,
             sample_order_available=sample_order_available if molcap_routed else None,
         )
@@ -1854,6 +2020,7 @@ def main():
                 weight=float(molcap_cfg["weight"]),
                 scale=molcap_scale,
                 centroid_bank=centroid_bank,
+                centroid_shadow_bank=centroid_shadow_bank,
             )
         sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
         L = train_cfg["local_views"]
@@ -2060,6 +2227,10 @@ def main():
                     boundary_proposal=centroid_gate_boundary_proposal,
                 )
                 centroid_gate_passed = True
+                centroid_shadow_bank = discard_latest_observation_shadow(
+                    centroid_shadow_bank, gate_passed=centroid_gate_passed
+                )
+                centroid_gate_boundary_shadow_proposal = None
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
             flop_ctx = FlopCounterMode(display=False) if measured_flops_per_step is None else contextlib.nullcontext()
@@ -2104,6 +2275,11 @@ def main():
                 pending_history = (
                     routed_result.pending_history if routed_result is not None else None
                 )
+                pending_shadow_history = (
+                    routed_result.pending_shadow_history
+                    if routed_result is not None
+                    else None
+                )
                 grad_norm = transactional_optimizer_step(
                     total_loss,
                     opt,
@@ -2111,12 +2287,19 @@ def main():
                     clip_grad=dino_cfg["clip_grad"],
                     centroid_bank=centroid_bank if pending_history is not None else None,
                     pending_history=pending_history,
+                    centroid_shadow_bank=(
+                        centroid_shadow_bank
+                        if pending_shadow_history is not None
+                        else None
+                    ),
+                    pending_shadow_history=pending_shadow_history,
                     completed_step=completed_step,
                     post_backward=post_backward,
                 )
                 if pending_history is not None and molcap_scale == 0.0:
                     assert int(centroid_bank.centroid_state_step.item()) == completed_step
                     centroid_gate_boundary_proposal = pending_history
+                    centroid_gate_boundary_shadow_proposal = pending_shadow_history
             if measured_flops_per_step is None:
                 measured_flops_per_step = int(flop_ctx.get_total_flops())
                 print(f"{console_prefix()} measured_flops_per_step: {measured_flops_per_step:,}", flush=True)

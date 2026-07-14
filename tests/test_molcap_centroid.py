@@ -15,10 +15,12 @@ from train import (
     HierarchicalCentroidBank,
     centroid_audit,
     centroid_geometry,
+    commit_matched_centroid_updates,
     crop_major_tile_mean,
     deterministic_grouped_sum,
     hierarchical_means,
     patient_targets_from_tiles,
+    propose_matched_centroid_updates,
     require_centroid_gate,
     teacher_value_student_gradient,
 )
@@ -33,6 +35,109 @@ def assert_buffers_unchanged(module, expected):
     assert actual.keys() == expected.keys()
     for name, value in expected.items():
         assert torch.equal(actual[name], value), name
+
+
+def test_latest_observation_bank_copies_each_teacher_value_without_gradient():
+    mapping = torch.tensor([0, 1], dtype=torch.int64)
+    bank = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.0)
+    first_teacher = hierarchical_means(
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True),
+        torch.tensor([0, 1]),
+        mapping,
+    )
+
+    first = bank.propose(first_teacher)
+    assert torch.equal(first.next_slide_centroids, first_teacher.slide_means.detach())
+    assert not first.next_slide_centroids.requires_grad
+    assert not first.patient_centroids.requires_grad
+    bank.commit(first, step=1)
+
+    second_teacher = hierarchical_means(
+        torch.tensor([[11.0, 13.0], [17.0, 19.0]], requires_grad=True),
+        torch.tensor([0, 1]),
+        mapping,
+    )
+    second = bank.propose(second_teacher)
+    assert torch.equal(second.next_slide_centroids, second_teacher.slide_means.detach())
+    bank.commit(second, step=2)
+
+    assert torch.equal(bank.slide_centroids, second_teacher.slide_means.detach())
+
+
+def test_latest_observation_patient_pooling_weights_slides_equally_not_tiles():
+    mapping = torch.tensor([0, 0], dtype=torch.int64)
+    bank = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.0)
+    teacher = hierarchical_means(
+        torch.tensor([[1.0, 3.0], [9.0, 11.0], [9.0, 11.0], [9.0, 11.0]]),
+        torch.tensor([0, 1, 1, 1]),
+        mapping,
+    )
+
+    proposal = bank.propose(teacher)
+
+    assert torch.equal(proposal.slide_tile_counts, torch.tensor([1, 3]))
+    assert torch.equal(proposal.patient_centroids, torch.tensor([[5.0, 7.0]]))
+
+
+def test_matched_updates_validate_both_proposals_before_either_bank_mutates():
+    mapping = torch.tensor([0, 0, 1], dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.0)
+    teacher = hierarchical_means(
+        torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        torch.tensor([0, 1, 2]),
+        mapping,
+    )
+    ema_proposal, latest_proposal = propose_matched_centroid_updates(
+        ema, latest, teacher
+    )
+
+    assert torch.equal(ema_proposal.slide_ids, latest_proposal.slide_ids)
+    assert torch.equal(ema_proposal.slide_tile_counts, latest_proposal.slide_tile_counts)
+    assert torch.equal(ema_proposal.patient_ids, latest_proposal.patient_ids)
+    ema_before = snapshot_buffers(ema)
+    latest_before = snapshot_buffers(latest)
+    invalid_latest = latest_proposal._replace(
+        patient_centroids=latest_proposal.patient_centroids.clone().fill_(float("nan"))
+    )
+
+    with pytest.raises(AssertionError):
+        commit_matched_centroid_updates(
+            ema,
+            ema_proposal,
+            latest,
+            invalid_latest,
+            step=1,
+        )
+
+    assert_buffers_unchanged(ema, ema_before)
+    assert_buffers_unchanged(latest, latest_before)
+    commit_matched_centroid_updates(
+        ema,
+        ema_proposal,
+        latest,
+        latest_proposal,
+        step=1,
+    )
+    assert torch.equal(ema.slide_counts, latest.slide_counts)
+    assert torch.equal(ema.slide_tile_presentations, latest.slide_tile_presentations)
+    assert torch.equal(ema.centroid_state_step, latest.centroid_state_step)
+
+
+def test_matched_updates_reject_unmatched_patient_observation_counts_before_proposal():
+    mapping = torch.tensor([0, 0, 1], dtype=torch.int64)
+    ema = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.9)
+    latest = HierarchicalCentroidBank(mapping, feature_dim=2, momentum=0.0)
+    with torch.no_grad():
+        latest.patient_slide_counts[0] = 1
+    teacher = hierarchical_means(
+        torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        torch.tensor([0, 1, 2]),
+        mapping,
+    )
+
+    with pytest.raises(AssertionError):
+        propose_matched_centroid_updates(ema, latest, teacher)
 
 
 def test_deterministic_grouped_sum_preserves_values_output_order_and_gradients():
