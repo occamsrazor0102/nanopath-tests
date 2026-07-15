@@ -15,7 +15,7 @@ import torch
 
 sys.modules.setdefault("wandb", types.ModuleType("wandb"))
 
-import molcap_relative_gate as relative_gate_module
+import train as relative_gate_module
 import train as train_module
 from train import (
     HierarchicalCentroidBank,
