@@ -1,6 +1,7 @@
 # Focused contracts for hierarchical MolCap aggregation and EMA centroid state.
 # These tests keep the state proposal pure and every rejected commit atomic.
 
+import ast
 import math
 import hashlib
 import json
@@ -995,6 +996,27 @@ def duck_boundary_proposal(proposal):
         next_slide_centroids=proposal.next_slide_centroids,
         drift_cosines=proposal.drift_cosines,
     )
+
+
+def test_legacy_centroid_audit_rejects_duck_typed_boundary_proposal():
+    ema, _ = large_matched_gate_banks()
+    proposal = committed_boundary_proposal(ema)
+
+    with pytest.raises(AssertionError):
+        centroid_audit(
+            ema,
+            boundary_proposal=duck_boundary_proposal(proposal),
+        )
+
+
+def test_train_has_single_legacy_distribution_and_boundary_helper_definition():
+    module = ast.parse(Path(train_module.__file__).read_text())
+    top_level_names = [
+        node.name for node in module.body if isinstance(node, ast.FunctionDef)
+    ]
+
+    assert top_level_names.count("_fixed_distribution") == 1
+    assert top_level_names.count("_boundary_teacher_drift") == 1
 
 
 def mutate_boundary_transaction(proposal, field):

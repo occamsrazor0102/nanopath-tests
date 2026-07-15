@@ -1497,29 +1497,7 @@ def matched_latest_permutation_audit(
     }
 
 
-
-def _fixed_distribution(values, quantiles):
-    assert isinstance(values, torch.Tensor) and values.ndim == 1
-    values = values.detach().to(device="cpu", dtype=torch.float64)
-    assert torch.isfinite(values).all()
-    summary = {
-        "count": int(values.numel()),
-        "mean": float(values.mean().item()) if values.numel() else None,
-    }
-    if values.numel():
-        levels = torch.tensor(
-            [level for _, level in quantiles], dtype=torch.float64
-        )
-        quantile_values = torch.quantile(values, levels).tolist()
-    else:
-        quantile_values = [None] * len(quantiles)
-    summary.update(
-        {label: value for (label, _), value in zip(quantiles, quantile_values)}
-    )
-    return summary
-
-
-def _boundary_teacher_drift(bank, boundary_proposal):
+def _matched_latest_boundary_teacher_drift(bank, boundary_proposal):
     drift = torch.empty(0, dtype=torch.float64)
     if boundary_proposal is not None:
         assert boundary_proposal.base_state_step + 1 == int(
@@ -1553,7 +1531,7 @@ def _boundary_proposal_provenance(
             "transaction_valid": None,
             "committed_match": None,
             "state_step": state_step,
-            **_boundary_teacher_drift(bank, None),
+            **_matched_latest_boundary_teacher_drift(bank, None),
         }
     type_exact = type(boundary_proposal) is expected_proposal_type
     invalid = {
@@ -1670,7 +1648,9 @@ def _boundary_proposal_provenance(
             atol=1.0e-6,
             rtol=0.0,
         )
-        summary = _boundary_teacher_drift(bank, boundary_proposal)
+        summary = _matched_latest_boundary_teacher_drift(
+            bank, boundary_proposal
+        )
     except (AssertionError, AttributeError, IndexError, RuntimeError, TypeError, ValueError):
         return invalid
     return {
@@ -1998,7 +1978,7 @@ def _unavailable_relative_legacy_diagnostics(
                 (("q0", 0.0), ("q25", 0.25), ("q50", 0.5), ("q75", 0.75), ("q100", 1.0)),
             ),
         },
-        "boundary_teacher_centroid_drift": _boundary_teacher_drift(
+        "boundary_teacher_centroid_drift": _matched_latest_boundary_teacher_drift(
             bank, boundary_proposal
         ),
     }
