@@ -531,6 +531,7 @@ def test_matched_latest_audit_uses_canonical_population_and_complete_geometry():
 
 def test_matched_latest_audit_validates_and_records_shadow_boundary_proposal():
     ema, latest = oracle_matched_banks()
+    latest.export_state({})
     target_sha256 = "2f6648a4155b96757a136335a253e3faeb6029a92a7e6356380ce80805011577"
     mapping_digest = "8cf4e2e46ba593231ae68ea390e05365b75ce408ff80471a79007b77422d4922"
     metadata = {"target_sha256": target_sha256, "mapping_digest": mapping_digest}
@@ -976,6 +977,7 @@ def large_matched_gate_banks(*, latest_sign=1.0):
 
 
 def committed_boundary_proposal(bank):
+    bank.export_state({})
     slide_ids = torch.arange(len(bank.slide_centroids), dtype=torch.int64)
     return train_module.CentroidProposal(
         base_state_step=int(bank.centroid_state_step.item()) - 1,
@@ -2523,6 +2525,23 @@ def production_shaped_checkpoint_bank_with_natural_cache_drift():
         bank.patient_sums[0, block_start] = incremental_sum
     bank.patient_slide_counts.fill_(2)
     return bank
+
+
+def test_boundary_provenance_accepts_committed_cache_centroids_with_natural_drift():
+    bank = production_shaped_checkpoint_bank_with_natural_cache_drift()
+    teacher = hierarchical_means(
+        bank.slide_centroids[1:2].clone(), torch.tensor([1]), bank.slide_to_patient
+    )
+    proposal = bank.propose(teacher)
+    bank.commit(proposal, step=7_814)
+
+    _, authoritative = bank.patient_centroids(1)
+    assert float((proposal.patient_centroids - authoritative.float()).abs().max()) > 1e-4
+    provenance = train_module._boundary_proposal_provenance(
+        bank, proposal, train_module.CentroidProposal
+    )
+    assert provenance["transaction_valid"] is True
+    assert provenance["committed_match"] is True
 
 
 def assert_restore_rejected_atomically(payload, *, expected_metadata=None, expected_step=2):

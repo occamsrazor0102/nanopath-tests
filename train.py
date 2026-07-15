@@ -1605,17 +1605,12 @@ def _boundary_proposal_provenance(
         assert patient_centroids.device == device
         assert not patient_centroids.requires_grad
         assert bool(torch.isfinite(patient_centroids).all())
-        observed_patient_ids, observed_patient_centroids = bank.patient_centroids(1)
-        patient_positions = torch.searchsorted(
-            observed_patient_ids, patient_ids.detach().cpu()
+        # Proposals commit through this float32 cache; CPU centroids are geometry-only.
+        patient_counts = bank.patient_slide_counts[patient_ids]
+        assert bool(torch.all(patient_counts > 0))
+        expected_patient_centroids = (
+            bank.patient_sums[patient_ids] / patient_counts[:, None]
         )
-        assert bool(torch.all(patient_positions < len(observed_patient_ids)))
-        assert torch.equal(
-            observed_patient_ids[patient_positions], patient_ids.detach().cpu()
-        )
-        expected_patient_centroids = observed_patient_centroids[
-            patient_positions
-        ].to(device=device, dtype=bank.slide_centroids.dtype)
         assert torch.allclose(
             patient_centroids,
             expected_patient_centroids,
