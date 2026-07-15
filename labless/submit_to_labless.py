@@ -237,7 +237,7 @@ def required(opts: dict[str, str], key: str) -> str:
 
 
 def public_config_path(value: Any) -> str:
-    config_path = str(value)
+    config_path = str(value).replace("\\", "/")
     match = re.search(r"(?:^|/)(configs/[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml)$", config_path)
     if match:
         return match.group(1)
