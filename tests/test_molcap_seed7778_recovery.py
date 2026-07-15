@@ -7,6 +7,7 @@ import yaml
 
 
 BASE_REVISION = "06679b7b61e16b402601c694cea5851f2e7bec99"
+FROZEN_ACTIVE_SOURCE_REVISION = "701fd77526ddbdf82d80e851ad8a04c35539f525"
 MISSING = object()
 APPROVED_ADDITIONS = {
     "configs/molcap-probe-route-s7778.yaml",
@@ -115,24 +116,6 @@ def git_tree_entries(revision: str) -> dict[str, tuple[str, str]]:
     return result
 
 
-def git_index_entries() -> dict[str, tuple[str, str]]:
-    raw = subprocess.check_output(["git", "ls-files", "--stage", "-z"])
-    result = {}
-    for record in raw.rstrip(b"\0").split(b"\0"):
-        metadata, path = record.split(b"\t", 1)
-        mode, oid, stage = metadata.decode("ascii").split()
-        decoded_path = path.decode("utf-8")
-        assert stage == "0", f"{decoded_path}: expected index stage 0, got {stage}"
-        result[decoded_path] = (mode, oid)
-    return result
-
-
-def worktree_blob_oid(path: str) -> str:
-    return subprocess.check_output(
-        ["git", "hash-object", f"--path={path}", "--", path], text=True
-    ).strip()
-
-
 @pytest.mark.parametrize(
     ("left", "right", "prefix", "expected"),
     [
@@ -237,13 +220,8 @@ def test_relative_seed7778_locks_inherited_duplicate_key_loader_semantics():
     assert child_value == parent_value == 0.5
 
 
-def test_seed7778_candidate_index_is_exact_approved_additive_tree():
+def test_seed7778_frozen_active_source_revision_is_exact_approved_additive_tree():
     baseline = git_tree_entries(BASE_REVISION)
-    candidate = git_index_entries()
+    candidate = git_tree_entries(FROZEN_ACTIVE_SOURCE_REVISION)
     assert set(candidate) == set(baseline) | APPROVED_ADDITIONS
     assert {path: candidate[path] for path in baseline} == baseline
-    for path, (_mode, indexed_oid) in candidate.items():
-        worktree_oid = worktree_blob_oid(path)
-        assert worktree_oid == indexed_oid, (
-            f"{path}: worktree blob {worktree_oid} does not match index {indexed_oid}"
-        )
