@@ -499,11 +499,9 @@ class HierarchicalCentroidBank(nn.Module):
         if torch.any(candidate_counts <= 0):
             raise ValueError("proposal leaves a patient without cached slides")
 
-        # This CPU float64 calculation is a diagnostic only: bank state stays float32/int64.
-        reconstructed = candidate_sums.detach().to(device="cpu", dtype=torch.float64)
-        reconstructed /= candidate_counts.detach().to(device="cpu", dtype=torch.float64).unsqueeze(1)
-        proposed = patient_centroids.detach().to(device="cpu", dtype=torch.float64)
-        if not torch.allclose(reconstructed, proposed, atol=1e-6, rtol=0.0):
+        # Replay the exact staged float32 quotient, not a different CPU float64 calculation.
+        reconstructed = candidate_sums / candidate_counts.to(dtype=candidate_sums.dtype).unsqueeze(1)
+        if not torch.equal(reconstructed, patient_centroids):
             raise ValueError("proposal patient centroids do not match the cache reconstruction")
         return cache_indices, candidate_sums, candidate_counts, slide_ids
 
