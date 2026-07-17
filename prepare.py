@@ -869,6 +869,28 @@ def is_populated(name, p):
     return True
 
 
+def build_fino_meta(barcodes, fino_cfg, csv_dir):
+    # Generic FINO metadata builder — turns ANY column of the patient-level TCGA tables into a guidance factor, so
+    # any metadata selection is trainable without per-factor code. Joins the clinical master and cBioPortal genomics
+    # CSVs on the 12-char barcode; the factor name IS the CSV column name; the encoding is chosen by which config
+    # list it appears in: fino.discrete -> categorical column -> dense integer-id (prototype-contrastive target);
+    # fino.continuous -> numeric column -> z-scored scalar (MLP-regression target). Patients missing a value are
+    # dropped from that factor (dataloader.py masks them out per-branch). An unknown column name fails loudly.
+    import pandas as pd
+    m = pd.read_csv(f"{csv_dir}/tcga_master_dataset.csv", low_memory=False).drop_duplicates("submitter_id").set_index("submitter_id")
+    g = pd.read_csv(f"{csv_dir}/tcga_master_cancer_genomics.csv", low_memory=False)
+    g = g.assign(_bc=g["submitter_id"].str[:12]).drop_duplicates("_bc").set_index("_bc")
+    df = m.join(g[[c for c in g.columns if c not in m.columns]])  # every column of either table selectable by name
+    disc, cont, n, cdim = {}, {}, {}, {}
+    for f, _ in fino_cfg.get("discrete", []):
+        s = df[f].reindex(barcodes).dropna().astype(str); ids = {v: i for i, v in enumerate(sorted(s.unique()))}
+        disc[f] = {b: ids[v] for b, v in s.items()}; n[f] = len(ids)
+    for f, _ in fino_cfg.get("continuous", []):
+        z = pd.to_numeric(df[f].reindex(barcodes), errors="coerce").dropna(); z = (z - z.mean()) / z.std()
+        cont[f] = {b: round(float(v), 4) for b, v in z.items()}; cdim[f] = 1
+    return {"discrete": disc, "continuous": cont, "n": n, "cont_dim": cdim}
+
+
 def main():
     usage = "usage: python prepare.py [config.yaml] download=True|download=False"
     args = sys.argv[1:]
@@ -910,6 +932,22 @@ def main():
         dataset_dir.mkdir(parents=True, exist_ok=True)
         fetch_tiles_from_hf(dataset_dir)
         assert sum(1 for _ in dataset_dir.glob("shard-*.parquet")) == NUM_SHARDS, f"tiles still incomplete after fetch: {dataset_dir}"
+
+    # Stage 1b — FINO metadata, placed beside the tile dataset where dataloader.py / train.py read it. Default:
+    # copy the committed metadata/fino_meta.json (curated 33 factors). If fino.csv_dir is set, instead BUILD it
+    # generically (build_fino_meta) for whatever columns fino.discrete/continuous name — any TCGA metadata selection.
+    fino_cfg = cfg.get("fino") or {}
+    fino_path = dataset_dir / "fino_meta.json"
+    if fino_cfg.get("enabled") and not fino_path.exists():
+        if fino_cfg.get("csv_dir"):
+            bcs = sorted({"-".join(p.split("/", 1)[0].split("-")[:3]) for s in sorted(dataset_dir.glob("shard-*.parquet"))
+                          for p in pq.read_table(str(s), columns=["path"], memory_map=True)["path"].to_pylist()})
+            meta = build_fino_meta(bcs, fino_cfg, os.path.expandvars(fino_cfg["csv_dir"]))
+            fino_path.write_text(json.dumps(meta))
+            print(f"[done] fino_meta: built {len(meta['discrete']) + len(meta['continuous'])} factors from {fino_cfg['csv_dir']} -> {fino_path}", flush=True)
+        else:
+            shutil.copy(Path(__file__).parent / "metadata" / "fino_meta.json", fino_path)
+            print(f"[done] fino_meta: {fino_path} (from committed metadata/)", flush=True)
 
     # Stage 2 — probe datasets. Verify-only collects every gap and reports
     # them all at once so the user fixes the YAML in a single edit.

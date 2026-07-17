@@ -20,6 +20,7 @@
 
 import hashlib
 import io
+import json
 import random
 from pathlib import Path
 
@@ -52,6 +53,14 @@ LOG_1E6 = float(np.log(1e-6))
 TILE_SIZE = 224
 
 
+# Load the compact patient-id/target arrays once; forked workers share this dictionary copy-on-write.
+def load_molcap_bank(path, target_dim):
+    with np.load(path, allow_pickle=False) as artifact:
+        patient_ids, targets = artifact["patient_ids"], artifact["targets"]
+    assert targets.ndim == 2 and targets.shape == (len(patient_ids), target_dim), f"MolCap target_dim={target_dim} does not match {targets.shape}"
+    return {str(patient_id): target.astype(np.float32) for patient_id, target in zip(patient_ids, targets)}
+
+
 # Patients (not tiles) are the split unit so train/val never share a case.
 def patient_in_val(patient_id, seed, val_fraction):
     key = f"{seed}:{patient_id}".encode()
@@ -62,6 +71,17 @@ def patient_in_val(patient_id, seed, val_fraction):
 # Path entries start with the SVS stem (TCGA-XX-XXXX-...); the first three dash parts are the patient barcode.
 def patient_id_from_relpath(rel):
     return "-".join(rel.split("/", 1)[0].split("-")[:3])
+
+
+def build_centroid_index(paths: list[str]):
+    slide_stems = sorted({path.split("/", 1)[0] for path in paths})
+    patient_ids = sorted({"-".join(stem.split("-")[:3]) for stem in slide_stems})
+    patient_map = {patient: i for i, patient in enumerate(patient_ids)}
+    slide_map = {slide: i for i, slide in enumerate(slide_stems)}
+    slide_to_patient = np.asarray(
+        [patient_map["-".join(slide.split("-")[:3])] for slide in slide_stems], dtype=np.int64
+    )
+    return slide_map, patient_map, slide_to_patient
 
 
 # Lightweight stain-space jitter; this is the stain augmentation hook for pretraining tiles.
@@ -93,6 +113,10 @@ class TCGATileDataset(Dataset):
     def __init__(self, cfg, is_train=True):
         data = cfg["data"]
         train = cfg["train"]
+        molcap = cfg.get("molcap") or {}
+        self.molcap_centroid_enabled = bool(
+            is_train and molcap.get("enabled") and (molcap.get("centroid") or {}).get("enabled")
+        )
         self.tissue_thresh = float(data["tissue_thresh"]) if is_train else 0.0
         dataset_dir = Path(data["dataset_dir"])
         self.shards = sorted(dataset_dir.glob("shard-*.parquet"))
@@ -111,19 +135,69 @@ class TCGATileDataset(Dataset):
         # the JPEG bytes column stays on disk until __getitem__.
         in_split_shard = []
         in_split_row = []
+        in_split_paths = [] if self.molcap_centroid_enabled else None
+        in_split_slide_stem = [] if self.molcap_centroid_enabled else None
+        in_split_patient_id = [] if self.molcap_centroid_enabled else None
+        shard_sizes = []
         for shard_idx, shard_path in enumerate(self.shards):
             paths = pq.read_table(str(shard_path), columns=["path"], memory_map=True)["path"].to_pylist()
+            shard_sizes.append(len(paths))
             for row_idx, p in enumerate(paths):
                 # XOR with is_train: training keeps tiles where patient_in_val is False,
                 # validation keeps the complement.
                 if patient_in_val(patient_id_from_relpath(p), data["split_seed"], data["val_fraction"]) != is_train:
                     in_split_shard.append(shard_idx)
                     in_split_row.append(row_idx)
+                    if self.molcap_centroid_enabled:
+                        in_split_paths.append(p)
+                        in_split_slide_stem.append(p.split("/", 1)[0])
+                        in_split_patient_id.append(patient_id_from_relpath(p))
         if not in_split_shard:
             raise ValueError(f"no {'train' if is_train else 'val'} tiles found in {dataset_dir}; check val_fraction={data['val_fraction']}")
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
+        if self.molcap_centroid_enabled:
+            self.molcap_slide_stem_of = np.asarray(in_split_slide_stem)
+            self.molcap_patient_id_of = np.asarray(in_split_patient_id)
+            slide_map, patient_map, self.molcap_slide_to_patient = build_centroid_index(in_split_paths)
+            self.molcap_slide_idx_of = np.asarray(
+                [slide_map[slide_stem] for slide_stem in self.molcap_slide_stem_of], dtype=np.int64
+            )
+            self.molcap_patient_idx_of = np.asarray(
+                [patient_map[patient_id] for patient_id in self.molcap_patient_id_of], dtype=np.int64
+            )
+            patient_ids = tuple(patient_map)
+            mapping = "\n".join(
+                f"{slide_stem}\t{patient_ids[self.molcap_slide_to_patient[slide_idx]]}"
+                for slide_stem, slide_idx in slide_map.items()
+            )
+            self.molcap_centroid_mapping_digest = hashlib.sha256(mapping.encode("utf-8")).hexdigest()
+        # FINO metadata, built/copied once by prepare.py: per-factor barcode->id (discrete) / barcode->value
+        # (continuous, z-scored) maps. cfg.fino.discrete/continuous select factors and their sign (+ encourage /
+        # - suppress). Loaded once so DataLoader fork-workers share it copy-on-write; train.py masks absent ones.
+        self.fino = (cfg.get("fino") or {}).get("enabled")
+        if self.fino:
+            meta = json.loads((dataset_dir / "fino_meta.json").read_text())
+            self.fino_disc = [f for f, _ in cfg["fino"].get("discrete", [])]
+            self.fino_cont = [f for f, _ in cfg["fino"].get("continuous", [])]
+            # tile_npy maps a discrete factor -> a per-TILE label .npy in shard-concat order (e.g. strong-FM cluster
+            # pseudo-labels): a dense FM-distillation M+ target, looked up by global tile index not patient barcode.
+            tile_npy = cfg["fino"].get("tile_npy", {})
+            self.meta_disc = {f: meta["discrete"][f] for f in self.fino_disc if f not in tile_npy}
+            gidx = np.concatenate([[0], np.cumsum(shard_sizes)])[:-1][self.shard_of] + self.row_of
+            self.tile_label = {f: np.load(dataset_dir / tile_npy[f])[gidx] for f in self.fino_disc if f in tile_npy}
+            self.meta_cont = {f: meta["continuous"][f] for f in self.fino_cont}
+            self.cont_dim = {f: (len(next(iter(v.values()))) if v and isinstance(next(iter(v.values())), list) else 1) for f, v in self.meta_cont.items()}
+        self.molcap_bank = load_molcap_bank(molcap["targets"], int(molcap["target_dim"])) if is_train and molcap.get("enabled") else None
+        self.molcap_dim = int(molcap.get("target_dim", 0))
+        if self.molcap_centroid_enabled:
+            target_digest = hashlib.sha256()
+            for patient_id in sorted(self.molcap_bank):
+                target_digest.update(patient_id.encode("utf-8"))
+                target_digest.update(b"\n")
+                target_digest.update(np.asarray(self.molcap_bank[patient_id], dtype=np.float32).tobytes())
+            self.molcap_target_digest = target_digest.hexdigest()
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
@@ -192,10 +266,35 @@ class TCGATileDataset(Dataset):
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
         global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
+        # FINO per-factor labels for this tile's patient: discrete ids (-1 = missing), one tensor per continuous
+        # factor (scalar or vector; nan-filled if missing). train.py masks missing branches out per-factor.
+        fino_keys = {}
+        if self.fino:
+            fino_keys["meta_disc"] = torch.tensor([int(self.tile_label[f][idx]) if f in self.tile_label else self.meta_disc[f].get(patient_id, -1) for f in self.fino_disc], dtype=torch.int64)
+            for f in self.fino_cont:
+                v = self.meta_cont[f].get(patient_id)
+                v = [float("nan")] * self.cont_dim[f] if v is None else (v if isinstance(v, list) else [v])
+                fino_keys[f"mc_{f}"] = torch.tensor(v, dtype=torch.float32)
+        molcap_keys = {}
+        if self.molcap_bank is not None:
+            target = self.molcap_bank.get(patient_id)
+            molcap_keys = {
+                "molcap_target": torch.from_numpy(target) if target is not None else torch.zeros(self.molcap_dim),
+                "molcap_present": torch.tensor(float(target is not None)),
+            }
+        centroid_keys = {}
+        if self.molcap_centroid_enabled:
+            centroid_keys = {
+                "molcap_slide_idx": torch.tensor(int(self.molcap_slide_idx_of[idx]), dtype=torch.int64),
+                "molcap_patient_idx": torch.tensor(int(self.molcap_patient_idx_of[idx]), dtype=torch.int64),
+            }
         return {
             "global_views": global_views,
             "local_views": local_views,
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
+            **fino_keys,
+            **molcap_keys,
+            **centroid_keys,
         }
