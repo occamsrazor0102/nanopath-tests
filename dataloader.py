@@ -20,6 +20,7 @@
 
 import hashlib
 import io
+import json
 import random
 from pathlib import Path
 
@@ -50,6 +51,21 @@ RGB_FROM_HED = torch.tensor(
 )
 LOG_1E6 = float(np.log(1e-6))
 TILE_SIZE = 224
+
+
+# Load the compact patient-id/target arrays once; forked workers share this dictionary copy-on-write.
+def load_molcap_bank(path, target_dim, return_patient_ids=False):
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as artifact:
+        assert set(artifact.files) == {"patient_ids", "targets", "captions", "mode"}
+        patient_ids = tuple(str(patient_id) for patient_id in artifact["patient_ids"])
+        targets = artifact["targets"]
+        mode = str(artifact["mode"])
+    assert len(set(patient_ids)) == len(patient_ids), "MolCap patient_ids must be unique"
+    assert targets.ndim == 2 and targets.shape == (len(patient_ids), target_dim), f"MolCap target_dim={target_dim} does not match {targets.shape}"
+    assert np.isfinite(targets).all(), "MolCap targets contain non-finite values"
+    bank = {patient_id: target.astype(np.float32) for patient_id, target in zip(patient_ids, targets)}
+    return (bank, patient_ids) if return_patient_ids else bank
 
 
 # Patients (not tiles) are the split unit so train/val never share a case.
@@ -93,6 +109,10 @@ class TCGATileDataset(Dataset):
     def __init__(self, cfg, is_train=True):
         data = cfg["data"]
         train = cfg["train"]
+        molcap = cfg.get("molcap") or {}
+        self.molcap_identity_enabled = bool(
+            is_train and molcap.get("enabled") and molcap.get("route") == "probe_cls_hierarchical"
+        )
         self.tissue_thresh = float(data["tissue_thresh"]) if is_train else 0.0
         dataset_dir = Path(data["dataset_dir"])
         self.shards = sorted(dataset_dir.glob("shard-*.parquet"))
@@ -111,19 +131,96 @@ class TCGATileDataset(Dataset):
         # the JPEG bytes column stays on disk until __getitem__.
         in_split_shard = []
         in_split_row = []
+        shard_sizes = []
+        train_patients = set()
+        train_slides = set()
         for shard_idx, shard_path in enumerate(self.shards):
             paths = pq.read_table(str(shard_path), columns=["path"], memory_map=True)["path"].to_pylist()
+            shard_sizes.append(len(paths))
             for row_idx, p in enumerate(paths):
                 # XOR with is_train: training keeps tiles where patient_in_val is False,
                 # validation keeps the complement.
                 if patient_in_val(patient_id_from_relpath(p), data["split_seed"], data["val_fraction"]) != is_train:
                     in_split_shard.append(shard_idx)
                     in_split_row.append(row_idx)
+                    if self.molcap_identity_enabled:
+                        train_patients.add(patient_id_from_relpath(p))
+                        train_slides.add(p.split("/", 1)[0])
         if not in_split_shard:
             raise ValueError(f"no {'train' if is_train else 'val'} tiles found in {dataset_dir}; check val_fraction={data['val_fraction']}")
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
+        # FINO metadata, built/copied once by prepare.py: per-factor barcode->id (discrete) / barcode->value
+        # (continuous, z-scored) maps. cfg.fino.discrete/continuous select factors and their sign (+ encourage /
+        # - suppress). Loaded once so DataLoader fork-workers share it copy-on-write; train.py masks absent ones.
+        self.fino = (cfg.get("fino") or {}).get("enabled")
+        if self.fino:
+            meta = json.loads((dataset_dir / "fino_meta.json").read_text())
+            self.fino_disc = [f for f, _ in cfg["fino"].get("discrete", [])]
+            self.fino_cont = [f for f, _ in cfg["fino"].get("continuous", [])]
+            # tile_npy maps a discrete factor -> a per-TILE label .npy in shard-concat order (e.g. strong-FM cluster
+            # pseudo-labels): a dense FM-distillation M+ target, looked up by global tile index not patient barcode.
+            tile_npy = cfg["fino"].get("tile_npy", {})
+            self.meta_disc = {f: meta["discrete"][f] for f in self.fino_disc if f not in tile_npy}
+            gidx = np.concatenate([[0], np.cumsum(shard_sizes)])[:-1][self.shard_of] + self.row_of
+            self.tile_label = {f: np.load(dataset_dir / tile_npy[f])[gidx] for f in self.fino_disc if f in tile_npy}
+            self.meta_cont = {f: meta["continuous"][f] for f in self.fino_cont}
+            self.cont_dim = {f: (len(next(iter(v.values()))) if v and isinstance(next(iter(v.values())), list) else 1) for f, v in self.meta_cont.items()}
+        self.molcap_bank = None
+        if is_train and molcap.get("enabled"):
+            target_path = Path(molcap["targets"])
+            if self.molcap_identity_enabled:
+                target_sha256 = hashlib.sha256(target_path.read_bytes()).hexdigest()
+                assert target_sha256 == molcap.get("target_sha256"), (
+                    f"MolCap target_sha256 mismatch: expected {molcap.get('target_sha256')}, got {target_sha256}"
+                )
+                self.molcap_bank, canonical_patient_ids = load_molcap_bank(
+                    target_path, int(molcap["target_dim"]), return_patient_ids=True
+                )
+                with np.load(target_path, allow_pickle=False) as artifact:
+                    targets = artifact["targets"]
+                    mode = str(artifact["mode"])
+                assert targets.shape == (11_428, 384), (
+                    f"routed MolCap target bank must have shape (11428, 384), got {targets.shape}"
+                )
+                assert mode == "text", f"routed MolCap target mode must be text, got {mode}"
+                assert np.isfinite(targets).all(), "routed MolCap targets contain non-finite values"
+                unit_norm_error = float(np.max(np.abs(np.linalg.norm(targets, axis=1) - 1.0)))
+                assert unit_norm_error <= 1e-5, f"routed MolCap target unit-norm error is {unit_norm_error}"
+
+                ordered_patients = tuple(
+                    patient_id for patient_id in canonical_patient_ids if patient_id in train_patients
+                )
+                assert len(ordered_patients) == len(train_patients), (
+                    "every routed training patient must have exactly one canonical MolCap target"
+                )
+                patient_index = {patient_id: index for index, patient_id in enumerate(ordered_patients)}
+                ordered_slides = tuple(sorted(train_slides))
+                slide_index = {slide_id: index for index, slide_id in enumerate(ordered_slides)}
+                slide_to_patient = np.asarray(
+                    [patient_index["-".join(slide_id.split("-")[:3])] for slide_id in ordered_slides],
+                    dtype=np.int64,
+                )
+                mapping_payload = {
+                    "version": 1,
+                    "patient_ids": ordered_patients,
+                    "slide_ids": ordered_slides,
+                    "slide_to_patient": slide_to_patient.tolist(),
+                }
+                mapping_digest = hashlib.sha256(
+                    json.dumps(mapping_payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                self.molcap_patient_ids = ordered_patients
+                self.molcap_slide_ids = ordered_slides
+                self.molcap_patient_index = patient_index
+                self.molcap_slide_index = slide_index
+                self.molcap_slide_to_patient = slide_to_patient
+                self.molcap_mapping_digest = mapping_digest
+                self.molcap_target_sha256 = target_sha256
+            else:
+                self.molcap_bank = load_molcap_bank(target_path, int(molcap["target_dim"]))
+        self.molcap_dim = int(molcap.get("target_dim", 0))
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
@@ -154,16 +251,6 @@ class TCGATileDataset(Dataset):
                 v2.Normalize(mean=mean, std=std),
             ]
         )
-        # MolCap (optional aux target): map each tile's patient barcode to a precomputed, L2-normalized
-        # caption embedding (patient metadata rendered as a sentence, embedded offline). Loaded only for
-        # the training split; missing patients get a zero vector + 0 weight so they add no molcap gradient.
-        # Off unless configured, so the base recipe stays byte-identical.
-        mol = cfg.get("molcap", {})
-        self.caption_bank = None
-        if is_train and mol.get("enabled"):
-            bank = np.load(mol["caption_embeds"])  # .npz: patient_barcode -> float32[text_dim]
-            self.caption_bank = {k: bank[k].astype(np.float32) for k in bank.files}
-            self.text_dim = int(next(iter(self.caption_bank.values())).shape[0])
 
     # Dataset length is the number of tiles in this train/val split.
     def __len__(self):
@@ -202,15 +289,35 @@ class TCGATileDataset(Dataset):
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
         global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
-        item = {
+        # FINO per-factor labels for this tile's patient: discrete ids (-1 = missing), one tensor per continuous
+        # factor (scalar or vector; nan-filled if missing). train.py masks missing branches out per-factor.
+        fino_keys = {}
+        if self.fino:
+            fino_keys["meta_disc"] = torch.tensor([int(self.tile_label[f][idx]) if f in self.tile_label else self.meta_disc[f].get(patient_id, -1) for f in self.fino_disc], dtype=torch.int64)
+            for f in self.fino_cont:
+                v = self.meta_cont[f].get(patient_id)
+                v = [float("nan")] * self.cont_dim[f] if v is None else (v if isinstance(v, list) else [v])
+                fino_keys[f"mc_{f}"] = torch.tensor(v, dtype=torch.float32)
+        molcap_keys = {}
+        if self.molcap_bank is not None:
+            target = self.molcap_bank.get(patient_id)
+            molcap_keys = {
+                "molcap_target": torch.from_numpy(target) if target is not None else torch.zeros(self.molcap_dim),
+                "molcap_present": torch.tensor(float(target is not None)),
+            }
+            if self.molcap_identity_enabled:
+                molcap_keys["molcap_slide_idx"] = torch.tensor(
+                    self.molcap_slide_index[slide_stem], dtype=torch.int64
+                )
+                molcap_keys["molcap_patient_idx"] = torch.tensor(
+                    self.molcap_patient_index[patient_id], dtype=torch.int64
+                )
+        return {
             "global_views": global_views,
             "local_views": local_views,
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
+            **fino_keys,
+            **molcap_keys,
         }
-        if self.caption_bank is not None:
-            vec = self.caption_bank.get(patient_id)
-            item["caption"] = torch.from_numpy(vec) if vec is not None else torch.zeros(self.text_dim)
-            item["has_caption"] = torch.tensor(1.0 if vec is not None else 0.0)
-        return item
