@@ -574,7 +574,7 @@ _CENTROID_HISTORY_KEYS = {
 }
 
 
-def validate_centroid_config(raw_centroid_cfg, legacy_molcap_enabled=True):
+def validate_centroid_config(raw_centroid_cfg, legacy_molcap_cfg=None):
     """Return an approved C1 block, or None for the bit-exact C0 path."""
     if raw_centroid_cfg is None:
         return None
@@ -582,7 +582,7 @@ def validate_centroid_config(raw_centroid_cfg, legacy_molcap_enabled=True):
         raise ValueError("molcap.centroid must be a mapping")
     if not raw_centroid_cfg.get("enabled", False):
         return None
-    if not legacy_molcap_enabled:
+    if not legacy_molcap_cfg or not legacy_molcap_cfg.get("enabled", False):
         raise ValueError("an enabled centroid objective requires enabled legacy MolCap")
     if set(raw_centroid_cfg) != _CENTROID_KEYS:
         raise ValueError("enabled molcap.centroid must contain exactly the approved keys")
@@ -611,6 +611,9 @@ def validate_centroid_config(raw_centroid_cfg, legacy_molcap_enabled=True):
             raise ValueError(f"centroid {name} must be finite")
     if float(raw_centroid_cfg["ramp_len"]) <= 0 or not 0.0 <= float(raw_centroid_cfg["ramp_start"]) <= 1.0:
         raise ValueError("centroid ramp must have a positive length and a start in [0, 1]")
+    legacy_ramp_end = float(legacy_molcap_cfg["ramp_start"]) + float(legacy_molcap_cfg["ramp_len"])
+    if float(raw_centroid_cfg["ramp_start"]) < legacy_ramp_end:
+        raise ValueError("centroid ramp_start must be no earlier than the end of the legacy MolCap ramp")
     for name in ("momentum", "min_sample_weighted_coverage", "max_mean_offdiag_cosine"):
         if not isinstance(history[name], (float, int)) or not math.isfinite(float(history[name])):
             raise ValueError(f"centroid history {name} must be finite")
@@ -630,11 +633,11 @@ def centroid_scale(sfrac, centroid_cfg) -> float:
     return linear_ramp(float(sfrac), start, float(centroid_cfg["ramp_len"]))
 
 
-def build_centroid_runtime(centroid_cfg, train_ds, target_dim, device):
+def build_centroid_runtime(centroid_cfg, legacy_molcap_cfg, train_ds, target_dim, device):
     """Create C1-only state without touching C0's dataset/device/RNG state."""
     if centroid_cfg is None or not centroid_cfg.get("enabled", False):
         return None
-    centroid_cfg = validate_centroid_config(centroid_cfg)
+    centroid_cfg = validate_centroid_config(centroid_cfg, legacy_molcap_cfg)
     return CentroidRuntime(
         head=seed_neutral_molcap_head(int(centroid_cfg["input_dim"]), target_dim, device),
         bank=HierarchicalCentroidBank(
@@ -816,7 +819,7 @@ def main():
     fino_cfg = cfg["fino"] if (cfg.get("fino") or {}).get("enabled") else None
     raw_molcap_cfg = cfg.get("molcap") or {}
     molcap_cfg = raw_molcap_cfg if raw_molcap_cfg.get("enabled") else None
-    centroid_cfg = validate_centroid_config(raw_molcap_cfg.get("centroid"), bool(molcap_cfg))
+    centroid_cfg = validate_centroid_config(raw_molcap_cfg.get("centroid"), molcap_cfg)
     fino_disc = [(f, float(s)) for f, s in fino_cfg.get("discrete", [])] if fino_cfg else []
     fino_cont = [(f, float(s)) for f, s in fino_cfg.get("continuous", [])] if fino_cfg else []
     fino_meta = json.loads((Path(cfg["data"]["dataset_dir"]) / "fino_meta.json").read_text()) if fino_cfg else {"n": {}, "cont_dim": {}}
@@ -976,7 +979,7 @@ def main():
                   "source_dir": str(source_snapshot_dir), "git": {"commit": git_commit, "remote": git_remote}}
     train_ds = TCGATileDataset(cfg, is_train=True)
     centroid_runtime = (
-        build_centroid_runtime(centroid_cfg, train_ds, int(molcap_cfg["target_dim"]), device)
+        build_centroid_runtime(centroid_cfg, molcap_cfg, train_ds, int(molcap_cfg["target_dim"]), device)
         if centroid_cfg is not None else None
     )
     if centroid_runtime is not None:
