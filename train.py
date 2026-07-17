@@ -222,8 +222,6 @@ class Hierarchy(NamedTuple):
     slide_means: torch.Tensor
     patient_ids: torch.Tensor
     patient_means: torch.Tensor
-    patient_sums: torch.Tensor
-    patient_counts: torch.Tensor
 
 
 class CentroidProposal(NamedTuple):
@@ -231,6 +229,7 @@ class CentroidProposal(NamedTuple):
     next_slide_centroids: torch.Tensor
     patient_ids: torch.Tensor
     patient_centroids: torch.Tensor
+    cache_indices: torch.Tensor
     patient_sums: torch.Tensor
     patient_counts: torch.Tensor
 
@@ -301,7 +300,7 @@ def hierarchical_means(
     patient_counts = tile_features.new_zeros((patient_ids.numel(), 1))
     patient_counts.index_add_(0, slide_to_patient_idx, tile_features.new_ones((slide_ids.numel(), 1)))
     patient_means = patient_sums / patient_counts
-    return Hierarchy(slide_ids, slide_means, patient_ids, patient_means, patient_sums, patient_counts)
+    return Hierarchy(slide_ids, slide_means, patient_ids, patient_means)
 
 
 def teacher_value_student_gradient(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
@@ -381,29 +380,36 @@ class HierarchicalCentroidBank(nn.Module):
     def _validate_hierarchy(self, hierarchy: Hierarchy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(hierarchy, Hierarchy):
             raise ValueError("propose expects a Hierarchy")
-        slide_ids, slide_means, patient_ids, patient_means, patient_sums, patient_counts = hierarchy
+        slide_ids, slide_means, patient_ids, patient_means = hierarchy
         if slide_ids.ndim != 1 or slide_ids.dtype != torch.int64 or slide_ids.device != self.slide_centroids.device:
             raise ValueError("hierarchy slide IDs must be device-matched int64")
         if patient_ids.ndim != 1 or patient_ids.dtype != torch.int64 or patient_ids.device != self.slide_centroids.device:
             raise ValueError("hierarchy patient IDs must be device-matched int64")
         if not self._ids_are_sorted_and_unique(slide_ids) or not self._ids_are_sorted_and_unique(patient_ids):
             raise ValueError("hierarchy IDs must be sorted and unique")
-        if slide_means.shape != (slide_ids.numel(), self.feature_dim) or patient_means.shape != (patient_ids.numel(), self.feature_dim) or patient_sums.shape != patient_means.shape or patient_counts.shape != (patient_ids.numel(), 1):
+        if slide_means.shape != (slide_ids.numel(), self.feature_dim) or patient_means.shape != (patient_ids.numel(), self.feature_dim):
             raise ValueError("hierarchy feature shapes do not match this centroid bank")
-        if not slide_means.is_floating_point() or not patient_means.is_floating_point() or not patient_sums.is_floating_point() or not patient_counts.is_floating_point():
+        if not slide_means.is_floating_point() or not patient_means.is_floating_point():
             raise ValueError("hierarchy means must be floating point")
-        if slide_means.device != self.slide_centroids.device or patient_means.device != self.slide_centroids.device or patient_sums.device != self.slide_centroids.device or patient_counts.device != self.slide_centroids.device:
+        if slide_means.device != self.slide_centroids.device or patient_means.device != self.slide_centroids.device:
             raise ValueError("hierarchy means must match the centroid bank device")
-        if not torch.isfinite(slide_means).all() or not torch.isfinite(patient_means).all() or not torch.isfinite(patient_sums).all() or not torch.isfinite(patient_counts).all():
+        if not torch.isfinite(slide_means).all() or not torch.isfinite(patient_means).all():
             raise ValueError("hierarchy means must be finite")
         if slide_ids.numel() and (torch.any(slide_ids < 0) or torch.any(slide_ids >= self.slide_to_patient.numel())):
             raise ValueError("hierarchy contains a slide outside slide_to_patient")
 
         slide_patients = self.slide_to_patient.index_select(0, slide_ids)
-        expected_patient_ids = torch.unique(slide_patients, sorted=True)
+        expected_patient_ids, slide_to_patient_idx = torch.unique(slide_patients, sorted=True, return_inverse=True)
         if not torch.equal(patient_ids, expected_patient_ids):
             raise ValueError("hierarchy patient IDs do not match slide_to_patient")
-        if torch.any(patient_counts <= 0) or not torch.equal(patient_means, patient_sums / patient_counts):
+        expected_patient_sums = slide_means.new_zeros((patient_ids.numel(), self.feature_dim))
+        expected_patient_sums.index_add_(0, slide_to_patient_idx, slide_means)
+        expected_patient_counts = slide_means.new_zeros((patient_ids.numel(), 1))
+        expected_patient_counts.index_add_(
+            0, slide_to_patient_idx, slide_means.new_ones((slide_ids.numel(), 1))
+        )
+        expected_patient_means = expected_patient_sums / expected_patient_counts
+        if not torch.allclose(patient_means, expected_patient_means, atol=1e-6, rtol=0.0):
             raise ValueError("hierarchy patient means do not match its slide means")
         return slide_ids, slide_means.to(dtype=torch.float32), slide_patients
 
@@ -442,10 +448,12 @@ class HierarchicalCentroidBank(nn.Module):
             slide_means,
         )
         patient_ids, _ = torch.unique(slide_patients, sorted=True, return_inverse=True)
-        _, patient_sums, patient_counts = self._candidate_cache(slide_ids, next_slide_centroids, patient_ids)
+        cache_indices, patient_sums, patient_counts = self._candidate_cache(
+            slide_ids, next_slide_centroids, patient_ids
+        )
         patient_centroids = patient_sums / patient_counts.to(dtype=patient_sums.dtype).unsqueeze(1)
         return CentroidProposal(
-            slide_ids, next_slide_centroids, patient_ids, patient_centroids, patient_sums, patient_counts
+            slide_ids, next_slide_centroids, patient_ids, patient_centroids, cache_indices, patient_sums, patient_counts
         )
 
     @staticmethod
@@ -475,11 +483,15 @@ class HierarchicalCentroidBank(nn.Module):
     def _validate_proposal(self, proposal: CentroidProposal) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(proposal, CentroidProposal):
             raise ValueError("commit expects a CentroidProposal")
-        slide_ids, next_slide_centroids, patient_ids, patient_centroids, candidate_sums, candidate_counts = proposal
+        slide_ids, next_slide_centroids, patient_ids, patient_centroids, cache_indices, candidate_sums, candidate_counts = proposal
         if slide_ids.ndim != 1 or slide_ids.dtype != torch.int64 or slide_ids.device != self.slide_centroids.device:
             raise ValueError("proposal slide IDs must be device-matched int64")
         if patient_ids.ndim != 1 or patient_ids.dtype != torch.int64 or patient_ids.device != self.slide_centroids.device:
             raise ValueError("proposal patient IDs must be device-matched int64")
+        if cache_indices.ndim != 1 or cache_indices.dtype != torch.int64 or cache_indices.device != self.slide_centroids.device:
+            raise ValueError("proposal cache indices must be device-matched int64")
+        if cache_indices.shape != patient_ids.shape:
+            raise ValueError("proposal cache indices must match proposal patient IDs")
         if not self._ids_are_sorted_and_unique(slide_ids) or not self._ids_are_sorted_and_unique(patient_ids):
             raise ValueError("proposal IDs must be sorted and unique")
         if next_slide_centroids.shape != (slide_ids.numel(), self.feature_dim) or patient_centroids.shape != (patient_ids.numel(), self.feature_dim) or candidate_sums.shape != patient_centroids.shape or candidate_counts.shape != (patient_ids.numel(),):
@@ -492,7 +504,8 @@ class HierarchicalCentroidBank(nn.Module):
             raise ValueError("proposal centroids must be finite")
         if slide_ids.numel() and (torch.any(slide_ids < 0) or torch.any(slide_ids >= self.slide_to_patient.numel())):
             raise ValueError("proposal contains a slide outside slide_to_patient")
-        cache_indices = self._patient_cache_indices(patient_ids)
+        if not torch.equal(cache_indices, self._patient_cache_indices(patient_ids)):
+            raise ValueError("proposal cache indices do not match proposal patient IDs")
         if torch.any(candidate_counts <= 0):
             raise ValueError("proposal leaves a patient without cached slides")
 
