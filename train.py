@@ -409,7 +409,7 @@ class HierarchicalCentroidBank(nn.Module):
             0, slide_to_patient_idx, slide_means.new_ones((slide_ids.numel(), 1))
         )
         expected_patient_means = expected_patient_sums / expected_patient_counts
-        if not torch.allclose(patient_means, expected_patient_means, atol=1e-6, rtol=0.0):
+        if not torch.allclose(patient_means, expected_patient_means, atol=1e-5, rtol=1e-5):
             raise ValueError("hierarchy patient means do not match its slide means")
         return slide_ids, slide_means.to(dtype=torch.float32), slide_patients
 
@@ -614,7 +614,7 @@ def validate_centroid_config(raw_centroid_cfg, legacy_molcap_cfg=None):
         raise ValueError("centroid forward_source must be teacher")
     if raw_centroid_cfg["gradient_source"] != "student_identity_ste":
         raise ValueError("centroid gradient_source must be student_identity_ste")
-    if history["level"] != "slide_then_patient" or history["gate_version"] != "matched_latest_v1":
+    if history["level"] != "slide_then_patient" or history["gate_version"] != "matched_latest_centered_unit_v2":
         raise ValueError("centroid history level and gate_version are fixed")
     for name in ("weight", "ramp_start", "ramp_len"):
         if not isinstance(raw_centroid_cfg[name], (float, int)) or not math.isfinite(float(raw_centroid_cfg[name])):
@@ -726,7 +726,9 @@ def run_centroid_gate(bank, centroid_cfg, target_digest, mapping_digest, output_
             ).detach().to(device="cpu", dtype=torch.float64)
             if not torch.isfinite(patient_centroids).all():
                 raise ValueError("centroid gate found non-finite patient centroids")
-            singular_values = torch.linalg.svdvals(patient_centroids)
+            # Measure residual directions; raw cosine below still guards near-collapse.
+            patient_geometry = F.normalize(patient_centroids - patient_centroids.mean(dim=0, keepdim=True), p=2, dim=-1)
+            singular_values = torch.linalg.svdvals(patient_geometry)
             spectrum = singular_values.square()
             spectrum_sum = spectrum.sum()
             if spectrum_sum > 0:

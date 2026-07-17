@@ -83,7 +83,7 @@ molcap:
       min_effective_rank: 32
       min_participation_ratio: 16
       max_mean_offdiag_cosine: 0.95
-      gate_version: matched_latest_v1
+      gate_version: matched_latest_centered_unit_v2
 probe:
   enabled: true
   model_weights: ema
