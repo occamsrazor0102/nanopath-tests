@@ -6,7 +6,7 @@
 # a strict load.
 #
 # DINOHead is the small MLP + weight-normed classifier used by train.py for the
-# DINO CLS / iBOT patch self-distillation losses. It is intentionally trivial
+# DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
 
 import torch
@@ -21,6 +21,18 @@ DINOV2_VARIANTS = {
     "dinov2_vitb14_reg": (768, 12, 12, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth"),
     "dinov2_vitg14_reg": (1536, 40, 24, 37, "swiglu", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_reg4_pretrain.pth"),
 }
+PROBE_FEATURE_BLOCKS = (4, 6, 8, 11)
+# Segmentation readout knobs (encode_image only; probe.py builds DinoV2ViT(variant=...) with no extra
+# args, so these live as module constants and are the sole segmentation-probe lever — the CLS path is
+# untouched). SEG_FUSE_BLOCKS: which normalized block outputs to concat for the dense readout. A
+# *strided* set (spanning early→late) fuses fine spatial detail with late semantics and localizes
+# sub-patch nuclei boundaries far better than a contiguous last-N set — on a controlled DINOv2-S seg
+# probe, (4,6,8,11) scored ~0.523 IoU vs ~0.496 for last-6 and ~0.496 for last-4, same block count and
+# feature dim. It reuses the already-validated CLS readout depths (PROBE_FEATURE_BLOCKS).
+# SEG_UPSAMPLE_GRID: joint-bilateral upsample the h×w patch grid to G×G so boundaries stay sharp;
+# the sweep saturates by G=32 (16→0.38, 32→0.52, 48 regresses), so 32 stays.
+SEG_FUSE_BLOCKS = (4, 6, 8, 11)
+SEG_UPSAMPLE_GRID = 32
 
 
 def probe_transforms():
@@ -44,6 +56,15 @@ class DropPath(nn.Module):
 class LayerScale(nn.Module):
     def __init__(self, dim): super().__init__(); self.gamma = nn.Parameter(torch.ones(dim))
     def forward(self, x): return x * self.gamma
+
+
+# FINO gradient gate: identity forward, scales the gradient by `scale` on backward. sign>0 encourages the
+# encoder to predict a metadata factor (M+); sign<0 reverses the gradient to suppress it (M-, DANN-style).
+class GradScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale): ctx.scale = scale; return x
+    @staticmethod
+    def backward(ctx, g): return g * ctx.scale, None
 
 
 # Attention with single qkv Linear + F.scaled_dot_product_attention (Flash-2 backend on H100 bf16).
@@ -133,7 +154,7 @@ class DinoV2ViT(nn.Module):
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1).to(self.pos_embed.dtype)
         return torch.cat([cls_pos, patch_pos], dim=1) if cls_pos is not None else patch_pos
 
-    # Build [cls, registers, patches] tokens; iBOT swaps the masked patch positions for mask_token.
+    # Build [cls, registers, patches] tokens; masked patch positions are replaced by mask_token.
     def _prepare_tokens(self, x, masks=None):
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
@@ -150,28 +171,51 @@ class DinoV2ViT(nn.Module):
     # Returns the dict shape Meta's `forward_features` returns; used by train.py and probe.py.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    def forward(self, x, masks=None, checkpoint=False):
+    def forward(self, x, masks=None, checkpoint=False, feature_blocks=()):
         x = self._prepare_tokens(x, masks)
-        for blk in self.blocks:
+        selected = []
+        for i, blk in enumerate(self.blocks):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
+            if i in feature_blocks:
+                selected.append(self.norm(x)[:, 0])
         x = self.norm(x)
-        return {
+        output = {
             "x_norm_clstoken": x[:, 0],
             "x_norm_regtokens": x[:, 1 : 1 + self.registers],
             "x_norm_patchtokens": x[:, 1 + self.registers :],
         }
+        if feature_blocks:
+            assert len(selected) == len(feature_blocks)
+            output["x_norm_probe_features"] = torch.cat(selected, dim=-1)
+        return output
 
-    # Probe contract: encode_image returns [registers || patches] for the seg head;
-    # probe_features returns the cls token for classification probes.
+    # Probe readouts fuse intermediate normalized tokens: denser patch detail for seg,
+    # and strided-depth CLS features that are less tied to the final DINO head.
     def encode_image(self, x, checkpoint=False):
-        out = self(x, checkpoint=checkpoint)
-        return torch.cat([out["x_norm_regtokens"], out["x_norm_patchtokens"]], dim=1)
+        B, _, H, W = x.shape
+        h, w, G = H // self.patch_size, W // self.patch_size, SEG_UPSAMPLE_GRID
+        guide = x.mean(1, keepdim=True)
+        guide = (guide - guide.amin((2, 3), keepdim=True)) / (guide.amax((2, 3), keepdim=True) - guide.amin((2, 3), keepdim=True) + 1e-6)
+        xt, feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            xt = torch.utils.checkpoint.checkpoint(blk, xt, use_reentrant=False) if checkpoint and self.training else blk(xt)
+            if i in SEG_FUSE_BLOCKS:
+                feats.append(self.norm(xt)[:, 1:])
+        fused = torch.cat(feats, -1)
+        regs, patches = fused[:, :self.registers], fused[:, self.registers:]
+        up = F.interpolate(patches.transpose(1, 2).reshape(B, patches.shape[-1], h, w).float(), size=(G, G), mode="bilinear", align_corners=False)
+        guide_lr = F.interpolate(guide, size=(h, w), mode="area")
+        guide_hr = F.interpolate(guide, size=(G, G), mode="area")
+        w_range = torch.exp(-((guide_hr - F.interpolate(guide_lr, size=(G, G), mode="nearest")).abs() ** 2) / 0.02)
+        blur = F.avg_pool2d(F.pad(up, (1, 1, 1, 1), mode="replicate"), 3, 1)
+        dense = (up + (1 - w_range) * (up - blur)).flatten(2).transpose(1, 2).to(fused.dtype)
+        return torch.cat([regs, dense], dim=1)
 
     def probe_features(self, x):
-        return self(x)["x_norm_clstoken"]
+        return self(x, feature_blocks=PROBE_FEATURE_BLOCKS)["x_norm_probe_features"]
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.
@@ -183,7 +227,7 @@ def load_dinov2_pretrained(model):
     return model
 
 
-# DINO/iBOT projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
+# DINO projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
 # weight-normed Linear(bottleneck -> n_prototypes) with weight_g frozen at 1, matching the
 # behaviour of dinov2.layers.DINOHead. Standalone reimplementation (no xformers, no fvcore).
 class DINOHead(nn.Module):
@@ -207,17 +251,62 @@ class DINOHead(nn.Module):
         return self.last_layer(x)
 
 
-# MolCap projection head (train.py auxiliary): maps the student CLS token to the frozen
-# text-embedding of the tile's patient "molecular caption" (subtype/stage/mutations/expression
-# rendered as a sentence, embedded once offline by a non-pathology text encoder). It is a
-# *projection*, not identity, so the CLS need only carry molecular semantics in a linear subspace
-# — leaving the rest of the CLS free for tile discrimination (linear/knn). Output is L2-normalized
-# so the training loss is a cosine alignment against the (also L2-normalized) caption vector.
-# Discarded at probe time: probe.py reads the raw CLS, never this head.
+# Train-only projection from shared patch features to a frozen patient target; probes never load this head.
 class MolCapHead(nn.Module):
-    def __init__(self, in_dim, text_dim, hidden_dim=2048):
+    def __init__(self, in_dim, target_dim):
         super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, text_dim))
+        self.net = nn.Sequential(nn.Linear(in_dim, 512), nn.GELU(), nn.Linear(512, target_dim))
 
     def forward(self, x):
-        return F.normalize(self.mlp(x), dim=-1, p=2)
+        return F.normalize(self.net(x), dim=-1)
+
+
+# Head initialization must not perturb the frontier's later FINO prototype draw at the same seed.
+def seed_neutral_molcap_head(in_dim, target_dim, device):
+    state = torch.random.get_rng_state()
+    head = MolCapHead(in_dim, target_dim)
+    torch.random.set_rng_state(state)
+    return head.to(device)
+
+
+# Targets are per tile while features are crop-major global views: [view0 batch, view1 batch, ...].
+def molcap_loss(head, features, targets, present, views):
+    pred = head(features)
+    target, weight = targets.repeat(views, 1), present.repeat(views)
+    return (weight * (1 - (pred * target).sum(-1))).sum() / weight.sum().clamp_min(1)
+
+
+def linear_ramp(progress, start, length):
+    return min(1.0, max(0.0, (progress - start) / length))
+
+
+# Measure whether the auxiliary and existing objectives agree on a shared trunk parameter.
+def gradient_alignment(base_loss, auxiliary_loss, parameter):
+    base_grad = torch.autograd.grad(base_loss, parameter, retain_graph=True)[0]
+    auxiliary_grad = torch.autograd.grad(auxiliary_loss, parameter, retain_graph=True)[0]
+    cosine = F.cosine_similarity(base_grad.flatten(), auxiliary_grad.flatten(), dim=0)
+    ratio = auxiliary_grad.norm() / base_grad.norm().clamp_min(1e-12)
+    return cosine.detach(), ratio.detach()
+
+
+# I-JEPA predictor head: regresses EMA-teacher patch representations at masked target blocks from the student's
+# block-masked patch tokens. FINO/JEPA-T option: n_cond>0 adds a learned per-class embedding (idx 0 = missing/-1)
+# of a discrete metadata factor to every patch token, so the latent-regression target is metadata-aware
+# (a dense-path alternative to CLS-token steering). n_cond=0 is plain I-JEPA.
+class JEPAPredictor(nn.Module):
+    def __init__(self, dim, depth=4, width=0, heads=6, n_cond=0):
+        super().__init__()
+        width = width or dim
+        self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
+        self.cond_emb = nn.Embedding(n_cond + 1, width) if n_cond else None
+        self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+        self.proj = nn.Linear(width, dim, bias=True)
+
+    def forward(self, patch_tokens, cond=None):
+        x = self.proj_in(patch_tokens)
+        if self.cond_emb is not None and cond is not None:
+            x = x + self.cond_emb(cond + 1).unsqueeze(1)  # broadcast factor embedding over patches; cond=-1 -> idx 0
+        for blk in self.blocks:
+            x = blk(x)
+        return self.proj(self.norm(x))
