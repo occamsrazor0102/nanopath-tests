@@ -82,8 +82,8 @@ molcap:
       min_geometry_patients: 512
       min_effective_rank: 32
       min_participation_ratio: 16
-      max_mean_offdiag_cosine: 0.95
-      gate_version: matched_latest_centered_unit_v2
+      max_mean_offdiag_residual_cosine: 0.95
+      gate_version: matched_latest_centered_residual_v3
 probe:
   enabled: false
   model_weights: ema

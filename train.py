@@ -580,7 +580,7 @@ _CENTROID_KEYS = {
 _CENTROID_HISTORY_KEYS = {
     "level", "momentum", "min_slide_updates", "min_sample_weighted_coverage",
     "min_geometry_patients", "min_effective_rank", "min_participation_ratio",
-    "max_mean_offdiag_cosine", "gate_version",
+    "max_mean_offdiag_residual_cosine", "gate_version",
 }
 
 
@@ -614,7 +614,7 @@ def validate_centroid_config(raw_centroid_cfg, legacy_molcap_cfg=None):
         raise ValueError("centroid forward_source must be teacher")
     if raw_centroid_cfg["gradient_source"] != "student_identity_ste":
         raise ValueError("centroid gradient_source must be student_identity_ste")
-    if history["level"] != "slide_then_patient" or history["gate_version"] != "matched_latest_centered_unit_v2":
+    if history["level"] != "slide_then_patient" or history["gate_version"] != "matched_latest_centered_residual_v3":
         raise ValueError("centroid history level and gate_version are fixed")
     for name in ("weight", "ramp_start", "ramp_len"):
         if not isinstance(raw_centroid_cfg[name], (float, int)) or not math.isfinite(float(raw_centroid_cfg[name])):
@@ -624,7 +624,7 @@ def validate_centroid_config(raw_centroid_cfg, legacy_molcap_cfg=None):
     legacy_ramp_end = float(legacy_molcap_cfg["ramp_start"]) + float(legacy_molcap_cfg["ramp_len"])
     if float(raw_centroid_cfg["ramp_start"]) < legacy_ramp_end:
         raise ValueError("centroid ramp_start must be no earlier than the end of the legacy MolCap ramp")
-    for name in ("momentum", "min_sample_weighted_coverage", "max_mean_offdiag_cosine"):
+    for name in ("momentum", "min_sample_weighted_coverage", "max_mean_offdiag_residual_cosine"):
         if not isinstance(history[name], (float, int)) or not math.isfinite(float(history[name])):
             raise ValueError(f"centroid history {name} must be finite")
     if not 0.0 <= float(history["momentum"]) <= 1.0:
@@ -726,7 +726,7 @@ def run_centroid_gate(bank, centroid_cfg, target_digest, mapping_digest, output_
             ).detach().to(device="cpu", dtype=torch.float64)
             if not torch.isfinite(patient_centroids).all():
                 raise ValueError("centroid gate found non-finite patient centroids")
-            # Measure residual directions; raw cosine below still guards near-collapse.
+            # Rank and cosine must describe the same centered residual geometry.
             patient_geometry = F.normalize(patient_centroids - patient_centroids.mean(dim=0, keepdim=True), p=2, dim=-1)
             singular_values = torch.linalg.svdvals(patient_geometry)
             spectrum = singular_values.square()
@@ -740,20 +740,24 @@ def run_centroid_gate(bank, centroid_cfg, target_digest, mapping_digest, output_
                 effective_rank = patient_centroids.new_zeros(())
                 participation_ratio = patient_centroids.new_zeros(())
             if mature_patient_count > 1:
-                normalized = F.normalize(patient_centroids, p=2, dim=-1)
-                cosine = normalized @ normalized.T
-                mean_offdiag_cosine = (cosine.sum() - cosine.diagonal().sum()) / (mature_patient_count * (mature_patient_count - 1))
+                residual_cosine = patient_geometry @ patient_geometry.T
+                raw_geometry = F.normalize(patient_centroids, p=2, dim=-1)
+                raw_cosine = raw_geometry @ raw_geometry.T
+                denominator = mature_patient_count * (mature_patient_count - 1)
+                mean_offdiag_residual_cosine = (residual_cosine.sum() - residual_cosine.diagonal().sum()) / denominator
+                mean_offdiag_raw_cosine = (raw_cosine.sum() - raw_cosine.diagonal().sum()) / denominator
             else:
-                mean_offdiag_cosine = patient_centroids.new_zeros(())
+                mean_offdiag_residual_cosine = mean_offdiag_raw_cosine = patient_centroids.new_zeros(())
         else:
-            effective_rank = participation_ratio = mean_offdiag_cosine = 0.0
+            effective_rank = participation_ratio = mean_offdiag_residual_cosine = mean_offdiag_raw_cosine = 0.0
         coverage = _centroid_coverage(bank)
         report = {
             "sample_weighted_coverage": _finite_float(coverage),
             "mature_patient_count": mature_patient_count,
             "effective_rank": _finite_float(effective_rank),
             "participation_ratio": _finite_float(participation_ratio),
-            "mean_offdiag_cosine": _finite_float(mean_offdiag_cosine),
+            "mean_offdiag_residual_cosine": _finite_float(mean_offdiag_residual_cosine),
+            "mean_offdiag_raw_cosine": _finite_float(mean_offdiag_raw_cosine),
             "target_digest": target_digest,
             "mapping_digest": mapping_digest,
             "gate_version": history["gate_version"],
@@ -767,8 +771,8 @@ def run_centroid_gate(bank, centroid_cfg, target_digest, mapping_digest, output_
         ):
             if actual < minimum:
                 failures.append(name)
-        if report["mean_offdiag_cosine"] > float(history["max_mean_offdiag_cosine"]):
-            failures.append("mean_offdiag_cosine")
+        if report["mean_offdiag_residual_cosine"] > float(history["max_mean_offdiag_residual_cosine"]):
+            failures.append("mean_offdiag_residual_cosine")
         report["passed"] = not failures
         report["failure_reason"] = None if report["passed"] else ", ".join(failures)
         if not report["passed"]:
@@ -817,6 +821,14 @@ def attach_centroid_checkpoint_state(payload, runtime):
         "centroid_mapping_digest": runtime.mapping_digest,
     })
     return payload
+
+
+def checkpoint_centroid_gate_report(checkpoint, centroid_cfg):
+    """Reuse only an already-passed gate with identical geometry semantics."""
+    report = checkpoint["centroid_gate_report"]
+    if report is not None and report.get("gate_version") != centroid_cfg["history"]["gate_version"]:
+        raise ValueError("centroid checkpoint gate version does not match the training config")
+    return report
 
 
 # Orchestrates one pretraining run: setup, train+probe loop, checkpoint, summary.
@@ -1008,7 +1020,7 @@ def main():
                 raise ValueError("centroid checkpoint mapping digest does not match the training dataset")
             centroid_runtime.head.load_state_dict(checkpoint["centroid_head"])
             centroid_runtime.bank.restore_state(checkpoint["centroid_history"])
-            centroid_runtime.gate_report = checkpoint["centroid_gate_report"]
+            centroid_runtime.gate_report = checkpoint_centroid_gate_report(checkpoint, centroid_cfg)
             centroid_runtime.gate_checked = centroid_runtime.gate_report is not None
             opt.load_state_dict(checkpoint["opt"])
     val_ds = TCGATileDataset(cfg, is_train=False)
