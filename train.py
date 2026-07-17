@@ -229,6 +229,8 @@ class CentroidProposal(NamedTuple):
     next_slide_centroids: torch.Tensor
     patient_ids: torch.Tensor
     patient_centroids: torch.Tensor
+    patient_sums: torch.Tensor
+    patient_counts: torch.Tensor
 
 
 class CentroidStep(NamedTuple):
@@ -445,7 +447,9 @@ class HierarchicalCentroidBank(nn.Module):
         patient_ids, _ = torch.unique(slide_patients, sorted=True, return_inverse=True)
         _, patient_sums, patient_counts = self._candidate_cache(slide_ids, next_slide_centroids, patient_ids)
         patient_centroids = patient_sums / patient_counts.to(dtype=patient_sums.dtype).unsqueeze(1)
-        return CentroidProposal(slide_ids, next_slide_centroids, patient_ids, patient_centroids)
+        return CentroidProposal(
+            slide_ids, next_slide_centroids, patient_ids, patient_centroids, patient_sums, patient_counts
+        )
 
     @staticmethod
     def _coverage_count(value: object, name: str) -> int:
@@ -474,26 +478,24 @@ class HierarchicalCentroidBank(nn.Module):
     def _validate_proposal(self, proposal: CentroidProposal) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(proposal, CentroidProposal):
             raise ValueError("commit expects a CentroidProposal")
-        slide_ids, next_slide_centroids, patient_ids, patient_centroids = proposal
+        slide_ids, next_slide_centroids, patient_ids, patient_centroids, candidate_sums, candidate_counts = proposal
         if slide_ids.ndim != 1 or slide_ids.dtype != torch.int64 or slide_ids.device != self.slide_centroids.device:
             raise ValueError("proposal slide IDs must be device-matched int64")
         if patient_ids.ndim != 1 or patient_ids.dtype != torch.int64 or patient_ids.device != self.slide_centroids.device:
             raise ValueError("proposal patient IDs must be device-matched int64")
         if not self._ids_are_sorted_and_unique(slide_ids) or not self._ids_are_sorted_and_unique(patient_ids):
             raise ValueError("proposal IDs must be sorted and unique")
-        if next_slide_centroids.shape != (slide_ids.numel(), self.feature_dim) or patient_centroids.shape != (patient_ids.numel(), self.feature_dim):
+        if next_slide_centroids.shape != (slide_ids.numel(), self.feature_dim) or patient_centroids.shape != (patient_ids.numel(), self.feature_dim) or candidate_sums.shape != patient_centroids.shape or candidate_counts.shape != (patient_ids.numel(),):
             raise ValueError("proposal centroid shapes do not match this centroid bank")
-        if next_slide_centroids.dtype != torch.float32 or patient_centroids.dtype != torch.float32:
+        if next_slide_centroids.dtype != torch.float32 or patient_centroids.dtype != torch.float32 or candidate_sums.dtype != torch.float32 or candidate_counts.dtype != torch.int64:
             raise ValueError("proposal centroids must be float32")
-        if next_slide_centroids.device != self.slide_centroids.device or patient_centroids.device != self.slide_centroids.device:
+        if next_slide_centroids.device != self.slide_centroids.device or patient_centroids.device != self.slide_centroids.device or candidate_sums.device != self.slide_centroids.device or candidate_counts.device != self.slide_centroids.device:
             raise ValueError("proposal centroids must match the centroid bank device")
-        if not torch.isfinite(next_slide_centroids).all() or not torch.isfinite(patient_centroids).all():
+        if not torch.isfinite(next_slide_centroids).all() or not torch.isfinite(patient_centroids).all() or not torch.isfinite(candidate_sums).all():
             raise ValueError("proposal centroids must be finite")
         if slide_ids.numel() and (torch.any(slide_ids < 0) or torch.any(slide_ids >= self.slide_to_patient.numel())):
             raise ValueError("proposal contains a slide outside slide_to_patient")
-        cache_indices, candidate_sums, candidate_counts = self._candidate_cache(
-            slide_ids, next_slide_centroids, patient_ids
-        )
+        cache_indices = self._patient_cache_indices(patient_ids)
         if torch.any(candidate_counts <= 0):
             raise ValueError("proposal leaves a patient without cached slides")
 
